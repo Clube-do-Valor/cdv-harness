@@ -43,7 +43,7 @@ Every core skill reads the profile in its step 0 and stops when it is missing, t
 
 The vendored copy is never edited in place: the gate fails the PR, and the core deny list blocks the agent's Edit tool on those paths. A change goes here first:
 
-- `bin/harness propose --from <checkout of this repository>` (run in the consumer) takes what diverged from the lock back to the core paths on a `propose/<date>-<label>` branch and opens the PR. The branch, commit and PR never name the consumer (the label is random). Before anything is written, the proposed files and their paths go through `scan` with the core's patterns plus the private ones (`--extra-patterns`, default `~/.config/cdv-harness/private-patterns.txt`; without them it stops unless `--public-patterns-only` is given), and so does the git identity that would sign the commit: one finding and nothing is proposed. `release` checks the identity of its tag the same way. `{app_dir}` is restored in the rules, and the house block goes back to `instructions/house.md`.
+- `bin/harness propose --from <checkout of this repository>` (run in the consumer) takes what diverged from the lock back to the core paths on a `propose/<date>-<label>` branch and opens the PR. The branch, commit and PR never name the consumer (the label is random). Before anything is written, the proposed files and their paths go through `scan` with the core's patterns plus the private ones (`--extra-patterns`, default `~/.config/cdv-harness/private-patterns.txt`; without them it stops unless `--public-patterns-only` is given), and so does the git identity that would sign the commit: one finding and nothing is proposed. `release` scans the branch's tree, its history (identities, messages and every added line) and the tag identity the same way before tagging. `{app_dir}` is restored in the rules, and the house block goes back to `instructions/house.md`.
 - After the merge, a tag, and `sync` brings it to each repository.
 - An emergency commit in a consumer may carry `Harness-skip: <reason>`; `verify.sh --skip-trailer-range <base>..HEAD` then passes and prints the reason for the reviewer.
 
@@ -56,7 +56,7 @@ The vendored copy is never edited in place: the gate fails the PR, and the core 
 ```
 python3 -m unittest discover -s tests -v
 bin/harness lint                 # name = folder, kebab-case, ≤ 64; description ≤ 1024; strict YAML; metadata.version and owner
-bin/harness scan --commits HEAD  # files, paths, commit identities and messages, tags; add --extra-patterns <file> for the private patterns kept outside the repository
+bin/harness scan --commits HEAD  # files, paths, commit identities, messages and added lines, tags; add --extra-patterns <file> for the private patterns kept outside the repository
 bin/harness catalog --check      # CATALOG.md and registry.json are up to date
 ```
 

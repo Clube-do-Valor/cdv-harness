@@ -64,15 +64,40 @@ class ScanTest(HarnessTestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(len(result.stdout.strip().splitlines()), 2)
 
-    def test_pattern_files_binaries_and_git_dir_are_skipped(self):
+    def test_barrier_files_get_only_the_private_patterns_and_git_dir_is_skipped(self):
         self.put("scan-allowlist.txt", f"# {fake_token('ticket')}\n")
         self.put("notes/pattern-mention.md", "clean\n")
         (self.core / ".git").mkdir()
         self.put(".git/config", fake_token("github") + "\n")
-        (self.core / "notes" / "blob.bin").write_bytes(b"\0\1\2" + fake_token("github").encode())
-        (self.core / "notes" / "latin1.txt").write_bytes(b"caf\xe9 " + fake_token("github").encode())
+        self.assertEqual(self.scan().returncode, 0)
+        self.put("scan-allowlist.txt", "# Bluebird\n")
+        extra = self.tmp / "private.txt"
+        extra.write_text("Bluebird\n")
+        result = self.scan("--extra-patterns", str(extra))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("scan-allowlist.txt:1: Bluebird: Bluebird", result.stdout)
+
+    def test_binary_and_non_utf8_files_are_findings_unless_allowed(self):
+        (self.core / "notes" / "blob.bin").write_bytes(b"\0\1\2")
+        (self.core / "notes" / "latin1.txt").write_bytes(b"caf\xe9")
         result = self.scan()
-        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("notes/blob.bin:0: <binary or non-UTF-8 content>", result.stdout)
+        self.assertIn("notes/latin1.txt:0: <binary or non-UTF-8 content>", result.stdout)
+        self.put("scan-allowlist.txt", "notes/*\t<binary>\treviewed by hand\n")
+        self.assertEqual(self.scan().returncode, 0)
+
+    def test_commits_scan_the_lines_a_commit_added_even_when_removed_later(self):
+        self.git(self.core, "init", "-q")
+        self.put("notes/a.md", f"oops {fake_token('aws')}\n")
+        self.git(self.core, "add", "-A")
+        self.git(self.core, "commit", "-q", "-m", "chore: add")
+        self.put("notes/a.md", "clean\n")
+        self.git(self.core, "commit", "-qam", "chore: clean")
+        self.assertEqual(self.scan().returncode, 0)
+        result = self.scan("--commits", "HEAD")
+        self.assertEqual(result.returncode, 1)
+        self.assertRegex(result.stdout, r"commit [0-9a-f]{7} notes/a\.md:1: AKIA")
 
     def test_a_file_path_is_scanned_too(self):
         self.put(f"notes/{fake_token('ticket')}-notes.md", "clean\n")

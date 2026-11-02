@@ -7,6 +7,9 @@ class ReleaseTest(HarnessTestCase):
     def setUp(self):
         super().setUp()
         self.core = self.make_core(with_remote=True)
+        private = self.home / ".config" / "cdv-harness" / "private-patterns.txt"
+        private.parent.mkdir(parents=True, exist_ok=True)
+        private.write_text("SecretCorp\n")
 
     def release(self, *extra, now="2026-03-01", consumers=None):
         args = ["release", "--core", str(self.core), "--now", now]
@@ -54,9 +57,6 @@ class ReleaseTest(HarnessTestCase):
 
     def test_a_private_git_identity_creates_no_tag(self):
         self.commit("fix: one bug")
-        private = self.home / ".config" / "cdv-harness" / "private-patterns.txt"
-        private.parent.mkdir(parents=True)
-        private.write_text("SecretCorp\n")
         env = dict(self.env, GIT_COMMITTER_NAME="SecretCorp Dev")
         result = self.harness("release", "--core", str(self.core), "--now", "2026-03-01", env=env)
         self.assertEqual(result.returncode, 1)
@@ -129,7 +129,7 @@ class ReleaseTest(HarnessTestCase):
         gh = self.make_cli("gh")
         repo = self.make_consumer("only", pr_cli=gh)
         config = self.home / ".config" / "cdv-harness"
-        config.mkdir(parents=True)
+        config.mkdir(parents=True, exist_ok=True)
         (config / "consumers.yaml").write_text(f"consumers:\n  - {repo}\n")
         self.commit("fix: one bug")
         result = self.release()

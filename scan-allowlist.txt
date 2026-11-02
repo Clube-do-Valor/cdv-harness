@@ -9,10 +9,12 @@ registry.json	augusto-henriques	GitHub login of the named owner of the core skil
 skills/*/SKILL.md	leonardoburtet-clube	GitHub login of the named owner of the frontend skill; public on GitHub
 CATALOG.md	leonardoburtet-clube	GitHub login of the named owner of the frontend skill; public on GitHub
 registry.json	leonardoburtet-clube	GitHub login of the named owner of the frontend skill; public on GitHub
-commit *	noreply@github\.com	GitHub's own identity on the merge commits it creates (pull request merges and CI merge refs)
+commit *	^noreply@github\.com$	GitHub's own identity on the merge commits it creates (pull request merges and CI merge refs)
 commit *	augusto-henriques	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
 tag *	augusto-henriques	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
 git identity	augusto-henriques	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
 commit *	leonardoburtet-clube	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
 tag *	leonardoburtet-clube	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
 git identity	leonardoburtet-clube	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
+scan-allowlist.txt	augusto-henriques	the allowlist entries of this login
+scan-allowlist.txt	leonardoburtet-clube	the allowlist entries of this login

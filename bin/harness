@@ -1446,7 +1446,7 @@ def load_allowlist(path):
 
 def core_file_list(core):
     core = Path(core)
-    names = []
+    names = None
     if (core / ".git").exists():
         proc = subprocess.run(
             ["git", "-C", str(core), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
@@ -1454,7 +1454,8 @@ def core_file_list(core):
         )
         if proc.returncode == 0:
             names = sorted({n for n in proc.stdout.decode("utf-8", "replace").split("\0") if n})
-    else:
+    if names is None:  # not a repository, or git cannot read it: walk the directory
+        names = []
         for base, dirs, files in os.walk(core):
             dirs[:] = sorted(d for d in dirs if d != ".git")
             for name in sorted(files):
@@ -1462,27 +1463,42 @@ def core_file_list(core):
     return [n for n in names if (core / n).is_file() and not (core / n).is_symlink()]
 
 
-def scan_contents(contents, patterns, allowlist):
-    """Findings as `path:line: pattern: match` for (relative path, bytes) pairs. The path itself
-    is scanned as line 0; binary and non-UTF-8 content is skipped."""
+BARRIER_FILES = {"scan-patterns.txt", "scan-allowlist.txt"}
+UNREADABLE = "<binary or non-UTF-8 content>"
+
+
+def scan_contents(contents, patterns, allowlist, barrier_patterns=()):
+    """Findings as `[label ]path:line: pattern: match` for (path, bytes) or (path, bytes, label)
+    items. The path itself is scanned as line 0. Content that is binary or not UTF-8 cannot be
+    scanned, so it is a finding unless the allowlist names it with the regex `<binary>`. The
+    barrier files (the pattern list and the allowlist) would match their own public patterns, so
+    they are scanned with `barrier_patterns` (the private ones) only."""
     lines = []
-    for relative, data in contents:
-        for source, regex in patterns:
+    for item in contents:
+        relative, data = item[0], item[1]
+        prefix = f"{item[2]} " if len(item) > 2 and item[2] else ""
+        active = barrier_patterns if Path(relative).name in BARRIER_FILES else patterns
+        for source, regex in active:
             for match in regex.finditer(relative):
                 if not allowed(relative, relative, match, allowlist):
-                    lines.append(f"{relative}:0: {source}: {match.group(0)}")
-        if b"\0" in data[:8192]:
-            continue
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
+                    lines.append(f"{prefix}{relative}:0: {source}: {match.group(0)}")
+        text = None
+        if b"\0" not in data[:8192]:
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                pass
+        if text is None:
+            marker = re.match(re.escape("<binary>"), "<binary>")
+            if not allowed(relative, "<binary>", marker, allowlist):
+                lines.append(f"{prefix}{relative}:0: {UNREADABLE}")
             continue
         for number, line in enumerate(text.splitlines(), 1):
-            for source, regex in patterns:
+            for source, regex in active:
                 for match in regex.finditer(line):
                     if allowed(relative, line, match, allowlist):
                         continue
-                    lines.append(f"{relative}:{number}: {source}: {match.group(0)}")
+                    lines.append(f"{prefix}{relative}:{number}: {source}: {match.group(0)}")
     return lines
 
 
@@ -1529,12 +1545,31 @@ def check_identity(core, patterns, allowlist):
 
 
 def history_contents(core, rev_range):
-    """Author, committer and message of each commit in the range, and tagger and message of each
-    annotated tag, as (label, bytes) pairs for scan_contents."""
+    """For scan_contents: author, committer and message of each commit in the range, the lines
+    each commit added (a fact added and removed later stays in public history), and tagger and
+    message of each annotated tag."""
     contents = []
     for sha in git_out(core, "rev-list", rev_range).split():
         meta = git(core, "show", "-s", "--format=%an <%ae>%n%cn <%ce>%n%B", sha).stdout
         contents.append((f"commit {sha[:7]}", meta))
+        patch = git(core, "show", "--format=", "-U0", "--no-color", "--no-ext-diff", "--no-renames",
+                    "--root", sha).stdout
+        added, path = {}, None
+        for raw in patch.split(b"\n"):
+            if raw.startswith(b"+++ "):
+                target = raw[4:].decode("utf-8", "replace")
+                path = target[2:] if target.startswith("b/") else None
+                if path is not None:
+                    added.setdefault(path, [])
+            elif raw.startswith(b"Binary files ") and raw.endswith(b" differ"):
+                target = raw.decode("utf-8", "replace").rsplit(" and ", 1)[-1][: -len(" differ")]
+                if target.startswith("b/"):
+                    added[target[2:]] = [b"\0"]  # binary content: reported as unreadable
+            elif path is not None and raw.startswith(b"+"):
+                added[path].append(raw[1:])
+        for path, chunks in added.items():
+            if chunks:
+                contents.append((path, b"\n".join(chunks) + b"\n", f"commit {sha[:7]}"))
     for line in git_out(core, "for-each-ref", "--format=%(objecttype) %(refname:short)", "refs/tags").splitlines():
         kind, _, tag = line.partition(" ")
         if kind == "tag":
@@ -1549,12 +1584,13 @@ def cmd_scan(args):
     own = core / "scan-patterns.txt"
     if own.is_file():
         patterns += load_patterns(own)
+    private = []
     for extra in args.extra_patterns or []:
         if not Path(extra).is_file():
             raise HarnessError(f"patterns file not found: {extra}", 2)
-        patterns += load_patterns(extra)
+        private += load_patterns(extra)
+    patterns += private
     allowlist = load_allowlist(core / "scan-allowlist.txt")
-    skipped = {"scan-patterns.txt", "scan-allowlist.txt"}
 
     if args.paths:
         names = []
@@ -1579,12 +1615,12 @@ def cmd_scan(args):
 
     contents = []
     for relative, full in candidates:
-        if relative in skipped or full.is_symlink():
+        if full.is_symlink():
             continue
         contents.append((relative, full.read_bytes()))
     if args.commits:
         contents += history_contents(core, args.commits)
-    lines = scan_contents(contents, patterns, allowlist)
+    lines = scan_contents(contents, patterns, allowlist, private)
     for line in lines:
         print(line)
     findings = len(lines)
@@ -1638,9 +1674,20 @@ def cmd_release(args):
     if args.dry_run:
         info(f"next version: {version} ({basis}); dry run, nothing created")
         return 0
-    own = core / "scan-patterns.txt"
-    patterns = publication_patterns(own.read_text(encoding="utf-8") if own.is_file() else "", None, False)
-    check_identity(core, patterns, load_allowlist(core / "scan-allowlist.txt"))
+    # Pushing the tag also publishes every commit of the branch the remote lacks: scan the tree,
+    # the history and the identity first, with the private patterns.
+    tree = CoreTree(core, branch)
+    core_patterns = tree.read("scan-patterns.txt").decode("utf-8") if tree.has("scan-patterns.txt") else ""
+    patterns = publication_patterns(core_patterns, args.extra_patterns, not args.public_patterns_only)
+    private = publication_patterns("", args.extra_patterns, False)
+    allowlist = load_allowlist(core / "scan-allowlist.txt")
+    blobs = tree.read_many(sorted(tree.entries))
+    findings = scan_contents(list(blobs.items()) + history_contents(core, branch), patterns, allowlist, private)
+    if findings:
+        for line in findings:
+            print(line)
+        raise HarnessError(f"scan: {len(findings)} finding(s) in {branch}; nothing was tagged")
+    check_identity(core, patterns, allowlist)
     git(core, "tag", "-a", version, "-m", f"release {version}", branch)
     git(core, "push", "origin", version)
     info(f"tagged and pushed {version} ({basis})")
@@ -1709,6 +1756,10 @@ def build_parser():
     p.add_argument("--now", help="YYYY-MM-DD (midnight UTC) used as the current date")
     p.add_argument("--consumers", help="file listing consumer repositories (default: ~/.config/cdv-harness/consumers.yaml)")
     p.add_argument("--branch", default="main")
+    p.add_argument("--extra-patterns", action="append", metavar="FILE",
+                   help="private scan patterns (default: ~/.config/cdv-harness/private-patterns.txt)")
+    p.add_argument("--public-patterns-only", action="store_true",
+                   help="accept scanning with the core's public patterns alone when no private file exists")
     p.set_defaults(func=cmd_release)
 
     p = sub.add_parser("lint", help="check the SKILL.md frontmatter of every skill")
