@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.0
+
+- Three third-party skills copied from the Tech Leads Club catalog: `tlc-spec-lean`, `create-adr` and `modular-design-principles` (CC-BY-4.0, see `THIRD_PARTY.md`). They are vendored into consumers like the house skills and installed per user by `sync --user`.
+- `bin/harness third-party` copies new upstream versions listed in `third-party.json`; `--check` only reports them. A weekly workflow runs it and opens a PR.
+- `sync` vendors every skill under `skills/`, not only `cdv-*`.
+
 ## v0.1.0
 
 First release.

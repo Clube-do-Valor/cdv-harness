@@ -136,6 +136,30 @@
       "description": "Run a research round — survey the state of the art, the code and the usage evidence for a feature or idea through subagents — inside one folder on disk that holds a README, every subagent's output and the synthesis, tied to a task in the task tracker. Triggers on \"rodada de pesquisa\", \"pesquisa essa feature\", \"levanta o estado da arte\", \"/cdv-research-round\". Do NOT use to interview the user about decisions (`cdv-grilling`), to plan or implement a feature (`cdv-plan-feature`), or to debug (`cdv-debug`).",
       "path": "skills/cdv-research-round",
       "contentHash": "b6a0d3a75f83b77063bbdab22dfaa4631050ac17592a0c134bbdc9b13dcb4050"
+    },
+    {
+      "name": "create-adr",
+      "version": "1.0.0",
+      "owner": "tech-leads-club (third party)",
+      "description": "Creates Architecture Decision Records (ADRs) to document significant architectural choices and their rationale for future team members. Use when the user says \"write an ADR\", \"document this decision\", \"record why we chose X\", \"add an architecture decision record\", \"create an ADR for\", or wants to capture the reasoning behind a technical choice so the team understands it later. Do NOT use when the decision hasn't been made yet (use create-rfc instead), for implementation planning (use technical-design-doc-creator), or for general documentation.",
+      "path": "skills/create-adr",
+      "contentHash": "d9998468de0ce0e311da3654856c81b52e97fa420a9c1338e02bd67f8beca450"
+    },
+    {
+      "name": "modular-design-principles",
+      "version": "-",
+      "owner": "tech-leads-club (third party)",
+      "description": "Technology-agnostic guidance for modular systems: bounded contexts, clear boundaries, composability, state isolation, explicit contracts, failure containment, scaffolding workflows, split/merge criteria, sub-units inside a context, and compliance review signals. Use when designing or reviewing module structure, service boundaries, package layout, cross-cutting dependencies, \"how should we split this?\", modularity assessments, coupling between domains, greenfield context design, or architecture discussions without assuming a specific framework, language, or repository layout. Do NOT use for executing the full Patterns 1–5 repo decomposition pipeline or per-pattern inventories (use modular-decomposition), phased extraction roadmaps as the main deliverable (use decomposition-planning-roadmap), or end-to-end legacy migration strategy (use legacy-migration-planner).",
+      "path": "skills/modular-design-principles",
+      "contentHash": "a7fdb54b4dddf7dbb293f4bc8b038c6a1e4eeed1f165dcccb46d806633bc0a06"
+    },
+    {
+      "name": "tlc-spec-lean",
+      "version": "2.2.0",
+      "owner": "tech-leads-club (third party)",
+      "description": "Spec-driven feature work that freezes obligations instead of the plan: one human-reviewed plan with EARS criteria, path, entities, interface and one-way doors, then proof-backed checks, then build, then an independent Verifier. Use when the user says \"tlc-spec-lean\", \"plan feature\", \"specify feature\", \"write the checks\", \"build this plan\", or \"verify work\". Do NOT use for standalone design documents unattached to a feature, architecture decomposition analysis, or work that already has a task list or checklist to execute.",
+      "path": "skills/tlc-spec-lean",
+      "contentHash": "59c93b6b27c08e1305b670214633df7726051a9005013c014269522cb9126464"
     }
   ]
 }

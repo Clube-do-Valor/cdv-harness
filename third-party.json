@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "upstream": {
+    "repo": "tech-leads-club/agent-skills",
+    "ref": "main",
+    "registry": "packages/skills-catalog/skills-registry.json",
+    "skills_root": "packages/skills-catalog/skills",
+    "license": "CC-BY-4.0"
+  },
+  "skills": {
+    "create-adr": {
+      "owner": "tech-leads-club (third party)",
+      "path": "(creation)/create-adr",
+      "contentHash": "47ec663c849e8c1620c6f33a7be0055acdcf838c27ab7c16f44260244b80195a",
+      "version": "1.0.0",
+      "user": true
+    },
+    "modular-design-principles": {
+      "owner": "tech-leads-club (third party)",
+      "path": "(architecture)/modular-design-principles",
+      "contentHash": "d53fdca7ae18205376956c39a3a1729edfae843f63e5f2a6c5dd2c64ccd8a576",
+      "version": "-",
+      "user": true
+    },
+    "tlc-spec-lean": {
+      "owner": "tech-leads-club (third party)",
+      "path": "(development)/tlc-spec-lean",
+      "contentHash": "65cf4acff0a88093eafc9d34a36ca3a03a74c78301b1b4025e517ecc18e66a44",
+      "version": "2.2.0",
+      "user": true
+    }
+  }
+}
