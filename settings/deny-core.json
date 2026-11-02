@@ -1,0 +1,14 @@
+{
+  "deny": [
+    "Bash(* artisan *:notify-*)",
+    "Bash(* artisan *:remind-*)",
+    "Bash(* artisan *:send-*)",
+    "Bash(* artisan *:dispatch-*)",
+    "Bash(php -r *)",
+    "Bash(php -f *)",
+    "Edit(/.claude/skills/cdv-*/**)",
+    "Edit(/.claude/rules/core/**)",
+    "Edit(/.claude/harness/bin/**)",
+    "Edit(/.claude/harness.lock)"
+  ]
+}
