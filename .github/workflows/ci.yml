@@ -1,0 +1,24 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Lint skills
+        run: bin/harness lint
+      - name: Scan for private facts (files, commit identities and messages, tags)
+        run: bin/harness scan --commits HEAD
+      - name: Catalog is up to date
+        run: bin/harness catalog --check
+      - name: Verifier is valid POSIX sh
+        run: sh -n bin/verify.sh
