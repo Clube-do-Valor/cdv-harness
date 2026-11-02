@@ -1,0 +1,18 @@
+# Findings the scan must skip. One line per exception, three TAB-separated fields:
+#   <path glob>  <regex matched against the finding text, or against a span of the line that contains it>  <reason>
+# A line without a reason is an error.
+.github/CODEOWNERS	augusto-henriques	GitHub login of the named owner of the core skills; public on GitHub
+skills/*/SKILL.md	augusto-henriques	GitHub login of the named owner of the core skills; public on GitHub
+CATALOG.md	augusto-henriques	GitHub login of the named owner of the core skills; public on GitHub
+registry.json	augusto-henriques	GitHub login of the named owner of the core skills; public on GitHub
+.github/CODEOWNERS	leonardoburtet-clube	GitHub login of the named owner of the frontend skill; public on GitHub
+skills/*/SKILL.md	leonardoburtet-clube	GitHub login of the named owner of the frontend skill; public on GitHub
+CATALOG.md	leonardoburtet-clube	GitHub login of the named owner of the frontend skill; public on GitHub
+registry.json	leonardoburtet-clube	GitHub login of the named owner of the frontend skill; public on GitHub
+commit *	noreply@github\.com	GitHub's own identity on the merge commits it creates (pull request merges and CI merge refs)
+commit *	augusto-henriques	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
+tag *	augusto-henriques	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
+git identity	augusto-henriques	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
+commit *	leonardoburtet-clube	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
+tag *	leonardoburtet-clube	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
+git identity	leonardoburtet-clube	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address

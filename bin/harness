@@ -1,0 +1,1740 @@
+#!/usr/bin/env python3
+"""harness: vendor, verify, propose and release a shared agent-harness core.
+
+Standard library only, Python 3.10+. Run `harness <subcommand> --help` for the options.
+"""
+
+import argparse
+import contextlib
+import datetime
+import fnmatch
+import hashlib
+import json
+import os
+import re
+import secrets
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+USER_SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round"]
+LOCK_RELATIVE = ".claude/harness.lock"
+USER_LOCK_RELATIVE = ".claude/harness-user.lock"
+HOUSE_END = "<!-- /cdv-harness:house -->"
+HOUSE_BLOCK_RE = re.compile(
+    r"^<!-- cdv-harness:house \S+ -->[ \t]*\r?\n(?P<body>.*?)^<!-- /cdv-harness:house -->[ \t]*(?:\r?\n|\Z)",
+    re.M | re.S,
+)
+HOUSE_START_ANY_RE = re.compile(r"^<!-- cdv-harness:house ", re.M)
+SEMVER_TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+SKILL_NAME_RE = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+
+
+class HarnessError(Exception):
+    def __init__(self, message, code=1):
+        super().__init__(message)
+        self.code = code
+
+
+def info(message):
+    print(message)
+
+
+def warn(message):
+    print(f"harness: warning: {message}", file=sys.stderr)
+
+
+def default_core():
+    return Path(__file__).resolve().parent.parent
+
+
+# ---------------------------------------------------------------------------------------
+# git and hashing helpers
+# ---------------------------------------------------------------------------------------
+
+
+def git(cwd, *args, check=True, input_bytes=None):
+    proc = subprocess.run(["git", "-C", str(cwd), *args], input=input_bytes, capture_output=True)
+    if check and proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        raise HarnessError(f"git {' '.join(args[:2])} failed in {cwd}: {detail}")
+    return proc
+
+
+def git_out(cwd, *args):
+    return git(cwd, *args).stdout.decode("utf-8", "replace").strip()
+
+
+def sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def path_key(path):
+    return path.encode("utf-8")
+
+
+def tree_hash(files):
+    """sha256 of the `sha256sum` lines of every file, sorted by path in the C locale."""
+    text = "".join(f"{files[p]}  {p}\n" for p in sorted(files, key=path_key))
+    return sha256_bytes(text.encode("utf-8"))
+
+
+class CoreTree:
+    """The content of a core at a ref, read from git objects and never from the working tree."""
+
+    def __init__(self, core, ref):
+        self.core = str(core)
+        self.ref = ref
+        proc = git(core, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", check=False)
+        if proc.returncode != 0:
+            raise HarnessError(f"unknown ref '{ref}' in {core}")
+        self.commit = proc.stdout.decode().strip()
+        listing = git(core, "ls-tree", "-r", "-z", "--full-tree", self.commit).stdout
+        self.entries = {}
+        for record in listing.split(b"\0"):
+            if not record:
+                continue
+            meta, path = record.split(b"\t", 1)
+            mode, kind, sha = meta.decode().split()
+            if kind == "blob":
+                self.entries[path.decode("utf-8")] = (mode, sha)
+
+    def has(self, path):
+        return path in self.entries
+
+    def read_many(self, paths):
+        paths = list(paths)
+        if not paths:
+            return {}
+        shas = []
+        for path in paths:
+            if path not in self.entries:
+                raise HarnessError(f"{path} is not in {self.ref}")
+            shas.append(self.entries[path][1])
+        raw = git(self.core, "cat-file", "--batch", input_bytes=("\n".join(shas) + "\n").encode()).stdout
+        blobs = {}
+        pos = 0
+        for path, sha in zip(paths, shas):
+            newline = raw.index(b"\n", pos)
+            header = raw[pos:newline].split()
+            if len(header) != 3 or header[1] != b"blob":
+                raise HarnessError(f"cannot read {path} at {self.ref}")
+            size = int(header[2])
+            blobs[path] = raw[newline + 1 : newline + 1 + size]
+            pos = newline + 1 + size + 1
+        return blobs
+
+    def read(self, path):
+        return self.read_many([path])[path]
+
+
+# ---------------------------------------------------------------------------------------
+# quoted scalars and the profile subset
+# ---------------------------------------------------------------------------------------
+
+ESCAPES = {"n": "\n", "t": "\t", "\\": "\\", '"': '"', "/": "/", "0": "\0"}
+
+
+def read_quoted(text):
+    """Read a quoted scalar at the start of text. Returns (value, rest). Raises ValueError."""
+    quote = text[0]
+    out = []
+    i = 1
+    while i < len(text):
+        char = text[i]
+        if quote == '"' and char == "\\":
+            if i + 1 >= len(text):
+                raise ValueError("unterminated quoted string")
+            nxt = text[i + 1]
+            if nxt not in ESCAPES:
+                raise ValueError(f"unsupported escape \\{nxt}")
+            out.append(ESCAPES[nxt])
+            i += 2
+            continue
+        if char == quote:
+            if quote == "'" and text[i + 1 : i + 2] == "'":
+                out.append("'")
+                i += 2
+                continue
+            return "".join(out), text[i + 1 :]
+        out.append(char)
+        i += 1
+    raise ValueError("unterminated quoted string")
+
+
+KEY_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_.-]*):(?:[ ]+(.*))?$")
+
+
+def parse_profile_value(text, where):
+    text = text.strip()
+    if text == "" or text.startswith("#"):
+        return None
+    first = text[0]
+    if first in "\"'":
+        try:
+            value, rest = read_quoted(text)
+        except ValueError as exc:
+            raise HarnessError(f"{where}: {exc}", 2)
+        rest = rest.strip()
+        if rest and not rest.startswith("#"):
+            raise HarnessError(f"{where}: unexpected text after the closing quote", 2)
+        return value
+    if first in "{[":
+        raise HarnessError(f"{where}: flow style ({first}...) is not supported; use `- item` lines", 2)
+    if first in "&*":
+        raise HarnessError(f"{where}: anchors and aliases are not supported", 2)
+    if first in "|>":
+        raise HarnessError(f"{where}: block scalars are not supported; write the value on one line", 2)
+    if first == "!":
+        raise HarnessError(f"{where}: tags are not supported", 2)
+    plain = re.split(r"\s#", text, maxsplit=1)[0].rstrip()
+    if ": " in plain or plain.endswith(":"):
+        raise HarnessError(f"{where}: a plain value cannot contain ': ' (nested mapping?); quote it", 2)
+    if plain == "true":
+        return True
+    if plain == "false":
+        return False
+    return plain
+
+
+def parse_profile_text(text, label):
+    """Parse the flat profile subset: `key: scalar` and `key:` followed by `- item` lines."""
+    values = {}
+    list_key = None
+    for number, raw in enumerate(text.splitlines(), 1):
+        where = f"{label}:{number}"
+        if "\t" in raw:
+            raise HarnessError(f"{where}: tab characters are not allowed", 2)
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        if stripped in ("---", "...") or stripped.startswith("--- "):
+            raise HarnessError(f"{where}: multiple documents are not supported", 2)
+        if stripped == "-" or stripped.startswith("- "):
+            if list_key is None:
+                raise HarnessError(f"{where}: list item without a `key:` line above it", 2)
+            item = parse_profile_value(stripped[1:], where)
+            if item is None:
+                raise HarnessError(f"{where}: empty list item", 2)
+            if not isinstance(values[list_key], list):
+                values[list_key] = []
+            values[list_key].append(item)
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        if indent > 0:
+            raise HarnessError(f"{where}: nested mapping or unexpected indentation is not supported", 2)
+        match = KEY_LINE_RE.match(raw.rstrip())
+        if not match:
+            raise HarnessError(f"{where}: expected `key: value` or `key:`", 2)
+        key = match.group(1)
+        if key in values:
+            raise HarnessError(f"{where}: duplicate key '{key}'", 2)
+        value = parse_profile_value(match.group(2) or "", where)
+        values[key] = value
+        list_key = key if value is None else None
+    return values
+
+
+def load_profile(repo):
+    base = Path(repo) / ".claude" / "harness" / "profile.yaml"
+    if not base.is_file():
+        raise HarnessError(f"profile not found: {base}", 2)
+    profile = parse_profile_text(base.read_text(encoding="utf-8"), str(base))
+    local = base.with_name("profile.local.yaml")
+    if local.is_file():
+        profile.update(parse_profile_text(local.read_text(encoding="utf-8"), str(local)))
+    return profile
+
+
+def parse_schema_scalar(text):
+    text = text.strip()
+    if text.startswith("[") and text.endswith("]"):
+        inner = text[1:-1].strip()
+        if not inner:
+            return []
+        return [parse_schema_scalar(part) for part in inner.split(",")]
+    if text and text[0] in "\"'":
+        try:
+            return read_quoted(text)[0]
+        except ValueError:
+            return text
+    if text == "true":
+        return True
+    if text == "false":
+        return False
+    return text
+
+
+def parse_schema_text(text):
+    """Parse profile.schema.yaml: nested mappings by indentation and `[a, b]` flow lists."""
+    root = {}
+    stack = [(-1, root)]
+    for number, raw in enumerate(text.splitlines(), 1):
+        if "\t" in raw:
+            raise HarnessError(f"schema:{number}: tab characters are not allowed", 2)
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" "))
+        match = KEY_LINE_RE.match(stripped)
+        if not match:
+            raise HarnessError(f"schema:{number}: cannot parse line", 2)
+        while stack and stack[-1][0] >= indent:
+            stack.pop()
+        if not stack:
+            raise HarnessError(f"schema:{number}: bad indentation", 2)
+        parent = stack[-1][1]
+        key, value = match.group(1), match.group(2)
+        if value is None or value.strip() == "":
+            child = {}
+            parent[key] = child
+            stack.append((indent, child))
+        else:
+            parent[key] = parse_schema_scalar(value)
+    return root
+
+
+def load_schema(tree):
+    if not tree.has("profile.schema.yaml"):
+        raise HarnessError(f"{tree.ref} has no profile.schema.yaml", 2)
+    schema = parse_schema_text(tree.read("profile.schema.yaml").decode("utf-8"))
+    if not isinstance(schema.get("variables"), dict):
+        raise HarnessError("profile.schema.yaml has no `variables:` mapping", 2)
+    return schema
+
+
+def validate_profile(profile, schema, relax=()):
+    variables = schema["variables"]
+    errors = []
+    for key, spec in variables.items():
+        required = spec.get("required") is True and key not in relax
+        value = profile.get(key)
+        if value is None or value == [] or value == "":
+            if required:
+                errors.append(f"required key '{key}' is missing or empty")
+            continue
+        kind = spec.get("type", "string")
+        if kind == "list" and not isinstance(value, list):
+            errors.append(f"key '{key}' must be a list (`- item` lines)")
+        elif kind != "list" and isinstance(value, list):
+            errors.append(f"key '{key}' must be a single value, not a list")
+        elif kind == "enum" and str(value) not in spec.get("values", []):
+            errors.append(f"key '{key}' must be one of {', '.join(spec.get('values', []))}, got '{value}'")
+    for key in profile:
+        if key not in variables:
+            warn(f"profile has unknown key '{key}'")
+    if errors:
+        raise HarnessError("invalid profile:\n  " + "\n  ".join(errors), 2)
+
+
+def normalize_app_dir(app_dir):
+    value = os.path.normpath(str(app_dir))
+    if value.startswith("/") or value == ".." or value.startswith("../"):
+        raise HarnessError(f"profile.app_dir must be relative to the repository root, got '{app_dir}'", 2)
+    return value
+
+
+def rewrite_rule(text, app_dir):
+    if app_dir == ".":
+        return text.replace("{app_dir}/", "").replace("{app_dir}", ".")
+    return text.replace("{app_dir}", app_dir)
+
+
+def restore_rule(text, app_dir, original=None):
+    """Turn a vendored rule back into core form: `paths:` entries under app_dir regain `{app_dir}`."""
+    known = {}
+    if original is not None:
+        for line in original.splitlines():
+            if "{app_dir}" in line:
+                known[rewrite_rule(line, app_dir)] = line
+    out = []
+    in_front = False
+    in_paths = False
+    for number, line in enumerate(text.split("\n")):
+        stripped = line.strip()
+        if number == 0 and stripped == "---":
+            in_front = True
+            out.append(line)
+            continue
+        if in_front and stripped == "---":
+            in_front = False
+            in_paths = False
+            out.append(line)
+            continue
+        if line in known:
+            out.append(known[line])
+            continue
+        if in_front:
+            if re.match(r"^paths:\s*$", line):
+                in_paths = True
+            elif re.match(r"^\S", line):
+                in_paths = False
+            elif in_paths and app_dir != ".":
+                line = re.sub(r"^(\s*-\s*[\"']?)" + re.escape(app_dir) + "/", r"\1{app_dir}/", line)
+        out.append(line)
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------------------
+# lock files
+# ---------------------------------------------------------------------------------------
+
+
+def read_lock(path):
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HarnessError(f"{path} is unreadable ({exc}); delete it to start over")
+    if not isinstance(data, dict) or data.get("schema") != 1:
+        raise HarnessError(f"{path} is not a schema 1 lock")
+    return data
+
+
+def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files):
+    def js(value):
+        return json.dumps(value, ensure_ascii=False)
+
+    def array(key, items):
+        if not items:
+            return [f'  "{key}": [', "  ],"]
+        lines = [f'  "{key}": [']
+        lines += [f"    {js(item)}," for item in items]
+        lines[-1] = lines[-1][:-1]
+        lines.append("  ],")
+        return lines
+
+    out = ["{", '  "schema": 1,']
+    out.append(f'  "source": {js(source)},')
+    out.append(f'  "ref": {js(ref)},')
+    out.append(f'  "commit": {js(commit)},')
+    out.append(f'  "tree_sha256": {js(tree_sha)},')
+    out.append(f'  "house_sha256": {js(house_sha)},')
+    out += array("paths", sorted(paths, key=path_key))
+    out += array("deny", list(deny))
+    ordered = sorted(files, key=path_key)
+    if ordered:
+        out.append('  "files": {')
+        entries = [f"    {js(p)}: {js(files[p])}," for p in ordered]
+        entries[-1] = entries[-1][:-1]
+        out += entries
+        out.append("  }")
+    else:
+        out += ['  "files": {', "  }"]
+    out.append("}")
+    return "\n".join(out) + "\n"
+
+
+# ---------------------------------------------------------------------------------------
+# filesystem helpers
+# ---------------------------------------------------------------------------------------
+
+
+def assert_no_symlink(root, relative):
+    current = Path(root)
+    for part in Path(relative).parts:
+        current = current / part
+        if current.is_symlink():
+            raise HarnessError(f"{current} is a symlink; refusing to write through it")
+        if not current.exists():
+            return
+
+
+def file_matches(path, data, executable):
+    path = Path(path)
+    if not path.is_file():
+        return False
+    if path.read_bytes() != data:
+        return False
+    if executable is None:
+        return True
+    return bool(path.stat().st_mode & 0o111) == executable
+
+
+def write_file(path, data, executable=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data)
+    if executable is not None:
+        mode = path.stat().st_mode
+        path.chmod((mode | 0o111) if executable else (mode & ~0o111))
+
+
+def prune_empty_dirs(root, start):
+    root = Path(root)
+    current = Path(start)
+    while current != root and root in current.parents:
+        try:
+            current.rmdir()
+        except OSError:
+            return
+        current = current.parent
+
+
+def safe_lock_path(relative):
+    normal = os.path.normpath(relative)
+    return normal.startswith(".claude/") and ".." not in Path(normal).parts
+
+
+def stage(repo, add, remove):
+    if add:
+        git(
+            repo,
+            "add",
+            "-f",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+            input_bytes=b"\0".join(p.encode() for p in add),
+        )
+    if remove:
+        git(
+            repo,
+            "rm",
+            "-q",
+            "--cached",
+            "--ignore-unmatch",
+            "--pathspec-from-file=-",
+            "--pathspec-file-nul",
+            input_bytes=b"\0".join(p.encode() for p in remove),
+        )
+
+
+# ---------------------------------------------------------------------------------------
+# vendoring
+# ---------------------------------------------------------------------------------------
+
+
+def select_vendored(tree):
+    """Map each destination path in the consumer to (source path, executable) from the core tree."""
+    selected = {}
+    for path, (mode, _sha) in tree.entries.items():
+        parts = path.split("/")
+        dest = None
+        if parts[0] == "skills" and len(parts) >= 3 and parts[1].startswith("cdv-"):
+            dest = ".claude/" + path
+        elif parts[0] == "rules" and len(parts) == 3 and parts[1] == "core" and path.endswith(".md"):
+            dest = ".claude/rules/core/" + parts[2]
+        elif path == "bin/verify.sh":
+            dest = ".claude/harness/bin/verify.sh"
+        if dest is None:
+            continue
+        if mode == "120000":
+            raise HarnessError(f"{path} is a symlink in the core; symlinks cannot be vendored")
+        selected[dest] = (path, mode == "100755")
+    return selected
+
+
+def lock_paths_for(vendored):
+    paths = set()
+    for dest in vendored:
+        if dest.startswith(".claude/skills/"):
+            paths.add("/".join(dest.split("/")[:3]))
+        elif dest.startswith(".claude/rules/core/"):
+            paths.add(".claude/rules/core")
+        elif dest.startswith(".claude/harness/bin/"):
+            paths.add(".claude/harness/bin")
+    return sorted(paths, key=path_key)
+
+
+def house_body(raw):
+    text = raw.decode("utf-8")
+    if text and not text.endswith("\n"):
+        text += "\n"
+    return text
+
+
+def apply_house(existing, tag, body):
+    block = f"<!-- cdv-harness:house {tag} -->\n{body}{HOUSE_END}\n"
+    if existing is None:
+        existing = ""
+    starts = len(HOUSE_START_ANY_RE.findall(existing))
+    found = list(HOUSE_BLOCK_RE.finditer(existing))
+    if starts > 1 or len(found) > 1:
+        raise HarnessError("the instructions file has more than one cdv-harness house block")
+    if starts == 1 and not found:
+        raise HarnessError("the instructions file has a cdv-harness house start marker without its end marker")
+    if found:
+        match = found[0]
+        return existing[: match.start()] + block + existing[match.end() :]
+    text = existing
+    if text and not text.endswith("\n"):
+        text += "\n"
+    if text and not text.endswith("\n\n"):
+        text += "\n"
+    return text + block
+
+
+def extract_house(text):
+    match = HOUSE_BLOCK_RE.search(text)
+    return match.group("body") if match else None
+
+
+def merge_deny(settings_text, core_deny, previous_deny):
+    if settings_text is None:
+        data = {}
+    else:
+        try:
+            data = json.loads(settings_text)
+        except ValueError as exc:
+            raise HarnessError(f".claude/settings.json is not valid JSON ({exc})")
+        if not isinstance(data, dict):
+            raise HarnessError(".claude/settings.json must hold a JSON object")
+    permissions = data.get("permissions")
+    if permissions is None:
+        permissions = {}
+        data["permissions"] = permissions
+    if not isinstance(permissions, dict):
+        raise HarnessError(".claude/settings.json: permissions must be an object")
+    deny = permissions.get("deny", [])
+    if not isinstance(deny, list):
+        raise HarnessError(".claude/settings.json: permissions.deny must be a list")
+    dropped = set(previous_deny) - set(core_deny)
+    merged = [entry for entry in deny if entry not in dropped]
+    for entry in core_deny:
+        if entry not in merged:
+            merged.append(entry)
+    permissions["deny"] = merged
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
+
+
+def origin_url(core):
+    proc = git(core, "config", "--get", "remote.origin.url", check=False)
+    return proc.stdout.decode().strip() if proc.returncode == 0 else ""
+
+
+def open_pr(profile, repo, branch, title, body, push_output):
+    cli = shlex.split(str(profile.get("pr_cli") or ""))
+    if not cli:
+        warn("profile.pr_cli is empty; the pull request was not opened")
+        print(push_output)
+        return
+    default_branch = str(profile.get("default_branch") or "main")
+    handle, body_path = tempfile.mkstemp(prefix="harness-pr-", suffix=".md")
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as out:
+            out.write(body)
+        if os.path.basename(cli[0]) == "gh":
+            args = cli + [
+                "pr", "create", "--base", default_branch, "--head", branch,
+                "--title", title, "--body-file", body_path,
+            ]
+        else:
+            args = cli + [
+                "pr", "create", "--title", title, "--body-file", body_path,
+                "--source", branch, "--dest", default_branch,
+            ]
+        try:
+            proc = subprocess.run(args, cwd=str(repo), capture_output=True, text=True)
+        except OSError as exc:
+            proc = subprocess.CompletedProcess(args, 127, "", str(exc))
+    finally:
+        os.unlink(body_path)
+    if proc.returncode != 0:
+        print(push_output)
+        warn(f"the pull request command failed ({proc.stderr.strip() or proc.stdout.strip()}); open it from the link above")
+    elif proc.stdout.strip():
+        print(proc.stdout.strip())
+
+
+def current_ref(repo):
+    proc = git(repo, "symbolic-ref", "--short", "-q", "HEAD", check=False)
+    if proc.returncode == 0:
+        return proc.stdout.decode().strip()
+    return git_out(repo, "rev-parse", "HEAD")
+
+
+def sync_repo(repo, tag, from_=None, pr=False):
+    repo = Path(repo).resolve()
+    top = git(repo, "rev-parse", "--show-toplevel", check=False)
+    if top.returncode != 0 or Path(top.stdout.decode().strip()).resolve() != repo:
+        raise HarnessError(f"{repo} is not the root of a git repository")
+    profile = load_profile(repo)
+    with contextlib.ExitStack() as stack:
+        if from_:
+            core = Path(from_).resolve()
+            if not core.is_dir():
+                raise HarnessError(f"core checkout not found: {from_}")
+        else:
+            source = profile.get("harness_source")
+            if not source:
+                raise HarnessError("profile has no harness_source; pass --from <core checkout>", 2)
+            scratch = stack.enter_context(tempfile.TemporaryDirectory(prefix="harness-core-"))
+            core = Path(scratch) / "core"
+            proc = subprocess.run(
+                ["git", "clone", "--quiet", str(source), str(core)], capture_output=True, text=True
+            )
+            if proc.returncode != 0:
+                raise HarnessError(f"cannot clone {source}: {proc.stderr.strip()}")
+        tree = CoreTree(core, tag)
+        schema = load_schema(tree)
+        validate_profile(profile, schema, relax=("harness_source",) if from_ else ())
+        source_label = str(profile.get("harness_source") or origin_url(core) or core)
+        return apply_sync(repo, profile, tree, tag, source_label, pr)
+
+
+def apply_sync(repo, profile, tree, tag, source_label, pr):
+    app_dir = normalize_app_dir(profile["app_dir"])
+    instructions_rel = os.path.normpath(str(profile["instructions_file"]))
+    if instructions_rel.startswith("/") or instructions_rel.startswith(".."):
+        raise HarnessError("profile.instructions_file must stay inside the repository", 2)
+
+    selected = select_vendored(tree)
+    wanted = [src for src, _exec in selected.values()]
+    for needed in ("settings/deny-core.json", "instructions/house.md"):
+        if not tree.has(needed):
+            raise HarnessError(f"{tag} has no {needed}")
+    blobs = tree.read_many(wanted + ["settings/deny-core.json", "instructions/house.md"])
+
+    vendored = {}
+    for dest, (src, executable) in selected.items():
+        data = blobs[src]
+        if dest.startswith(".claude/rules/core/"):
+            data = rewrite_rule(data.decode("utf-8"), app_dir).encode("utf-8")
+        vendored[dest] = (data, executable)
+
+    try:
+        deny_doc = json.loads(blobs["settings/deny-core.json"])
+        core_deny = deny_doc["deny"]
+        if not isinstance(core_deny, list) or not all(isinstance(x, str) for x in core_deny):
+            raise ValueError("deny must be a list of strings")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HarnessError(f"settings/deny-core.json is invalid: {exc}")
+    body = house_body(blobs["instructions/house.md"])
+
+    lock_path = repo / LOCK_RELATIVE
+    previous = read_lock(lock_path) or {}
+    previous_files = {p: s for p, s in (previous.get("files") or {}).items() if safe_lock_path(p)}
+    previous_deny = previous.get("deny") or []
+
+    instructions_path = repo / instructions_rel
+    settings_rel = ".claude/settings.json"
+    settings_path = repo / settings_rel
+    for relative in [*vendored, LOCK_RELATIVE, settings_rel, instructions_rel]:
+        assert_no_symlink(repo, relative)
+    if instructions_path.is_symlink():
+        raise HarnessError(f"{instructions_rel} is a symlink; refusing to write through it")
+
+    settings_text = merge_deny(
+        settings_path.read_text(encoding="utf-8") if settings_path.is_file() else None,
+        core_deny,
+        previous_deny,
+    )
+    instructions_text = apply_house(
+        instructions_path.read_text(encoding="utf-8") if instructions_path.is_file() else None, tag, body
+    )
+    file_shas = {dest: sha256_bytes(data) for dest, (data, _e) in vendored.items()}
+    new_lock = lock_text(
+        source_label,
+        tag,
+        tree.commit,
+        tree_hash(file_shas),
+        sha256_bytes(body.encode("utf-8")),
+        lock_paths_for(vendored),
+        core_deny,
+        file_shas,
+    )
+
+    removals = sorted((p for p in previous_files if p not in vendored), key=path_key)
+    added = [d for d in vendored if not (repo / d).is_file()]
+    changed = [d for d, (data, e) in vendored.items() if (repo / d).is_file() and not file_matches(repo / d, data, e)]
+    removed = [p for p in removals if (repo / p).exists() or (repo / p).is_symlink()]
+    other_writes = {
+        settings_rel: settings_text.encode("utf-8"),
+        instructions_rel: instructions_text.encode("utf-8"),
+        LOCK_RELATIVE: new_lock.encode("utf-8"),
+    }
+    other_changed = [r for r, data in other_writes.items() if not file_matches(repo / r, data, None)]
+
+    if not (added or changed or removed or other_changed):
+        info(f"already at {tag} ({tree.commit[:12]}): nothing to change")
+        return 0
+
+    for dest in changed:
+        locked = previous_files.get(dest)
+        if locked and sha256_bytes((repo / dest).read_bytes()) != locked:
+            warn(f"local changes in {dest} are overwritten (use `harness propose` to send them to the core)")
+
+    branch = f"chore/harness-sync-{tag}"
+    message = f"chore(harness): sync core {tag}"
+    original = None
+    if pr:
+        if git_out(repo, "status", "--porcelain", "--untracked-files=no"):
+            raise HarnessError("the working tree has uncommitted changes; commit or stash them before --pr")
+        original = current_ref(repo)
+        git(repo, "checkout", "-q", "-b", branch)
+    try:
+        for dest, (data, executable) in vendored.items():
+            if not file_matches(repo / dest, data, executable):
+                write_file(repo / dest, data, executable)
+        for relative in removals:
+            target = repo / relative
+            if target.is_file() or target.is_symlink():
+                target.unlink()
+                prune_empty_dirs(repo, target.parent)
+        for relative, data in other_writes.items():
+            if not file_matches(repo / relative, data, None):
+                write_file(repo / relative, data)
+        stage(repo, [*vendored, LOCK_RELATIVE, settings_rel, instructions_rel], removals)
+        info(
+            f"synced {tag} ({tree.commit[:12]}): {len(added)} added, {len(changed)} changed, "
+            f"{len(removed)} removed"
+        )
+        if pr:
+            git(repo, "commit", "-q", "-m", message)
+            pushed = git(repo, "push", "-u", "origin", branch, check=False)
+            push_output = (pushed.stdout + pushed.stderr).decode("utf-8", "replace").strip()
+            if pushed.returncode != 0:
+                raise HarnessError(f"git push failed (the commit stays on branch {branch}): {push_output}")
+            body_text = (
+                f"Syncs the vendored harness core to `{tag}` (commit `{tree.commit}`).\n\n"
+                f"- Files added: {len(added)}\n- Files changed: {len(changed)}\n- Files removed: {len(removed)}\n"
+            )
+            open_pr(profile, repo, branch, message, body_text, push_output)
+    finally:
+        if original is not None:
+            git(repo, "checkout", "-q", original, check=False)
+    return 0
+
+
+# ---------------------------------------------------------------------------------------
+# sync --user
+# ---------------------------------------------------------------------------------------
+
+
+def sync_user(tag, from_=None, source=None):
+    home = Path(os.environ.get("HOME") or Path.home())
+    lock_path = home / USER_LOCK_RELATIVE
+    previous = read_lock(lock_path) or {}
+    recorded = set(previous.get("paths") or [])
+    with contextlib.ExitStack() as stack:
+        if from_:
+            core = Path(from_).resolve()
+            source_label = origin_url(core) or str(core)
+        else:
+            source = source or os.environ.get("HARNESS_SOURCE") or previous.get("source")
+            if not source:
+                raise HarnessError("sync --user needs --from <core checkout> or --source <git URL>", 2)
+            scratch = stack.enter_context(tempfile.TemporaryDirectory(prefix="harness-core-"))
+            core = Path(scratch) / "core"
+            proc = subprocess.run(
+                ["git", "clone", "--quiet", str(source), str(core)], capture_output=True, text=True
+            )
+            if proc.returncode != 0:
+                raise HarnessError(f"cannot clone {source}: {proc.stderr.strip()}")
+            source_label = str(source)
+        tree = CoreTree(core, tag)
+        wanted = {}
+        for name in USER_SKILLS:
+            prefix = f"skills/{name}/"
+            members = [p for p in tree.entries if p.startswith(prefix)]
+            if not members:
+                raise HarnessError(f"{tag} has no skill {name}")
+            for path in members:
+                if tree.entries[path][0] == "120000":
+                    raise HarnessError(f"{path} is a symlink in the core; symlinks cannot be installed")
+            wanted[name] = members
+        refused = []
+        for name in USER_SKILLS:
+            dest = home / ".claude" / "skills" / name
+            relative = f".claude/skills/{name}"
+            if dest.is_symlink() or (dest.exists() and relative not in recorded):
+                refused.append(str(dest))
+        if refused:
+            raise HarnessError(
+                "refusing to replace what this tool did not install (nothing was changed): "
+                + ", ".join(refused)
+            )
+        blobs = tree.read_many([p for members in wanted.values() for p in members])
+        for relative in sorted(recorded):
+            target = home / relative
+            if safe_lock_path(relative) and target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+        files = {}
+        for name, members in wanted.items():
+            for path in members:
+                dest_rel = f".claude/{path}"
+                data = blobs[path]
+                write_file(home / dest_rel, data, tree.entries[path][0] == "100755")
+                files[dest_rel] = sha256_bytes(data)
+        paths = [f".claude/skills/{name}" for name in USER_SKILLS]
+        write_file(
+            lock_path,
+            lock_text(source_label, tag, tree.commit, tree_hash(files), "", paths, [], files).encode("utf-8"),
+        )
+    info(f"installed {len(USER_SKILLS)} skills from {tag} into {home / '.claude' / 'skills'}")
+    return 0
+
+
+def cmd_sync(args):
+    if args.user:
+        if args.pr:
+            raise HarnessError("--pr does not apply to --user", 2)
+        return sync_user(args.tag, args.from_, args.source)
+    return sync_repo(Path(args.repo or os.getcwd()), args.tag, args.from_, args.pr)
+
+
+# ---------------------------------------------------------------------------------------
+# verify
+# ---------------------------------------------------------------------------------------
+
+
+def cmd_verify(args):
+    repo = Path(args.repo or os.getcwd()).resolve()
+    script = repo / ".claude" / "harness" / "bin" / "verify.sh"
+    if not script.is_file():
+        script = Path(__file__).resolve().parent / "verify.sh"
+    command = ["sh", str(script), "--repo", str(repo)]
+    if args.skip_trailer_range:
+        command += ["--skip-trailer-range", args.skip_trailer_range]
+    return subprocess.run(command).returncode
+
+
+# ---------------------------------------------------------------------------------------
+# propose
+# ---------------------------------------------------------------------------------------
+
+
+def cmd_propose(args):
+    repo = Path(args.repo or os.getcwd()).resolve()
+    core = Path(args.from_).resolve()
+    profile = load_profile(repo)
+    for key in ("repo_name", "app_dir", "instructions_file"):
+        if not profile.get(key):
+            raise HarnessError(f"profile has no '{key}'", 2)
+    app_dir = normalize_app_dir(profile["app_dir"])
+    repo_name = str(profile["repo_name"])
+    lock = read_lock(repo / LOCK_RELATIVE)
+    if lock is None:
+        raise HarnessError(f"{LOCK_RELATIVE} not found; run `harness sync` first")
+
+    locked = {p: s for p, s in (lock.get("files") or {}).items() if safe_lock_path(p)}
+    present = {}
+    for relative in lock.get("paths") or []:
+        if not safe_lock_path(relative):
+            continue
+        root = repo / relative
+        if root.is_file():
+            present[relative] = root
+        elif root.is_dir():
+            for found in sorted(root.rglob("*")):
+                if found.is_file() and not found.is_symlink():
+                    present[found.relative_to(repo).as_posix()] = found
+    changed = sorted(p for p, f in present.items() if p in locked and sha256_bytes(f.read_bytes()) != locked[p])
+    created = sorted(p for p in present if p not in locked)
+    deleted = sorted(p for p in locked if p not in present)
+
+    instructions_path = repo / os.path.normpath(str(profile["instructions_file"]))
+    house_changed = False
+    house_text = None
+    if lock.get("house_sha256") and instructions_path.is_file():
+        house_text = extract_house(instructions_path.read_text(encoding="utf-8"))
+        if house_text is None:
+            warn("the instructions file has no house block; skipping it")
+        elif sha256_bytes(house_text.encode("utf-8")) != lock["house_sha256"]:
+            house_changed = True
+
+    if not (changed or created or deleted or house_changed):
+        info("nothing to propose")
+        return 0
+
+    commit = lock.get("commit")
+    tree = CoreTree(core, commit)
+    if git_out(core, "status", "--porcelain", "--untracked-files=no"):
+        raise HarnessError(f"the core checkout {core} has uncommitted changes")
+    date = args.date or datetime.date.today().strftime("%Y%m%d")
+    # The core is public: the branch, the commit and the PR never name nor fingerprint the consumer.
+    branch = f"propose/{date}-{secrets.token_hex(4)}"
+    if git(core, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode == 0:
+        raise HarnessError(f"branch {branch} already exists in {core}")
+
+    def core_path(relative):
+        if relative.startswith(".claude/skills/"):
+            return relative[len(".claude/") :]
+        if relative.startswith(".claude/rules/core/"):
+            return "rules/core/" + relative[len(".claude/rules/core/") :]
+        if relative == ".claude/harness/bin/verify.sh":
+            return "bin/verify.sh"
+        raise HarnessError(f"{relative} has no place in the core")
+
+    writes = []
+    for relative in sorted(set(changed + created)):
+        data = present[relative].read_bytes()
+        if relative.startswith(".claude/rules/core/"):
+            source_path = core_path(relative)
+            original_text = tree.read(source_path).decode("utf-8") if tree.has(source_path) else None
+            data = restore_rule(data.decode("utf-8"), app_dir, original_text).encode("utf-8")
+        writes.append((core_path(relative), data, bool(present[relative].stat().st_mode & 0o111)))
+    if house_changed:
+        writes.append(("instructions/house.md", house_text.encode("utf-8"), False))
+
+    # Nothing leaves a private repository for the public core without the scan: the core's
+    # patterns plus the private ones kept outside any repository.
+    core_patterns = tree.read("scan-patterns.txt").decode("utf-8") if tree.has("scan-patterns.txt") else ""
+    patterns = publication_patterns(core_patterns, args.extra_patterns, not args.public_patterns_only)
+    allowlist = load_allowlist(core / "scan-allowlist.txt")
+    findings = scan_contents([(path, data) for path, data, _ in writes], patterns, allowlist)
+    if findings:
+        for line in findings:
+            print(line)
+        raise HarnessError(f"scan: {len(findings)} finding(s) in the proposed files; nothing was proposed")
+    check_identity(core, patterns, allowlist)
+
+    original = current_ref(core)
+    git(core, "checkout", "-q", "-b", branch, commit)
+    touched = []
+    try:
+        for path, data, executable in writes:
+            write_file(core / path, data, executable)
+            touched.append(path)
+        for relative in deleted:
+            target = core / core_path(relative)
+            if target.is_file():
+                target.unlink()
+            touched.append(core_path(relative))
+        git(core, "add", "-A", "--", *touched)
+        if git(core, "diff", "--cached", "--quiet", check=False).returncode == 0:
+            git(core, "checkout", "-q", original)
+            git(core, "branch", "-q", "-D", branch)
+            info("nothing to propose")
+            return 0
+        message = "chore(harness): propose changes from a consumer repository"
+        git(core, "commit", "-q", "-m", message)
+        info(f"proposed {len(touched)} file(s) on branch {branch} in {core}")
+        if not args.no_pr:
+            pushed = git(core, "push", "-u", "origin", branch, check=False)
+            push_output = (pushed.stdout + pushed.stderr).decode("utf-8", "replace").strip()
+            if pushed.returncode != 0:
+                raise HarnessError(f"git push failed (the commit stays on branch {branch}): {push_output}")
+            body = "Changes made to the vendored core in a consumer repository:\n\n" + "\n".join(f"- `{p}`" for p in touched) + "\n"
+            gh = os.environ.get("HARNESS_GH") or "gh"
+            handle, body_path = tempfile.mkstemp(prefix="harness-pr-", suffix=".md")
+            try:
+                with os.fdopen(handle, "w", encoding="utf-8") as out:
+                    out.write(body)
+                try:
+                    proc = subprocess.run(
+                        [gh, "pr", "create", "--base", "main", "--head", branch, "--title", message,
+                         "--body-file", body_path],
+                        cwd=str(core), capture_output=True, text=True,
+                    )
+                except OSError as exc:
+                    proc = subprocess.CompletedProcess([gh], 127, "", str(exc))
+            finally:
+                os.unlink(body_path)
+            if proc.returncode != 0:
+                print(push_output)
+                warn(f"the pull request command failed ({proc.stderr.strip() or proc.stdout.strip()})")
+            elif proc.stdout.strip():
+                print(proc.stdout.strip())
+    finally:
+        if git(core, "rev-parse", "--abbrev-ref", "HEAD", check=False).stdout.decode().strip() == branch:
+            git(core, "checkout", "-q", original, check=False)
+    return 0
+
+
+# ---------------------------------------------------------------------------------------
+# frontmatter (strict YAML subset) for lint and catalog
+# ---------------------------------------------------------------------------------------
+
+FM_KEY_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*):(?:[ ]+(.*))?$")
+BLOCK_HEADER_RE = re.compile(r"^[|>][-+]?[1-9]?[-+]?(\s+#.*)?$")
+PLAIN_BAD_START = "`!&*{}[]|>'\"%@,?:"
+
+
+def indent_of(text):
+    return len(text) - len(text.lstrip(" "))
+
+
+class FrontmatterParser:
+    def __init__(self, items):
+        self.items = items
+        self.errors = []
+        self.lines = {}
+
+    def err(self, line, message):
+        self.errors.append((line, message))
+
+    def skip_blank(self, pos):
+        while pos < len(self.items) and (not self.items[pos][1].strip() or self.items[pos][1].strip().startswith("#")):
+            pos += 1
+        return pos
+
+    def check_plain(self, text, line, first):
+        if first and text and text[0] in PLAIN_BAD_START:
+            self.err(line, f"plain scalar starts with '{text[0]}'; quote the value")
+        if ": " in text:
+            self.err(line, "plain scalar contains ': '; quote the value")
+        if " #" in text:
+            self.err(line, "plain scalar contains ' #'; quote the value")
+        if text.endswith(":"):
+            self.err(line, "plain scalar ends with ':'; quote the value")
+
+    def parse_scalar(self, pos, cur, rest):
+        line = self.items[pos][0]
+        if rest[0] in "\"'":
+            text = rest
+            end = pos
+            while True:
+                try:
+                    value, after = read_quoted(text)
+                    break
+                except ValueError as exc:
+                    if "unterminated" in str(exc) and end + 1 < len(self.items):
+                        end += 1
+                        text += " " + self.items[end][1].strip()
+                        continue
+                    self.err(line, str(exc))
+                    return "", pos + 1
+            after = after.strip()
+            if after and not after.startswith("#"):
+                self.err(line, "unexpected text after the closing quote")
+            return value, end + 1
+        self.check_plain(rest, line, True)
+        parts = [rest]
+        end = pos + 1
+        while end < len(self.items):
+            raw = self.items[end][1]
+            if not raw.strip() or indent_of(raw) <= cur:
+                break
+            self.check_plain(raw.strip(), self.items[end][0], False)
+            parts.append(raw.strip())
+            end += 1
+        return " ".join(parts), end
+
+    def parse_block(self, pos, cur, rest):
+        line = self.items[pos][0]
+        end = pos + 1
+        collected = []
+        while end < len(self.items):
+            raw = self.items[end][1]
+            if not raw.strip():
+                collected.append("")
+                end += 1
+                continue
+            if indent_of(raw) <= cur:
+                break
+            collected.append(raw)
+            end += 1
+        if not BLOCK_HEADER_RE.match(rest):
+            self.err(line, f"invalid block scalar header '{rest}'")
+            return "", end
+        while collected and collected[-1] == "":
+            collected.pop()
+        indents = [indent_of(x) for x in collected if x.strip()]
+        base = min(indents) if indents else 0
+        lines = [x[base:] if x.strip() else "" for x in collected]
+        if rest[0] == "|":
+            return "\n".join(lines), end
+        value = ""
+        previous_blank = False
+        for number, text in enumerate(lines):
+            if text == "":
+                value += "\n"
+                previous_blank = True
+            else:
+                if number and not previous_blank:
+                    value += " "
+                value += text
+                previous_blank = False
+        return value, end
+
+    def parse_list(self, pos, indent, prefix):
+        out = []
+        while pos < len(self.items):
+            line, raw = self.items[pos]
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                pos += 1
+                continue
+            cur = indent_of(raw)
+            if cur < indent:
+                break
+            if cur == indent and (stripped == "-" or stripped.startswith("- ")):
+                rest = stripped[1:].strip()
+                if rest == "":
+                    out.append("")
+                    pos += 1
+                else:
+                    value, pos = self.parse_scalar(pos, cur, rest)
+                    out.append(value)
+            else:
+                self.err(line, "unexpected indentation or content in list")
+                pos += 1
+        return out, pos
+
+    def parse_map(self, pos, indent, prefix=""):
+        result = {}
+        while pos < len(self.items):
+            line, raw = self.items[pos]
+            stripped = raw.strip()
+            if not stripped or stripped.startswith("#"):
+                pos += 1
+                continue
+            cur = indent_of(raw)
+            if cur < indent:
+                break
+            if cur > indent:
+                self.err(line, "unexpected indentation")
+                pos += 1
+                continue
+            match = FM_KEY_RE.match(stripped)
+            if not match:
+                self.err(line, "cannot parse line (expected `key: value`)")
+                pos += 1
+                continue
+            key = match.group(1)
+            rest = (match.group(2) or "").strip()
+            if rest.startswith("#"):
+                rest = ""
+            duplicate = key in result
+            if duplicate:
+                self.err(line, f"duplicate key '{key}'")
+            self.lines.setdefault(prefix + key, line)
+            if rest == "":
+                look = self.skip_blank(pos + 1)
+                nested = None
+                if look < len(self.items):
+                    look_indent = indent_of(self.items[look][1])
+                    look_text = self.items[look][1].strip()
+                    is_item = look_text == "-" or look_text.startswith("- ")
+                    if look_indent > cur and is_item:
+                        nested = ("list", look, look_indent)
+                    elif look_indent > cur:
+                        nested = ("map", look, look_indent)
+                    elif look_indent == cur and is_item:
+                        nested = ("list", look, cur)
+                if nested is None:
+                    value, pos = "", pos + 1
+                elif nested[0] == "list":
+                    value, pos = self.parse_list(nested[1], nested[2], prefix + key + ".")
+                else:
+                    value, pos = self.parse_map(nested[1], nested[2], prefix + key + ".")
+            elif rest[0] in "|>":
+                value, pos = self.parse_block(pos, cur, rest)
+            else:
+                value, pos = self.parse_scalar(pos, cur, rest)
+            if not duplicate:
+                result[key] = value
+        return result, pos
+
+
+def parse_frontmatter(text):
+    """Return (data, lines, errors) for the frontmatter of a SKILL.md. errors: (line, message)."""
+    lines = text.split("\n")
+    if not lines or lines[0].rstrip() != "---":
+        return None, {}, [(1, "missing frontmatter: the file must start with ---")]
+    end = None
+    for index in range(1, len(lines)):
+        if lines[index].rstrip() == "---":
+            end = index
+            break
+    if end is None:
+        return None, {}, [(1, "frontmatter is not closed by a second ---")]
+    items = []
+    tab_errors = []
+    for index in range(1, end):
+        raw = lines[index].rstrip("\r")
+        if "\t" in raw:
+            tab_errors.append((index + 1, "tab character in frontmatter"))
+            raw = raw.replace("\t", " ")
+        items.append((index + 1, raw))
+    parser = FrontmatterParser(items)
+    data, _pos = parser.parse_map(0, 0)
+    return data, parser.lines, sorted(tab_errors + parser.errors)
+
+
+# ---------------------------------------------------------------------------------------
+# lint and catalog
+# ---------------------------------------------------------------------------------------
+
+
+def skill_dirs(core):
+    root = Path(core) / "skills"
+    if not root.is_dir():
+        return []
+    return sorted(p for p in root.iterdir() if p.is_dir())
+
+
+def skill_files(skill_dir):
+    found = []
+    for base, dirs, names in os.walk(skill_dir):
+        dirs[:] = sorted(d for d in dirs if d != "__pycache__")
+        for name in sorted(names):
+            full = Path(base) / name
+            if not full.is_symlink() and not name.endswith(".pyc"):
+                found.append(full)
+    return found
+
+
+def lint_skill(core, skill_dir):
+    relative = f"skills/{skill_dir.name}/SKILL.md"
+    skill_md = skill_dir / "SKILL.md"
+    if not skill_md.is_file():
+        return [f"skills/{skill_dir.name}:1: missing SKILL.md"], None
+    data, lines, errors = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+    problems = [f"{relative}:{line}: {message}" for line, message in errors]
+    if data is None:
+        return problems, None
+
+    def at(key):
+        return lines.get(key, 1)
+
+    name = data.get("name")
+    if not isinstance(name, str) or not name:
+        problems.append(f"{relative}:1: missing name")
+    else:
+        if name != skill_dir.name:
+            problems.append(f"{relative}:{at('name')}: name '{name}' does not match the directory '{skill_dir.name}'")
+        if not SKILL_NAME_RE.match(name):
+            problems.append(f"{relative}:{at('name')}: name '{name}' must match ^[a-z0-9]+(-[a-z0-9]+)*$")
+        if len(name) > 64:
+            problems.append(f"{relative}:{at('name')}: name is longer than 64 characters ({len(name)})")
+    description = data.get("description")
+    if not isinstance(description, str) or not description.strip():
+        problems.append(f"{relative}:1: missing description")
+    elif len(description.strip()) > 1024:
+        problems.append(
+            f"{relative}:{at('description')}: description is longer than 1024 characters ({len(description.strip())})"
+        )
+    metadata = data.get("metadata")
+    if not isinstance(metadata, dict):
+        problems.append(f"{relative}:1: missing metadata.version")
+        problems.append(f"{relative}:1: missing metadata.owner")
+    else:
+        for key in ("version", "owner"):
+            value = metadata.get(key)
+            if not isinstance(value, str) or not value.strip():
+                problems.append(f"{relative}:{at('metadata')}: missing metadata.{key}")
+    return problems, data
+
+
+def cmd_lint(args):
+    core = Path(args.core or default_core())
+    problems = []
+    count = 0
+    for skill_dir in skill_dirs(core):
+        count += 1
+        found, _data = lint_skill(core, skill_dir)
+        problems += found
+    for problem in problems:
+        print(problem)
+    if problems:
+        print(f"lint: {len(problems)} problem(s) in {count} skill(s)", file=sys.stderr)
+        return 1
+    info(f"lint: {count} skill(s) OK")
+    return 0
+
+
+def content_hash(skill_dir):
+    files = {p.relative_to(skill_dir).as_posix(): sha256_bytes(p.read_bytes()) for p in skill_files(skill_dir)}
+    return tree_hash(files)
+
+
+def render_catalog(core):
+    entries = []
+    for skill_dir in skill_dirs(core):
+        problems, data = lint_skill(core, skill_dir)
+        if problems or data is None:
+            raise HarnessError("cannot catalog a skill that fails lint:\n  " + "\n  ".join(problems or [skill_dir.name]))
+        description = " ".join(str(data["description"]).split())
+        entries.append(
+            {
+                "name": data["name"],
+                "version": data["metadata"]["version"],
+                "owner": data["metadata"]["owner"],
+                "description": description,
+                "path": f"skills/{skill_dir.name}",
+                "contentHash": content_hash(skill_dir),
+            }
+        )
+    entries.sort(key=lambda e: e["name"])
+    lines = [
+        "# Skill catalog",
+        "",
+        "Generated by `bin/harness catalog`; do not edit by hand. Each skill's `contentHash` in",
+        "`registry.json` is the sha256 of its `sha256sum` lines (paths relative to the skill directory).",
+        "",
+        "| Skill | Version | Owner | Description |",
+        "|---|---|---|---|",
+    ]
+    for entry in entries:
+        description = entry["description"].replace("|", "\\|")
+        lines.append(f"| `{entry['name']}` | {entry['version']} | {entry['owner']} | {description} |")
+    registry = {"schema": 1, "skills": entries}
+    return "\n".join(lines) + "\n", json.dumps(registry, indent=2, ensure_ascii=False) + "\n"
+
+
+def cmd_catalog(args):
+    core = Path(args.core or default_core())
+    catalog, registry = render_catalog(core)
+    targets = {"CATALOG.md": catalog, "registry.json": registry}
+    stale = [
+        name for name, text in targets.items()
+        if not (core / name).is_file() or (core / name).read_text(encoding="utf-8") != text
+    ]
+    if args.check:
+        for name in stale:
+            print(f"catalog: {name} is out of date; run `bin/harness catalog`")
+        if stale:
+            return 1
+        info("catalog: up to date")
+        return 0
+    for name, text in targets.items():
+        (core / name).write_text(text, encoding="utf-8")
+    info(f"catalog: wrote CATALOG.md and registry.json ({len(json.loads(registry)['skills'])} skills)")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------
+# scan
+# ---------------------------------------------------------------------------------------
+
+
+def load_patterns(path):
+    return parse_patterns(Path(path).read_text(encoding="utf-8"), path)
+
+
+def parse_patterns(text, path):
+    patterns = []
+    for number, raw in enumerate(text.splitlines(), 1):
+        entry = raw.strip()
+        if not entry or entry.startswith("#"):
+            continue
+        try:
+            patterns.append((entry, re.compile(entry)))
+        except re.error as exc:
+            raise HarnessError(f"{path}:{number}: invalid pattern ({exc})", 2)
+    return patterns
+
+
+def allowed(relative, line, match, allowlist):
+    """A finding is allowed when an allowlist regex for its path matches the finding text, or
+    matches a span of the line that contains the whole finding: `owner-login` then exempts that
+    login and not the bare name inside it elsewhere."""
+    for glob, rx in allowlist:
+        if not fnmatch.fnmatchcase(relative, glob):
+            continue
+        if rx.search(match.group(0)):
+            return True
+        for span in rx.finditer(line):
+            if span.start() <= match.start() and match.end() <= span.end():
+                return True
+    return False
+
+
+def load_allowlist(path):
+    entries = []
+    if not Path(path).is_file():
+        return entries
+    for number, raw in enumerate(Path(path).read_text(encoding="utf-8").splitlines(), 1):
+        if not raw.strip() or raw.lstrip().startswith("#"):
+            continue
+        fields = raw.split("\t")
+        if len(fields) < 3 or not fields[0].strip() or not fields[1].strip() or not fields[2].strip():
+            raise HarnessError(f"{path}:{number}: allowlist line needs <path glob><TAB><regex><TAB><reason>", 2)
+        try:
+            entries.append((fields[0].strip(), re.compile(fields[1].strip())))
+        except re.error as exc:
+            raise HarnessError(f"{path}:{number}: invalid regex ({exc})", 2)
+    return entries
+
+
+def core_file_list(core):
+    core = Path(core)
+    names = []
+    if (core / ".git").exists():
+        proc = subprocess.run(
+            ["git", "-C", str(core), "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True,
+        )
+        if proc.returncode == 0:
+            names = sorted({n for n in proc.stdout.decode("utf-8", "replace").split("\0") if n})
+    else:
+        for base, dirs, files in os.walk(core):
+            dirs[:] = sorted(d for d in dirs if d != ".git")
+            for name in sorted(files):
+                names.append((Path(base) / name).relative_to(core).as_posix())
+    return [n for n in names if (core / n).is_file() and not (core / n).is_symlink()]
+
+
+def scan_contents(contents, patterns, allowlist):
+    """Findings as `path:line: pattern: match` for (relative path, bytes) pairs. The path itself
+    is scanned as line 0; binary and non-UTF-8 content is skipped."""
+    lines = []
+    for relative, data in contents:
+        for source, regex in patterns:
+            for match in regex.finditer(relative):
+                if not allowed(relative, relative, match, allowlist):
+                    lines.append(f"{relative}:0: {source}: {match.group(0)}")
+        if b"\0" in data[:8192]:
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        for number, line in enumerate(text.splitlines(), 1):
+            for source, regex in patterns:
+                for match in regex.finditer(line):
+                    if allowed(relative, line, match, allowlist):
+                        continue
+                    lines.append(f"{relative}:{number}: {source}: {match.group(0)}")
+    return lines
+
+
+def default_private_patterns():
+    return Path.home() / ".config" / "cdv-harness" / "private-patterns.txt"
+
+
+def publication_patterns(core_patterns_text, extra_files, require_private):
+    """The core's public patterns plus the private ones. Without a private file, refuse unless
+    the caller accepted the public patterns alone."""
+    patterns = parse_patterns(core_patterns_text, "scan-patterns.txt") if core_patterns_text else []
+    extra_files = list(extra_files or [])
+    if not extra_files and default_private_patterns().is_file():
+        extra_files.append(str(default_private_patterns()))
+    if not extra_files and require_private:
+        raise HarnessError(
+            f"no private scan patterns ({default_private_patterns()} is missing); pass --extra-patterns FILE, "
+            "or --public-patterns-only to accept the public patterns alone",
+            2,
+        )
+    for extra in extra_files:
+        if not Path(extra).is_file():
+            raise HarnessError(f"patterns file not found: {extra}", 2)
+        patterns += load_patterns(extra)
+    return patterns
+
+
+def check_identity(core, patterns, allowlist):
+    """Commits and tags made by the tool carry the checkout's git identity to a public remote."""
+    idents = []
+    for var in ("GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"):
+        proc = git(core, "var", var, check=False)
+        if proc.returncode != 0:
+            raise HarnessError(f"git has no {var.lower().replace('_', ' ')}: set user.name and user.email in {core}")
+        idents.append(proc.stdout.decode("utf-8", "replace").rsplit(" ", 2)[0])
+    findings = scan_contents([("git identity", "\n".join(idents).encode("utf-8"))], patterns, allowlist)
+    if findings:
+        for line in findings:
+            print(line)
+        raise HarnessError(
+            "the git identity of the core checkout would be published; set user.name and user.email "
+            "(for example the GitHub no-reply address) in that checkout"
+        )
+
+
+def history_contents(core, rev_range):
+    """Author, committer and message of each commit in the range, and tagger and message of each
+    annotated tag, as (label, bytes) pairs for scan_contents."""
+    contents = []
+    for sha in git_out(core, "rev-list", rev_range).split():
+        meta = git(core, "show", "-s", "--format=%an <%ae>%n%cn <%ce>%n%B", sha).stdout
+        contents.append((f"commit {sha[:7]}", meta))
+    for line in git_out(core, "for-each-ref", "--format=%(objecttype) %(refname:short)", "refs/tags").splitlines():
+        kind, _, tag = line.partition(" ")
+        if kind == "tag":
+            meta = git(core, "for-each-ref", "--format=%(taggername) %(taggeremail)%0a%(contents)", f"refs/tags/{tag}").stdout
+            contents.append((f"tag {tag}", meta))
+    return contents
+
+
+def cmd_scan(args):
+    core = Path(args.core or default_core()).resolve()
+    patterns = []
+    own = core / "scan-patterns.txt"
+    if own.is_file():
+        patterns += load_patterns(own)
+    for extra in args.extra_patterns or []:
+        if not Path(extra).is_file():
+            raise HarnessError(f"patterns file not found: {extra}", 2)
+        patterns += load_patterns(extra)
+    allowlist = load_allowlist(core / "scan-allowlist.txt")
+    skipped = {"scan-patterns.txt", "scan-allowlist.txt"}
+
+    if args.paths:
+        names = []
+        for given in args.paths:
+            target = Path(given).resolve()
+            if target.is_dir():
+                for base, dirs, files in os.walk(target):
+                    dirs[:] = sorted(d for d in dirs if d != ".git")
+                    names += [Path(base, f) for f in sorted(files)]
+            elif target.is_file():
+                names.append(target)
+            else:
+                raise HarnessError(f"path not found: {given}", 2)
+        candidates = []
+        for full in names:
+            try:
+                candidates.append((full.relative_to(core).as_posix(), full))
+            except ValueError:
+                candidates.append((str(full), full))
+    else:
+        candidates = [(n, core / n) for n in core_file_list(core)]
+
+    contents = []
+    for relative, full in candidates:
+        if relative in skipped or full.is_symlink():
+            continue
+        contents.append((relative, full.read_bytes()))
+    if args.commits:
+        contents += history_contents(core, args.commits)
+    lines = scan_contents(contents, patterns, allowlist)
+    for line in lines:
+        print(line)
+    findings = len(lines)
+    if findings:
+        print(f"scan: {findings} finding(s)", file=sys.stderr)
+        return 1
+    info("scan: 0 findings")
+    return 0
+
+
+# ---------------------------------------------------------------------------------------
+# release
+# ---------------------------------------------------------------------------------------
+
+
+def cmd_release(args):
+    core = Path(args.core or default_core()).resolve()
+    branch = args.branch
+    if git(core, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False).returncode != 0:
+        raise HarnessError(f"branch '{branch}' not found in {core}")
+    tags = [t for t in git_out(core, "tag", "--list", "v*").split() if SEMVER_TAG_RE.match(t)]
+    if tags:
+        last = max(tags, key=lambda t: tuple(int(x) for x in SEMVER_TAG_RE.match(t).groups()))
+        ahead = int(git_out(core, "rev-list", "--count", f"{last}..{branch}"))
+        if ahead == 0:
+            info(f"no change on {branch} since {last}")
+            return 0
+        stamp = int(git_out(core, "for-each-ref", "--format=%(creatordate:unix)", f"refs/tags/{last}"))
+        tagged_at = datetime.datetime.fromtimestamp(stamp, datetime.timezone.utc)
+        if args.now:
+            try:
+                now = datetime.datetime.strptime(args.now, "%Y-%m-%d").replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                raise HarnessError(f"--now must be YYYY-MM-DD, got '{args.now}'", 2)
+        else:
+            now = datetime.datetime.now(datetime.timezone.utc)
+        if now - tagged_at < datetime.timedelta(days=7):
+            info(f"last tag {last} is younger than 7 days")
+            return 0
+        major, minor, patch = (int(x) for x in SEMVER_TAG_RE.match(last).groups())
+        subjects = git_out(core, "log", "--format=%s", f"{last}..{branch}").splitlines()
+        if any(re.match(r"^feat(\(.+\))?!?:", s) for s in subjects):
+            bump, version = "minor", f"v{major}.{minor + 1}.0"
+        else:
+            bump, version = "patch", f"v{major}.{minor}.{patch + 1}"
+        basis = f"{bump} bump from {last}"
+    else:
+        if int(git_out(core, "rev-list", "--count", branch)) == 0:
+            raise HarnessError(f"branch '{branch}' has no commits")
+        version, basis = "v0.1.0", "first release"
+    if args.dry_run:
+        info(f"next version: {version} ({basis}); dry run, nothing created")
+        return 0
+    own = core / "scan-patterns.txt"
+    patterns = publication_patterns(own.read_text(encoding="utf-8") if own.is_file() else "", None, False)
+    check_identity(core, patterns, load_allowlist(core / "scan-allowlist.txt"))
+    git(core, "tag", "-a", version, "-m", f"release {version}", branch)
+    git(core, "push", "origin", version)
+    info(f"tagged and pushed {version} ({basis})")
+
+    consumers_file = Path(args.consumers or Path(os.environ.get("HOME") or Path.home()) / ".config" / "cdv-harness" / "consumers.yaml")
+    if not consumers_file.is_file():
+        warn(f"consumers file not found ({consumers_file}); tagged only")
+        return 0
+    listed = parse_profile_text(consumers_file.read_text(encoding="utf-8"), str(consumers_file)).get("consumers") or []
+    if not isinstance(listed, list):
+        raise HarnessError(f"{consumers_file}: 'consumers' must be a list", 2)
+    failures = 0
+    for item in listed:
+        path = Path(os.path.expanduser(str(item)))
+        info(f"consumer {path}:")
+        try:
+            sync_repo(path, version, from_=core, pr=True)
+        except HarnessError as exc:
+            failures += 1
+            print(f"harness: consumer {path} failed: {exc}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+# ---------------------------------------------------------------------------------------
+# command line
+# ---------------------------------------------------------------------------------------
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="harness", description=__doc__.strip().splitlines()[0])
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("sync", help="vendor the core at a tag into a repository (or into $HOME with --user)")
+    p.add_argument("tag")
+    p.add_argument("--from", dest="from_", help="core checkout to read the tag from (default: clone profile.harness_source)")
+    p.add_argument("--repo", help="consumer repository root (default: current directory)")
+    p.add_argument("--pr", action="store_true", help="work on chore/harness-sync-<tag>, commit, push and open a PR")
+    p.add_argument("--user", action="store_true", help="install the user-level skills under $HOME/.claude/skills")
+    p.add_argument("--source", help="with --user and no --from: git URL of the core")
+    p.set_defaults(func=cmd_sync)
+
+    p = sub.add_parser("verify", help="check the vendored core against the lock")
+    p.add_argument("--repo")
+    p.add_argument("--skip-trailer-range")
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("propose", help="send local edits to vendored files back to the core as a branch and PR")
+    p.add_argument("--from", dest="from_", required=True, help="core checkout")
+    p.add_argument("--repo")
+    p.add_argument("--no-pr", action="store_true")
+    p.add_argument("--date", help="YYYYMMDD used in the branch name (default: today)")
+    p.add_argument("--extra-patterns", action="append", metavar="FILE",
+                   help="private scan patterns (default: ~/.config/cdv-harness/private-patterns.txt)")
+    p.add_argument("--public-patterns-only", action="store_true",
+                   help="accept scanning with the core's public patterns alone when no private file exists")
+    p.set_defaults(func=cmd_propose)
+
+    p = sub.add_parser("catalog", help="generate CATALOG.md and registry.json from the skills")
+    p.add_argument("--check", action="store_true", help="write nothing; exit 1 when a file would change")
+    p.add_argument("--core")
+    p.set_defaults(func=cmd_catalog)
+
+    p = sub.add_parser("release", help="tag the core and open sync PRs in the listed consumers")
+    p.add_argument("--core")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--now", help="YYYY-MM-DD (midnight UTC) used as the current date")
+    p.add_argument("--consumers", help="file listing consumer repositories (default: ~/.config/cdv-harness/consumers.yaml)")
+    p.add_argument("--branch", default="main")
+    p.set_defaults(func=cmd_release)
+
+    p = sub.add_parser("lint", help="check the SKILL.md frontmatter of every skill")
+    p.add_argument("--core")
+    p.set_defaults(func=cmd_lint)
+
+    p = sub.add_parser("scan", help="scan the core for facts that must not be public")
+    p.add_argument("--extra-patterns", action="append", metavar="FILE")
+    p.add_argument("--core")
+    p.add_argument("--commits", metavar="RANGE",
+                   help="also scan the author, committer and message of these commits, and the annotated tags")
+    p.add_argument("paths", nargs="*")
+    p.set_defaults(func=cmd_scan)
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args) or 0
+    except HarnessError as exc:
+        print(f"harness: error: {exc}", file=sys.stderr)
+        return exc.code
+    except KeyboardInterrupt:
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())

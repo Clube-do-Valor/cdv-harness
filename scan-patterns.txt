@@ -1,0 +1,31 @@
+# Public patterns: facts that must never appear in this repository.
+# One Python regex per line. Matching is case-sensitive unless the line starts with (?i).
+# Private patterns (names of the company, people, repositories) live outside the repository and
+# are passed with `bin/harness scan --extra-patterns FILE`.
+
+# Notion collections
+collection://
+
+# A Bitbucket workspace
+bitbucket\.org/[A-Za-z0-9_-]+/
+
+# Brazilian hostnames and e-mail domains
+\.com\.br\b
+
+# Home directories of a person
+/home/[a-z]
+
+# Ticket keys
+\b[A-Z][A-Z0-9]{1,9}-\d{2,}\b
+
+# Slack tokens
+xox[abposr]-
+
+# AWS access keys
+AKIA[0-9A-Z]{16}
+
+# GitHub tokens
+gh[pousr]_[A-Za-z0-9]{20,}
+
+# E-mail addresses (example domains and the GitHub no-reply domain are allowed)
+[A-Za-z0-9._%+-]+@(?!(example\.(com|org|net)|users\.noreply\.github\.com)\b)[A-Za-z0-9-]+\.[A-Za-z.]{2,}

@@ -1,0 +1,275 @@
+# Profile schema for a repository that consumes cdv-harness.
+#
+# A consumer declares its facts in `.claude/harness/profile.yaml` (committed) and the facts of
+# one machine in `.claude/harness/profile.local.yaml` (ignored by git). The local file overrides
+# the committed one key by key. Both files use a flat YAML subset: `key: scalar` or a list of
+# scalars written as `- item` lines under `key:`. Nested mappings, anchors and flow style are
+# rejected by `harness sync`.
+#
+# Skills refer to a value as `profile.<key>`. A skill reads the profile in its step 0 and stops
+# when the file is missing. A required key that is missing is an error; an optional key that is
+# missing, or that holds `none`, means the repository does not have that thing, and the skill
+# skips the step that needs it.
+
+schema: 1
+variables:
+  # Identity and layout
+  harness_source:
+    type: string
+    required: true
+    description: Git URL of the cdv-harness core that `harness sync` clones when no local checkout is given.
+  repo_name:
+    type: string
+    required: true
+    description: Short name of the repository, used in prose and in branch and pane names.
+  app_dir:
+    type: string
+    required: true
+    description: Directory that holds the application, relative to the repository root (`.` when the app is the root). Rewrites `{app_dir}` in the core rules.
+  instructions_file:
+    type: string
+    required: true
+    description: Instructions file at the repository root that carries the managed house block (usually CLAUDE.md).
+  extension_dir:
+    type: string
+    required: true
+    description: Directory of the repository extensions, one `<skill>.md` per core skill that needs one (usually docs/harness).
+  default_branch:
+    type: string
+    required: true
+    description: Branch that feature branches start from and PRs target.
+  branch_prefixes:
+    type: list
+    required: true
+    description: Allowed feature branch prefixes, without the slash.
+  language_code:
+    type: string
+    required: true
+    description: Language of everything an engineer types (identifiers, commits, docs).
+  language_ui:
+    type: string
+    required: true
+    description: Language of user-facing copy, PR descriptions and delivery notes.
+
+  # Version control and pull requests
+  vcs_host:
+    type: enum
+    values: [bitbucket, github]
+    required: true
+    description: Host of the repository. Selects `references/vcs-<vcs_host>.md` in the skills that talk to the host.
+  vcs_repo:
+    type: string
+    required: true
+    description: Repository slug on the host, `workspace/repo` or `owner/repo`.
+  pr_cli:
+    type: string
+    required: true
+    description: Command that opens and updates pull requests (`gh`, or the path of the bundled Bitbucket client).
+  pr_review_dir_prefix:
+    type: string
+    required: false
+    description: Prefix of the review output directory at the repository root (for example `review-`).
+  ci_config:
+    type: string
+    required: false
+    description: CI configuration file or directory where the harness gate runs.
+  docs_gate:
+    type: string
+    required: false
+    description: Script that checks a PR carries its user guide, with its skip trailer; `none` when absent.
+  docs_skip_trailer:
+    type: string
+    required: false
+    description: Commit trailer that skips the docs gate, with its reason (for example `Docs-skip:`).
+
+  # Tickets and tasks
+  ticket_system:
+    type: string
+    required: true
+    description: Where tickets live (`notion`, `github`, `none`).
+  ticket_key_pattern:
+    type: string
+    required: false
+    description: Regex of the ticket key found in branch names and PR titles.
+  ticket_database:
+    type: string
+    required: false
+    description: Address of the ticket database the PR is linked to (kept in the repository, never in the core).
+  factory_task_cli:
+    type: string
+    required: false
+    description: CLI the factory lane uses to read and hand back its task; `none` when the repository has no factory.
+  factory_task_key_pattern:
+    type: string
+    required: false
+    description: Regex of a factory task key.
+
+  research_task_cli:
+    type: string
+    required: false
+    description: Command that creates a task for a research round or a decision ledger and prints its key; `none` when there is no tracker.
+  factory_gates_script:
+    type: string
+    required: false
+    description: Script that runs the factory gates over a worktree (`<script> <worktree> [--filter F]`, prints `GATES: green|red`, exit 0/1/2); `none` means the agent runs the profile's commands by hand.
+  factory_restricted_paths:
+    type: list
+    required: false
+    description: Extra path prefixes that make a factory diff not small (integration clients, adapters), added to the built-in ones.
+
+  # Commands
+  commands_run_on:
+    type: enum
+    values: [host, container]
+    required: true
+    description: Where tests and linters run.
+  cmd_container_exec:
+    type: string
+    required: false
+    description: Prefix that runs a command inside the app container (non-interactive).
+  cmd_test_backend:
+    type: string
+    required: true
+    description: Backend test runner, run from app_dir.
+  cmd_test_backend_filter:
+    type: string
+    required: false
+    description: How to run a subset of backend tests by name.
+  cmd_test_frontend:
+    type: string
+    required: false
+    description: Frontend test runner; `none` when there is none.
+  cmd_lint_frontend:
+    type: string
+    required: false
+    description: Frontend linter.
+  cmd_format_frontend:
+    type: string
+    required: false
+    description: Frontend formatter.
+  cmd_format_backend:
+    type: string
+    required: true
+    description: Backend formatter (for example Pint), with the flag that limits it to changed files when there is one.
+  cmd_static_analysis:
+    type: string
+    required: false
+    description: Static analysis command.
+  cmd_build_frontend:
+    type: string
+    required: false
+    description: Frontend build used as a gate, or `none` when the build must never be run (dev server owns the bundle).
+  cmd_tinker:
+    type: string
+    required: false
+    description: Prefix of a read-only one-line REPL query (for example `... php artisan tinker --execute`).
+  cmd_noise_filter:
+    type: string
+    required: false
+    description: Extended regex of output lines the REPL wrapper drops (for example a container tool's warning); `none` passes the output through.
+  cmd_migrate_status:
+    type: string
+    required: false
+    description: Command that lists pending migrations.
+  cmd_queue_restart:
+    type: string
+    required: false
+    description: Command that restarts the queue workers after code changes.
+  worktree_runner:
+    type: string
+    required: false
+    description: Script that runs a gate against a worktree's code; `none` when the worktree can run its own gates.
+  bring_branch_script:
+    type: string
+    required: false
+    description: Script that brings a branch into the main checkout with a guard against other sessions' work; `none` when absent.
+
+  # Stack facts
+  backend_test_framework:
+    type: string
+    required: true
+    description: Backend test framework (for example `pest`, `phpunit`).
+  frontend_routes:
+    type: string
+    required: false
+    description: How routes reach the frontend (for example `ziggy`, `wayfinder`), and whether a regeneration step exists.
+  frontend_root:
+    type: string
+    required: false
+    description: Directory of frontend features, relative to app_dir.
+  frontend_rules:
+    type: string
+    required: false
+    description: Rule or doc that holds the frontend conventions of the repository.
+  env_templates:
+    type: list
+    required: false
+    description: Environment templates that must receive every new variable.
+
+  # Docs and rules
+  docs_dirs:
+    type: list
+    required: false
+    description: Documentation directories an agent searches before a feature.
+  adr_dir:
+    type: string
+    required: false
+    description: Directory of architecture decision records; `none` when absent.
+  research_dir:
+    type: string
+    required: false
+    description: Directory where research rounds and decision ledgers are written.
+  area_cards_glob:
+    type: string
+    required: false
+    description: Glob of the area cards (path rules that state contracts, invariants and traps); `none` when absent.
+  user_guides_rule:
+    type: string
+    required: false
+    description: Rule that says when a screen ships its user guide; `none` when absent.
+  ephemeral_patterns:
+    type: list
+    required: true
+    description: Root files that skills write and never commit; each must be ignored by git.
+
+  # Skills that exist only in the repository
+  design_skill:
+    type: string
+    required: false
+    description: Skill that judges whether a screen is good; `none` when absent.
+  design_review_skill:
+    type: string
+    required: false
+    description: Fresh-eyes design audit skill, only on explicit request; `none` when absent.
+  module_design_skill:
+    type: string
+    required: false
+    description: Skill that feeds module boundary judgement; `none` when absent.
+  sessions_skill:
+    type: string
+    required: false
+    description: Skill that searches session transcripts; `none` when absent.
+
+  # QA and safety
+  qa_env:
+    type: string
+    required: false
+    description: Description of the QA environment and where its data comes from (for example a seeded local database).
+  qa_fixture_pattern:
+    type: string
+    required: false
+    description: How QA fixtures are created (a seeder pattern, a command, or real rows found by a read-only query).
+  production_writing_integrations:
+    type: list
+    required: false
+    description: External systems the application writes to; a code path that writes to one is production-affecting.
+
+  # Machine (normally in profile.local.yaml)
+  main_checkout:
+    type: string
+    required: false
+    description: Absolute path of the main checkout on this machine; belongs in profile.local.yaml.
+  qa_url:
+    type: string
+    required: false
+    description: Local URL of the running app on this machine; belongs in profile.local.yaml.
