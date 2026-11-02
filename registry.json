@@ -1,0 +1,141 @@
+{
+  "schema": 1,
+  "skills": [
+    {
+      "name": "cdv-apply-review",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Triage and apply code-review findings on a feature branch. Takes findings from a <profile.pr_review_dir_prefix><TICKET>/ directory, pasted review comments, or the host's automatic reviewer, verifies each against the current code, classifies real / falso-positivo / fora-de-escopo, decides act-or-not with a one-line justification per finding, and applies the accepted ones on the SAME branch with one commit per finding (or per logical group). Triggers on \"check each finding against the code\", \"a code review has been made over this branch\", \"aplica os fixes do review\", \"triagem dos findings\", \"fix the nitpicks and commit\", or the hand-off from cdv-pr-review / cdv-code-review. Do NOT use to produce a review (use cdv-code-review or cdv-pr-review), for fixes that grow beyond finding-sized scope (use cdv-plan-feature), or to push/merge (finalize owns the wrap-up).",
+      "path": "skills/cdv-apply-review",
+      "contentHash": "29410208c3ea190ee8a5959620816caa2da77543433387430ef26bc04f8ceb4a"
+    },
+    {
+      "name": "cdv-code-review",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Single-pass code review of a feature branch, emitting paste-ready inline-comment files under <profile.pr_review_dir_prefix>[TICKET]/ (prose in the repository's UI language, verified file:line anchors, _summary.md + INDEX.md). Triggers on 'revise esse PR', 'gera os comentários do code review', 'review my branch before I open the PR'. Read-only — never edits source, never posts. Do NOT use for the multi-agent protocol (\"review PR with subagents\" → cdv-pr-review), debugging (cdv-debug), planning (cdv-grilling/cdv-plan-feature), or PR/commit generation (cdv-finalize).",
+      "path": "skills/cdv-code-review",
+      "contentHash": "9e9fd71b7b21358c770c084257f1132b99a4b7b8d4cdf57ca0546e66d76a2502"
+    },
+    {
+      "name": "cdv-debug",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Read-only root-cause investigation for backend bugs (integrations and sync jobs especially), from a Laravel log, a Sentry issue, or a human report, ending in an evidence-backed report. Triggers on \"investigue esse erro\", \"olha esse log\", \"esse cliente reportou\", \"esse 404 da integração\", \"esse erro do workflow\", or a pasted stack trace. When the user signals fix intent (\"vamos consertar\", \"plano de fix\"), sizes the fix and asks: a small fix (≤ ~3 files, no migration, no new screen) can be done here as \"fix direto\" (fix + test + express finalize); anything larger hands off to `cdv-plan-feature`. Never produces a multi-phase plan. Do NOT use for feature implementation, refactors, frontend-only bugs, or generic Laravel questions.",
+      "path": "skills/cdv-debug",
+      "contentHash": "bf672a035dc905ab7bb94ae9b436a3d182fc8eb8c937ab742e596abfb63ada0a"
+    },
+    {
+      "name": "cdv-factory-finalize",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Question-free wrap-up of a factory run — one conventional commit, rebase on the default branch when clean, the lean `<slug>-pr.md` with the factory banner, push of a feat|fix|chore|refac branch without --force, the PR-creation link of the repository's host, and the handback through the factory's task CLI that closes the task (or the refusal handback when triage refused). Invoked by `cdv-factory-small-feature` Step 8 (and its refusal path); triggers otherwise only on an explicit \"/cdv-factory-finalize\" inside a factory run. Do NOT use for interactive wrap-up with a person present (cdv-finalize), to create or merge the PR, or outside a worktree.",
+      "path": "skills/cdv-factory-finalize",
+      "contentHash": "c8f5be21d71b79887d34000417bcb7ca253007a7b5dcd34b00473e39abb5e8f3"
+    },
+    {
+      "name": "cdv-factory-small-feature",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Factory lane for a small request (text + optional image, usually from a chat thread through the factory's orchestrator) carried from request to pushed branch with no human in the loop — triage (execute / one question / refuse by category), worktree-only implementation, scripted gates, a diff-size check, a one-round automated code review when the diff is not small, a fresh opus verifier, then cdv-factory-finalize. Triggers ONLY on an explicit factory signal - \"modo fábrica\", \"/cdv-factory-small-feature\", a task whose data names this skill, or a task brief from the factory's orchestrator that tells the agent to follow this repository's factory skill (the extension lists the exact sentence). A repository without a factory (`profile.factory_task_cli` missing or `none`) never runs it. Do NOT use in an interactive session with the user present (cdv-plan-feature or cdv-debug), for bugs that need investigation (cdv-debug), or for anything already planned as multi-phase.",
+      "path": "skills/cdv-factory-small-feature",
+      "contentHash": "6d25de66e1c0e2e53b582630884fe3333c2beba3b34f505a4961f250684c7dbd"
+    },
+    {
+      "name": "cdv-finalize",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Finalize a feature branch — ephemeral `<slug>-pr.md` at repo root (lean PR format, never committed), atomic conventional commits with inferred scope, branch guard, state report, then the push and the pull request opened (or updated) through `cdv-open-pr` at wrap-up (never merges). Triggers on \"finaliza essa feature\", \"wrap up this branch\", \"gera o PR description e os commits\", \"comita isso e prepara o PR\". Do NOT use for planning unimplemented work (cdv-plan-feature), PRD/PROGRESS artifacts, or merging.",
+      "path": "skills/cdv-finalize",
+      "contentHash": "bfdf10654e2f123c42f6790bb64f3e6da72a1880fc9a6a8df12fad5a4637d2e4"
+    },
+    {
+      "name": "cdv-flows",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Menu interativo dos fluxos de trabalho assistido do repositório — apresenta as situações em linguagem plana, as fronteiras entre skills parecidos e as jornadas compostas (quem passa o quê para quem), e faz hand-off para o skill escolhido. Só roda quando chamado explicitamente com /cdv-flows; nunca dispara por frase natural — quem já sabe o que quer fala direto com o skill de destino.",
+      "path": "skills/cdv-flows",
+      "contentHash": "dc7b02ad0137c1db28671759907f10ea937aecb8116575552254ee58c9759b32"
+    },
+    {
+      "name": "cdv-frontend",
+      "version": "0.1.0",
+      "owner": "leonardoburtet-clube",
+      "description": "Activate when starting any frontend task: creating Vue components, new pages, modifying Inertia page props, adding UI-kit components, or implementing forms and interactive UI. Use BEFORE writing any Vue component or Inertia page — it keeps new UI consistent with the app's existing screens and components. Triggers on \"cria essa tela\", \"novo componente\", \"monta a tabela/painel\", or any plan-feature frontend phase. Skip for pure backend changes (migrations, controllers, services) with no frontend impact.",
+      "path": "skills/cdv-frontend",
+      "contentHash": "6f15b832022f65fb8de894301506033ffab189670b86bceacec3ecbac7734b1b"
+    },
+    {
+      "name": "cdv-grill-me",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "A relentless interview to sharpen a plan or design.",
+      "path": "skills/cdv-grill-me",
+      "contentHash": "e8a4bd65d537fd8c76acf54eda909e625fc0879485af66f2b489dfa5f9bab155"
+    },
+    {
+      "name": "cdv-grilling",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Grill the user relentlessly about a plan, decision or idea until a shared understanding exists and is written down. Use when the user wants to stress-test their thinking or uses any 'grill' trigger phrase (\"grill me\", \"me entrevista\", \"ask me interactively\"). Do NOT use to cut a settled plan into phases (`cdv-plan-feature`) or to implement.",
+      "path": "skills/cdv-grilling",
+      "contentHash": "12c97f6bde39561f7bb16e8f4b5079530fdc84c629044e3b43bbe3b365f047fa"
+    },
+    {
+      "name": "cdv-handoff",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Write the handoff block that lets a FRESH Claude session pick up work in this repository — QA of a branch, a code review, a continued investigation — without the current session's context. Verified facts only (git counts, worktree, fixtures, production-affecting steps), rendered in the chat for copy-paste; a HANDOFF-<slug>.md file only on request. Triggers on \"handoff prompt\", \"prompt pra outra sessão\", \"me dá um handoff\", \"hand this off to a fresh session\", \"passa isso pra uma sessão nova\", and the wrap-up of `cdv-finalize`. Do NOT use to summarize a conversation for a human (write prose), to generate the PR description (`cdv-finalize`) or the ticket note (`cdv-notion-ticket`).",
+      "path": "skills/cdv-handoff",
+      "contentHash": "b64389278ddea45c38d56ce8f2a2d1f11c14cd7f23289c271d5c8a8aa2b1da9f"
+    },
+    {
+      "name": "cdv-interactive-qa",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Interactive step-by-step manual QA of a branch against the local QA environment — one test per AskUserQuestion turn, real-data fixtures prepared by the skill, side effects self-verified, failures triaged in-loop. Works on any implemented branch. Triggers on \"QA this branch with me\", \"roda o QA interativo\", \"como eu faço QA disso?\", \"me guia no QA\", or the finalize wrap-up offer. Do NOT use for pure automated-test runs, production debugging (`cdv-debug`), or authoring the QA guide (`cdv-plan-feature` Step 4c).",
+      "path": "skills/cdv-interactive-qa",
+      "contentHash": "dd23a2ad31453d9657b86fa5833e500f61b1d62f9c8daabff21eb997cf210265"
+    },
+    {
+      "name": "cdv-notion-ticket",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Write the business-facing delivery note on a feature's Notion card — short pt-BR delivery-note layout (TL;DR callout, Antes/Agora table, como usar, próximos passos with the PR link) grounded in the branch's real diff, written into the card through the Notion MCP after the user confirms the draft. Sits beside cdv-finalize — that one produces the technical PR description; this one produces the business delivery description (Notion). Triggers on \"gera o ticket da entrega\", \"descrição pra o card do Notion\", \"nota de entrega\", \"delivery note\", \"o que escrevo no ticket dessa feature\". Do NOT use for the PR description (cdv-finalize), bug-analysis Notion blocks (cdv-debug Step 8 owns the Análise técnica template), or planning artifacts.",
+      "path": "skills/cdv-notion-ticket",
+      "contentHash": "c018dd444ade653ce2cc71b5226e19d479669ee780f511a03ed28b8b2dadbfd7"
+    },
+    {
+      "name": "cdv-open-pr",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Open or update the pull request of a branch through the host's API (`profile.pr_cli`, the bundled `bb` client for Bitbucket or `gh` for GitHub) — conventional title, the finalize description plus the `🏷️ Ticket` section with the ticket hyperlinked, the default reviewers, close-source-branch. Called by `cdv-finalize` Step 9 right after the push; triggers on its own on \"abre o PR\", \"open the PR\", \"abre os PRs dos workers\", \"atualiza a descrição do PR\", \"comenta no PR\". Claude in Chrome only as the fallback when the developer has no token and does not want to create one now; do NOT use to merge, approve or decline.",
+      "path": "skills/cdv-open-pr",
+      "contentHash": "49f17350bd211e43775f57618e28cb5ba34b0fd3d4b698397e83460df24b8eed"
+    },
+    {
+      "name": "cdv-plan-feature",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Plan a feature (Laravel + Inertia + Vue) as a multi-phase plan grounded in the repo docs, then execute the approved phases with an independent verifier at the end. Sizes the work in two tiers first — pequeno (≤ ~3 files, no migration, no new screen) runs inline on the main checkout; grande runs in a worktree with parallel executors only on disjoint code. Triggers on \"planeja essa feature\", \"preciso de um plano pra X\", \"implementa essa feature\", a `decisions.md` ledger from `cdv-grilling`, or a settled spec/definition doc (\"spec is settled, execute\" — resolved-spec mode skips the Q&A). Do NOT use for one-off bug fixes (`cdv-debug`), single-file refactors, wrap-up of implemented work (`cdv-finalize`), or pure infra/CI tasks.",
+      "path": "skills/cdv-plan-feature",
+      "contentHash": "45f3ffc35d5caf9c2db5419c3ded15e0dcae0211dbe01531d822dd9d1da88755"
+    },
+    {
+      "name": "cdv-pr-review",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Multi-agent PR reviewer. Use ONLY when explicitly asked to review a pull request or feature branch with the multi-agent protocol: \"cdv-pr-review\", \"review PR\", \"review this PR with subagents\", \"multi-agent code review\". Coordinates 6 specialized subagents (Security/PII, Requirements, Test Coverage, Architecture, Regression, Performance) and consolidates findings into paste-ready comment files under <profile.pr_review_dir_prefix><TICKET>/ (same format as cdv-code-review). Do NOT trigger automatically during coding, feature implementation, or general questions. Do NOT use for single-pass reviews (use cdv-code-review), debugging (cdv-debug), or finalizing (cdv-finalize).",
+      "path": "skills/cdv-pr-review",
+      "contentHash": "ea7e3000b7037d03252d93548b5adda9b70b09610bb4478df2e8c6fbcf33eaec"
+    },
+    {
+      "name": "cdv-research-round",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Run a research round — survey the state of the art, the code and the usage evidence for a feature or idea through subagents — inside one folder on disk that holds a README, every subagent's output and the synthesis, tied to a task in the task tracker. Triggers on \"rodada de pesquisa\", \"pesquisa essa feature\", \"levanta o estado da arte\", \"/cdv-research-round\". Do NOT use to interview the user about decisions (`cdv-grilling`), to plan or implement a feature (`cdv-plan-feature`), or to debug (`cdv-debug`).",
+      "path": "skills/cdv-research-round",
+      "contentHash": "b6a0d3a75f83b77063bbdab22dfaa4631050ac17592a0c134bbdc9b13dcb4050"
+    }
+  ]
+}
