@@ -63,7 +63,7 @@
       "owner": "leonardoburtet-clube",
       "description": "Activate when starting any frontend task: creating Vue components, new pages, modifying Inertia page props, adding UI-kit components, or implementing forms and interactive UI. Use BEFORE writing any Vue component or Inertia page — it keeps new UI consistent with the app's existing screens and components. Triggers on \"cria essa tela\", \"novo componente\", \"monta a tabela/painel\", or any plan-feature frontend phase. Skip for pure backend changes (migrations, controllers, services) with no frontend impact.",
       "path": "skills/cdv-frontend",
-      "contentHash": "6f15b832022f65fb8de894301506033ffab189670b86bceacec3ecbac7734b1b"
+      "contentHash": "fcf602b77a288c934c9fe8f03ee0cfa87825c7a71d9ab614b384d684543a9eed"
     },
     {
       "name": "cdv-grill-me",

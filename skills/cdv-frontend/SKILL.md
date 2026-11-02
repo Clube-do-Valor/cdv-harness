@@ -76,7 +76,7 @@ Canonical rule: [naming-language.md](../cdv-plan-feature/references/naming-langu
 
 - Product-facing **text**: `profile.language_ui` — labels, placeholders, empty states, error messages, tooltips, and the values in the translation files. The translation **keys** are in `profile.language_code`.
 - Everything an engineer types: `profile.language_code` — component filenames, props, emits, composables, types, functions, variables, test names, Inertia prop names.
-- **No mixed-language identifiers.** An identifier that blends the two languages (`valorTotal`, `useValor()` in a repository whose code language is English) is prohibited; use the single-language name (`totalValue`, `useValue()`).
+- **No mixed-language identifiers.** An identifier that blends the two languages (`betragTotal`, `useBetrag()` in a repository whose code language is English) is prohibited; use the single-language name (`totalAmount`, `useAmount()`).
 - **Route paths:** new routes use `profile.language_code` segments with a `profile.language_ui` menu label. Paths already published stay as they are — renaming breaks existing links.
 - **External payload keys** arriving in another language from an external system stay verbatim in the type definition (they describe someone else's contract); the local variable that reads them is in `profile.language_code`.
 - **Copy conventions**: [references/copy-conventions.md](references/copy-conventions.md) — load when writing any product-facing text (labels, empty states, docs pages, API guides).
