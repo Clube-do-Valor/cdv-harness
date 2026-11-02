@@ -1,0 +1,281 @@
+#!/usr/bin/env python3
+"""bb — Bitbucket Cloud pull requests from the terminal, in the spirit of `gh pr`.
+
+Auth: a personal Atlassian "API token with scopes" (ATATT…), stored once with `bb auth login` in the
+GNOME keyring, the way `gh auth login` stores its token. Lookup order: $BITBUCKET_API_TOKEN, the
+keyring, then the first token found in ~/.config/bitbucket/credentials. Sent as Basic auth with the
+account e-mail ($BITBUCKET_EMAIL, else `git config user.email`). A repository access token (ATCT…)
+also works, as Bearer, but its pull requests are authored by a bot. The token is never printed.
+
+Repo: $BITBUCKET_REPO, else parsed from `git remote get-url origin`.
+Default destination branch of `pr create`: `default_branch` in .claude/harness/profile.yaml
+(profile.local.yaml wins), else `main`.
+
+  bb auth login                                once, in a terminal: hidden prompt, checks the token, keyring
+  bb auth status                               whose token and where it is; exit 1 when missing or rejected
+  bb auth logout                               remove the token from the keyring
+  bb pr for-branch [BRANCH]                    open PR of the branch (default: current); exit 1 when none
+  bb pr create --title T [--body-file F] [--source BRANCH] [--dest BRANCH] [--draft] [--no-reviewers]
+  bb pr edit N [--title T] [--body-file F]
+  bb pr view N                                 header + description, to read a PR back
+  bb pr list [--state OPEN|MERGED|DECLINED]
+  bb pr comment N (--body TEXT | --body-file F)
+  bb mention NAME                              the @{account_id} markup that mentions NAME in a description
+  bb pipelines [--branch BRANCH]
+
+`create` sends close_source_branch and the repository's default reviewers minus yourself (the API
+does not apply them, nor the description template). Descriptions get the Claude Code footer once.
+"""
+import argparse
+import base64
+import functools
+import getpass
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API_HOST = 'api.bitbucket.org'
+API = f'https://{API_HOST}/2.0'
+CREDENTIALS = os.path.expanduser('~/.config/bitbucket/credentials')
+FOOTER = '🤖 Generated with [Claude Code](https://claude.com/claude-code)'
+TOKEN_PATTERN = re.compile(r'\b(ATATT[A-Za-z0-9_=-]{20,}|ATCT[A-Za-z0-9_=-]{20,})')
+KEYRING = ['service', 'bitbucket-api', 'account']
+TOKEN_HELP = ('no Bitbucket token: create an "API token with scopes" for Bitbucket at '
+              'https://id.atlassian.com/manage-profile/security/api-tokens, then run `bb auth login` '
+              'in a terminal — see .claude/skills/cdv-open-pr/references/vcs-bitbucket.md')
+
+
+def git(*args: str) -> str:
+    return subprocess.run(['git', *args], capture_output=True, text=True).stdout.strip()
+
+
+def profile_value(key: str) -> str:
+    root = git('rev-parse', '--show-toplevel') or '.'
+    value = ''
+    for name in ('profile.yaml', 'profile.local.yaml'):
+        path = os.path.join(root, '.claude', 'harness', name)
+        if not os.path.exists(path):
+            continue
+        for text in open(path, encoding='utf-8'):
+            match = re.match(rf'{re.escape(key)}:\s*(.*?)\s*$', text)
+            if match and match.group(1):
+                value = match.group(1).strip('"\'')
+    return value
+
+
+def email() -> str:
+    address = os.environ.get('BITBUCKET_EMAIL') or git('config', 'user.email')
+    if not address:
+        sys.exit('no e-mail for Basic auth: set BITBUCKET_EMAIL or git config user.email')
+    return address
+
+
+def secret_tool(*args: str, stdin: str | None = None) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(['secret-tool', *args], input=stdin, capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+
+
+@functools.cache
+def stored_token() -> tuple[str, str]:
+    if os.environ.get('BITBUCKET_API_TOKEN'):
+        return os.environ['BITBUCKET_API_TOKEN'], 'BITBUCKET_API_TOKEN'
+    found = secret_tool('lookup', *KEYRING, email())
+    if found and found.returncode == 0 and found.stdout.strip():
+        return found.stdout.strip(), 'keyring'
+    if os.path.exists(CREDENTIALS):
+        match = TOKEN_PATTERN.search(open(CREDENTIALS, encoding='utf-8').read())
+        if match:
+            return match.group(1), CREDENTIALS
+    return '', ''
+
+
+def header_for(token: str) -> str:
+    if token.startswith('ATCT'):
+        return f'Bearer {token}'
+    return 'Basic ' + base64.b64encode(f'{email()}:{token}'.encode()).decode()
+
+
+def auth_header() -> str:
+    token, _ = stored_token()
+    if not token:
+        sys.exit(TOKEN_HELP)
+    return header_for(token)
+
+
+def repo() -> str:
+    if os.environ.get('BITBUCKET_REPO'):
+        return os.environ['BITBUCKET_REPO']
+    match = re.search(r'bitbucket\.org[:/]([^/]+/[^/]+?)(?:\.git)?$', git('remote', 'get-url', 'origin'))
+    if not match:
+        sys.exit('origin is not a Bitbucket remote; set BITBUCKET_REPO=workspace/repo')
+    return match.group(1)
+
+
+def call(method: str, path: str, body: dict | None = None, header: str | None = None) -> dict:
+    url = path if path.startswith('http') else (f'{API}{path}' if path.startswith('/user') else f'{API}/repositories/{repo()}{path}')
+    request = urllib.request.Request(url, data=None if body is None else json.dumps(body).encode(), method=method, headers={
+        'Authorization': header or auth_header(), 'Accept': 'application/json', 'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(request) as response:
+            raw = response.read()
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as error:
+        detail = error.read().decode(errors='replace')[:500]
+        hint = ' (token missing a scope, or expired?)' if error.code in (401, 403) else ''
+        sys.exit(f'{method} {path.split("?")[0]} -> {error.code}{hint}: {detail}')
+
+
+def body_from(path: str | None) -> str | None:
+    if path is None:
+        return None
+    text = open(path, encoding='utf-8').read().rstrip()
+    return text if text.endswith(FOOTER) else f'{text}\n\n{FOOTER}'
+
+
+def default_reviewers() -> list[dict]:
+    me = call('GET', '/user').get('uuid')
+    users = [v['user'] for v in call('GET', '/effective-default-reviewers?pagelen=100').get('values', [])]
+    return [{'uuid': u['uuid']} for u in users if u.get('uuid') != me]
+
+
+def line(pr: dict) -> str:
+    draft = ' [draft]' if pr.get('draft') else ''
+    return (f"#{pr['id']} {pr['state']}{draft} {pr['source']['branch']['name']} → {pr['destination']['branch']['name']}"
+            f"  {pr['title']}  ({pr['author']['display_name']})\n{pr['links']['html']['href']}")
+
+
+def open_pr_for(branch: str) -> dict | None:
+    query = urllib.parse.quote(f'source.branch.name="{branch}" AND state="OPEN"')
+    values = call('GET', f'/pullrequests?q={query}&pagelen=5').get('values', [])
+    return values[0] if values else None
+
+
+def people() -> dict[str, dict]:
+    found: dict[str, dict] = {}
+    fields = 'values.author.display_name,values.author.account_id,values.reviewers.display_name,values.reviewers.account_id'
+    for state in ('MERGED', 'OPEN'):
+        for pr in call('GET', f'/pullrequests?state={state}&pagelen=50&fields={fields}').get('values', []):
+            for user in [pr.get('author') or {}, *(pr.get('reviewers') or [])]:
+                if user.get('account_id'):
+                    found[user['display_name'].lower()] = user
+    return found
+
+
+def auth(action: str) -> None:
+    if action == 'login':
+        if not sys.stdin.isatty():
+            sys.exit('run `bb auth login` in a terminal: it reads the token with a hidden prompt')
+        token = getpass.getpass('Bitbucket API token (input hidden): ').strip()
+        if not TOKEN_PATTERN.fullmatch(token):
+            sys.exit('that does not look like a Bitbucket API token (ATATT…); nothing stored')
+        user = call('GET', '/user', header=header_for(token))
+        stored = secret_tool('store', '--label=Bitbucket API token (bb)', *KEYRING, email(), stdin=token)
+        if stored and stored.returncode == 0:
+            print(f"logged in as {user.get('display_name')}; token stored in the GNOME keyring")
+            if os.path.exists(CREDENTIALS):
+                print(f'{CREDENTIALS} is no longer needed; delete it when you like')
+            return
+        os.makedirs(os.path.dirname(CREDENTIALS), exist_ok=True)
+        descriptor = os.open(CREDENTIALS, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, 'w') as handle:
+            handle.write(token + '\n')
+        print(f"logged in as {user.get('display_name')}; no keyring available, token stored in {CREDENTIALS} (mode 600)")
+    elif action == 'status':
+        token, source = stored_token()
+        if not token:
+            sys.exit(TOKEN_HELP)
+        request = urllib.request.Request(f'{API}/user', headers={'Authorization': header_for(token), 'Accept': 'application/json'})
+        try:
+            with urllib.request.urlopen(request) as response:
+                user = json.loads(response.read())
+        except urllib.error.HTTPError as error:
+            sys.exit(f'the token in {source} was rejected ({error.code}: expired, revoked or missing a scope) — run `bb auth login` again')
+        print(f"logged in as {user.get('display_name')} ({user.get('account_id')}), token from {source}")
+    elif action == 'logout':
+        cleared = secret_tool('clear', *KEYRING, email())
+        print('token removed from the keyring' if cleared and cleared.returncode == 0 else 'no keyring entry to remove')
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(prog='bb', description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest='cmd', required=True)
+    sub.add_parser('whoami')
+    p = sub.add_parser('auth'); p.add_argument('action', choices=['login', 'status', 'logout'])
+    p = sub.add_parser('mention'); p.add_argument('name')
+    p = sub.add_parser('pipelines'); p.add_argument('--branch')
+    pr = sub.add_parser('pr').add_subparsers(dest='action', required=True)
+    p = pr.add_parser('for-branch'); p.add_argument('branch', nargs='?')
+    p = pr.add_parser('create')
+    p.add_argument('--title', required=True); p.add_argument('--body-file'); p.add_argument('--source')
+    p.add_argument('--dest', default=profile_value('default_branch') or 'main'); p.add_argument('--draft', action='store_true')
+    p.add_argument('--no-reviewers', action='store_true')
+    p = pr.add_parser('edit'); p.add_argument('id', type=int); p.add_argument('--title'); p.add_argument('--body-file')
+    p = pr.add_parser('view'); p.add_argument('id', type=int)
+    p = pr.add_parser('list'); p.add_argument('--state', default='OPEN')
+    p = pr.add_parser('comment'); p.add_argument('id', type=int)
+    group = p.add_mutually_exclusive_group(required=True); group.add_argument('--body'); group.add_argument('--body-file')
+    args = parser.parse_args()
+
+    if args.cmd == 'auth':
+        auth(args.action)
+    elif args.cmd == 'whoami':
+        auth('status')
+    elif args.cmd == 'mention':
+        matches = [u for name, u in people().items() if args.name.lower() in name]
+        if len(matches) != 1:
+            sys.exit(f"{len(matches)} matches for {args.name!r} among recent PR authors and reviewers")
+        print(f"@{{{matches[0]['account_id']}}}")
+    elif args.cmd == 'pipelines':
+        query = '?sort=-created_on&pagelen=5' + (f'&target.branch={args.branch}' if args.branch else '')
+        for run in call('GET', f'/pipelines/{query}').get('values', []):
+            result = (run['state'].get('result') or {}).get('name', '')
+            print(f"#{run['build_number']} {run['state']['name']} {result} {run['target'].get('ref_name', '')} {run['target']['commit']['hash'][:9]}")
+    elif args.action == 'for-branch':
+        found = open_pr_for(args.branch or git('branch', '--show-current'))
+        if not found:
+            sys.exit(1)
+        print(line(found))
+    elif args.action == 'create':
+        source = args.source or git('branch', '--show-current')
+        existing = open_pr_for(source)
+        if existing:
+            sys.exit(f'{source} already has an open PR — use `bb pr edit {existing["id"]}`\n{line(existing)}')
+        payload = {
+            'title': args.title,
+            'source': {'branch': {'name': source}},
+            'destination': {'branch': {'name': args.dest}},
+            'close_source_branch': True,
+            'draft': args.draft,
+            'reviewers': [] if args.no_reviewers else default_reviewers(),
+        }
+        if args.body_file:
+            payload['description'] = body_from(args.body_file)
+        print(line(call('POST', '/pullrequests', payload)))
+    elif args.action == 'edit':
+        payload = {key: value for key, value in (('title', args.title), ('description', body_from(args.body_file))) if value}
+        if not payload:
+            sys.exit('nothing to edit: pass --title and/or --body-file')
+        print(line(call('PUT', f'/pullrequests/{args.id}', payload)))
+    elif args.action == 'view':
+        item = call('GET', f'/pullrequests/{args.id}')
+        print(line(item))
+        print('reviewers:', ', '.join(r['display_name'] for r in item.get('reviewers', [])) or '-')
+        print(f"\n{item.get('description', '')}")
+    elif args.action == 'list':
+        for item in call('GET', f'/pullrequests?state={args.state}&pagelen=20').get('values', []):
+            print(line(item))
+    elif args.action == 'comment':
+        text = args.body if args.body is not None else open(args.body_file, encoding='utf-8').read()
+        item = call('POST', f'/pullrequests/{args.id}/comments', {'content': {'raw': text}})
+        print('comment', item['id'], item['links']['html']['href'])
+
+
+if __name__ == '__main__':
+    main()
