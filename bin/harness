@@ -18,9 +18,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 
 USER_SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round"]
+THIRD_PARTY_FILE = "third-party.json"
+THIRD_PARTY_RAW = "https://raw.githubusercontent.com"
 LOCK_RELATIVE = ".claude/harness.lock"
 USER_LOCK_RELATIVE = ".claude/harness-user.lock"
 HOUSE_END = "<!-- /cdv-harness:house -->"
@@ -515,7 +518,7 @@ def select_vendored(tree):
     for path, (mode, _sha) in tree.entries.items():
         parts = path.split("/")
         dest = None
-        if parts[0] == "skills" and len(parts) >= 3 and parts[1].startswith("cdv-"):
+        if parts[0] == "skills" and len(parts) >= 3:
             dest = ".claude/" + path
         elif parts[0] == "rules" and len(parts) == 3 and parts[1] == "core" and path.endswith(".md"):
             dest = ".claude/rules/core/" + parts[2]
@@ -828,8 +831,12 @@ def sync_user(tag, from_=None, source=None):
                 raise HarnessError(f"cannot clone {source}: {proc.stderr.strip()}")
             source_label = str(source)
         tree = CoreTree(core, tag)
+        user_skills = list(USER_SKILLS)
+        if THIRD_PARTY_FILE in tree.entries:
+            listed = json.loads(tree.read(THIRD_PARTY_FILE).decode("utf-8")).get("skills", {})
+            user_skills += sorted(n for n, e in listed.items() if e.get("user"))
         wanted = {}
-        for name in USER_SKILLS:
+        for name in user_skills:
             prefix = f"skills/{name}/"
             members = [p for p in tree.entries if p.startswith(prefix)]
             if not members:
@@ -839,7 +846,7 @@ def sync_user(tag, from_=None, source=None):
                     raise HarnessError(f"{path} is a symlink in the core; symlinks cannot be installed")
             wanted[name] = members
         refused = []
-        for name in USER_SKILLS:
+        for name in user_skills:
             dest = home / ".claude" / "skills" / name
             relative = f".claude/skills/{name}"
             if dest.is_symlink() or (dest.exists() and relative not in recorded):
@@ -861,12 +868,12 @@ def sync_user(tag, from_=None, source=None):
                 data = blobs[path]
                 write_file(home / dest_rel, data, tree.entries[path][0] == "100755")
                 files[dest_rel] = sha256_bytes(data)
-        paths = [f".claude/skills/{name}" for name in USER_SKILLS]
+        paths = [f".claude/skills/{name}" for name in user_skills]
         write_file(
             lock_path,
             lock_text(source_label, tag, tree.commit, tree_hash(files), "", paths, [], files).encode("utf-8"),
         )
-    info(f"installed {len(USER_SKILLS)} skills from {tag} into {home / '.claude' / 'skills'}")
+    info(f"installed {len(user_skills)} skills from {tag} into {home / '.claude' / 'skills'}")
     return 0
 
 
@@ -1271,6 +1278,15 @@ def skill_files(skill_dir):
     return found
 
 
+def load_third_party(core):
+    path = Path(core) / THIRD_PARTY_FILE
+    if not path.is_file():
+        return {"schema": 1, "upstream": {}, "skills": {}}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data.setdefault("skills", {})
+    return data
+
+
 def lint_skill(core, skill_dir):
     relative = f"skills/{skill_dir.name}/SKILL.md"
     skill_md = skill_dir / "SKILL.md"
@@ -1301,6 +1317,8 @@ def lint_skill(core, skill_dir):
         problems.append(
             f"{relative}:{at('description')}: description is longer than 1024 characters ({len(description.strip())})"
         )
+    if skill_dir.name in load_third_party(core)["skills"]:
+        return problems, data
     metadata = data.get("metadata")
     if not isinstance(metadata, dict):
         problems.append(f"{relative}:1: missing metadata.version")
@@ -1337,6 +1355,7 @@ def content_hash(skill_dir):
 
 def render_catalog(core):
     entries = []
+    third_party = load_third_party(core)["skills"]
     for skill_dir in skill_dirs(core):
         problems, data = lint_skill(core, skill_dir)
         if problems or data is None:
@@ -1345,8 +1364,8 @@ def render_catalog(core):
         entries.append(
             {
                 "name": data["name"],
-                "version": data["metadata"]["version"],
-                "owner": data["metadata"]["owner"],
+                "version": third_party[skill_dir.name]["version"] if skill_dir.name in third_party else data["metadata"]["version"],
+                "owner": third_party[skill_dir.name]["owner"] if skill_dir.name in third_party else data["metadata"]["owner"],
                 "description": description,
                 "path": f"skills/{skill_dir.name}",
                 "contentHash": content_hash(skill_dir),
@@ -1636,6 +1655,55 @@ def cmd_scan(args):
 # ---------------------------------------------------------------------------------------
 
 
+def fetch_bytes(url):
+    import urllib.request
+
+    if url.startswith("file://"):
+        return Path(urllib.parse.unquote(url[len("file://"):])).read_bytes()
+    with urllib.request.urlopen(url, timeout=60) as response:
+        return response.read()
+
+
+def cmd_third_party(args):
+    core = Path(args.core or default_core())
+    path = core / THIRD_PARTY_FILE
+    if not path.is_file():
+        raise HarnessError(f"{THIRD_PARTY_FILE} not found in {core}", 2)
+    data = load_third_party(core)
+    upstream = data["upstream"]
+    base = os.environ.get("HARNESS_THIRD_PARTY_BASE") or f"{THIRD_PARTY_RAW}/{upstream['repo']}/{upstream['ref']}"
+    registry = json.loads(fetch_bytes(f"{base}/{upstream['registry']}").decode("utf-8"))
+    by_name = {entry["name"]: entry for entry in registry.get("skills", [])}
+    changed = []
+    for name, entry in sorted(data["skills"].items()):
+        remote = by_name.get(name)
+        if remote is None:
+            raise HarnessError(f"{name} is no longer in the upstream registry", 1)
+        if remote["contentHash"] == entry.get("contentHash"):
+            continue
+        changed.append(name)
+        for relative in remote["files"]:
+            if relative.startswith("/") or ".." in Path(relative).parts:
+                raise HarnessError(f"{name}: unsafe path {relative!r} in the upstream registry", 1)
+        if args.check:
+            continue
+        target = core / "skills" / name
+        if target.exists():
+            shutil.rmtree(target)
+        for relative in remote["files"]:
+            quoted = urllib.parse.quote(f"{upstream['skills_root']}/{remote['path']}/{relative}")
+            write_file(target / relative, fetch_bytes(f"{base}/{quoted}"))
+        entry.update({"path": remote["path"], "contentHash": remote["contentHash"], "version": remote.get("version") or "-"})
+    if changed and not args.check:
+        path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    for name in changed:
+        print(name)
+    if args.check and changed:
+        return 1
+    info(f"third-party: {len(changed)} skill(s) {'out of date' if args.check else 'updated'}")
+    return 0
+
+
 def cmd_release(args):
     core = Path(args.core or default_core()).resolve()
     branch = args.branch
@@ -1761,6 +1829,11 @@ def build_parser():
     p.add_argument("--public-patterns-only", action="store_true",
                    help="accept scanning with the core's public patterns alone when no private file exists")
     p.set_defaults(func=cmd_release)
+
+    p = sub.add_parser("third-party", help="copy new upstream versions of the third-party skills into the core")
+    p.add_argument("--core")
+    p.add_argument("--check", action="store_true", help="only report which skills are out of date (exit 1 when any is)")
+    p.set_defaults(func=cmd_third_party)
 
     p = sub.add_parser("lint", help="check the SKILL.md frontmatter of every skill")
     p.add_argument("--core")

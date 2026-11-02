@@ -18,3 +18,12 @@ tag *	leonardoburtet-clube	GitHub login of a named owner, in the identity of com
 git identity	leonardoburtet-clube	GitHub login of a named owner, in the identity of commits and tags made with the GitHub no-reply address
 scan-allowlist.txt	augusto-henriques	the allowlist entries of this login
 scan-allowlist.txt	leonardoburtet-clube	the allowlist entries of this login
+skills/tlc-spec-lean/*	\b[A-Z][A-Z0-9]{1,9}-\d{2,}\b	upstream third-party skill (public, CC-BY-4.0, copied verbatim by bin/harness third-party): example ids
+skills/tlc-spec-lean/*	(?i)\bplanner\b	upstream third-party skill (public, CC-BY-4.0, copied verbatim by bin/harness third-party)
+skills/create-adr/*	\b[A-Z][A-Z0-9]{1,9}-\d{2,}\b	upstream third-party skill (public, CC-BY-4.0, copied verbatim by bin/harness third-party): example ids
+skills/create-adr/*	(?i)\bplanner\b	upstream third-party skill (public, CC-BY-4.0, copied verbatim by bin/harness third-party)
+skills/modular-design-principles/*	\b[A-Z][A-Z0-9]{1,9}-\d{2,}\b	upstream third-party skill (public, CC-BY-4.0, copied verbatim by bin/harness third-party): example ids
+skills/modular-design-principles/*	(?i)\bplanner\b	upstream third-party skill (public, CC-BY-4.0, copied verbatim by bin/harness third-party)
+skills/tlc-spec-lean/*	(?i)\bfelipe\b	upstream third-party skill (public, CC-BY-4.0, copied verbatim by bin/harness third-party): author credit
+CATALOG.md	(?i)\bplanner\b	description of the third-party tlc-spec-lean skill
+registry.json	(?i)\bplanner\b	description of the third-party tlc-spec-lean skill
