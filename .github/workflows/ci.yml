@@ -12,6 +12,8 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # The PR's own commits, not GitHub's synthetic merge commit (made with the account's e-mail).
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
       - name: Lint skills
