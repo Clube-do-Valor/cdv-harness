@@ -27,7 +27,8 @@
       "path": "(development)/tlc-spec-lean",
       "contentHash": "65cf4acff0a88093eafc9d34a36ca3a03a74c78301b1b4025e517ecc18e66a44",
       "version": "2.2.0",
-      "user": true
+      "user": true,
+      "vendor": false
     }
   }
 }

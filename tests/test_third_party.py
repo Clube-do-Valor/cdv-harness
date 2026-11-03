@@ -128,5 +128,26 @@ class VendoredSelectionTest(HarnessTestCase):
         self.assertNotIn(".claude/README.md", selected)
 
 
+class UserOnlyTest(HarnessTestCase):
+    def test_vendor_false_skips_the_skill_in_sync(self):
+        tool = __import__("helpers").load_tool()
+
+        class Tree:
+            entries = {
+                "skills/cdv-debug/SKILL.md": ("100644", "a"),
+                "skills/tlc-spec-lean/SKILL.md": ("100644", "b"),
+                "skills/create-adr/SKILL.md": ("100644", "c"),
+                "third-party.json": ("100644", "d"),
+            }
+
+            def read(self, path):
+                return b'{"skills": {"tlc-spec-lean": {"vendor": false, "user": true}, "create-adr": {"user": true}}}'
+
+        selected = tool.select_vendored(Tree())
+        self.assertNotIn(".claude/skills/tlc-spec-lean/SKILL.md", selected)
+        self.assertIn(".claude/skills/create-adr/SKILL.md", selected)
+        self.assertIn(".claude/skills/cdv-debug/SKILL.md", selected)
+
+
 if __name__ == "__main__":
     unittest.main()

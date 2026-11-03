@@ -512,13 +512,22 @@ def stage(repo, add, remove):
 # ---------------------------------------------------------------------------------------
 
 
+def user_only_skills(tree):
+    """Third-party skills listed with "vendor": false install per user only, never into a repository."""
+    if THIRD_PARTY_FILE not in tree.entries:
+        return set()
+    listed = json.loads(tree.read(THIRD_PARTY_FILE).decode("utf-8")).get("skills", {})
+    return {name for name, entry in listed.items() if entry.get("vendor") is False}
+
+
 def select_vendored(tree):
     """Map each destination path in the consumer to (source path, executable) from the core tree."""
     selected = {}
+    skip = user_only_skills(tree)
     for path, (mode, _sha) in tree.entries.items():
         parts = path.split("/")
         dest = None
-        if parts[0] == "skills" and len(parts) >= 3:
+        if parts[0] == "skills" and len(parts) >= 3 and parts[1] not in skip:
             dest = ".claude/" + path
         elif parts[0] == "rules" and len(parts) == 3 and parts[1] == "core" and path.endswith(".md"):
             dest = ".claude/rules/core/" + parts[2]

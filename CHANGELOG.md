@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.2.1
+
+- `tlc-spec-lean` is installed per user only (`"vendor": false` in `third-party.json`): `sync` no longer copies it into repositories, and `sync --user` still installs it.
+
 ## v0.2.0
 
 - Three third-party skills copied from the Tech Leads Club catalog: `tlc-spec-lean`, `create-adr` and `modular-design-principles` (CC-BY-4.0, see `THIRD_PARTY.md`). They are vendored into consumers like the house skills and installed per user by `sync --user`.
