@@ -25,6 +25,7 @@ USER_SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round"]
 THIRD_PARTY_FILE = "third-party.json"
 THIRD_PARTY_RAW = "https://raw.githubusercontent.com"
 LOCK_RELATIVE = ".claude/harness.lock"
+PROFILE_RELATIVE = ".claude/harness/profile.yaml"
 USER_LOCK_RELATIVE = ".claude/harness-user.lock"
 HOUSE_END = "<!-- /cdv-harness:house -->"
 HOUSE_BLOCK_RE = re.compile(
@@ -791,7 +792,7 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
         for relative, data in other_writes.items():
             if not file_matches(repo / relative, data, None):
                 write_file(repo / relative, data)
-        stage(repo, [*vendored, LOCK_RELATIVE, settings_rel, instructions_rel], removals)
+        stage(repo, [*vendored, LOCK_RELATIVE, PROFILE_RELATIVE, settings_rel, instructions_rel], removals)
         info(
             f"synced {tag} ({tree.commit[:12]}): {len(added)} added, {len(changed)} changed, "
             f"{len(removed)} removed"

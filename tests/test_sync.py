@@ -326,6 +326,17 @@ class SyncTest(HarnessTestCase):
         self.assertIn(".claude/settings.json", staged)
         self.assertIn("CLAUDE.md", staged)
 
+    def test_gitignored_claude_directory_stages_the_profile_but_not_the_local_profile(self):
+        core = self.make_core()
+        repo = self.make_consumer(gitignore_claude=True)
+        self.git(repo, "rm", "-q", "--cached", ".claude/harness/profile.yaml")
+        self.git(repo, "commit", "-q", "-m", "chore: untrack the profile")
+        (repo / ".claude/harness/profile.local.yaml").write_text("commands_run_on: host\n")
+        self.sync(repo, core, "v0.1.0")
+        staged = self.git(repo, "diff", "--cached", "--name-status").stdout
+        self.assertRegex(staged, r"A\t\.claude/harness/profile\.yaml")
+        self.assertNotIn("profile.local.yaml", staged)
+
     def test_local_edits_to_vendored_files_are_overwritten_with_a_warning(self):
         core = self.make_core()
         self.add_v2(core)
