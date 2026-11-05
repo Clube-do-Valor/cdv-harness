@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- `sync` also stages `.claude/harness/profile.yaml` with `git add -f`, so a repository that ignores `.claude/` commits its profile with the first sync. `profile.local.yaml` stays out of git.
+
 ## v0.2.1
 
 - `tlc-spec-lean` is installed per user only (`"vendor": false` in `third-party.json`): `sync` no longer copies it into repositories, and `sync --user` still installs it.
