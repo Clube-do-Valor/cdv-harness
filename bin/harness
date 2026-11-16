@@ -595,11 +595,15 @@ def extract_house(text):
 
 
 HOOKS_CORE = "settings/hooks-core.json"
-HOOK_COMMAND_PREFIX = ".claude/harness/hooks/"
+# The host runs a hook command in the session's current directory, which moves with every `cd`, so
+# a core hook is reached through the project directory the host exports to hooks (door 4).
+HOOK_COMMAND_PREFIX = '"$CLAUDE_PROJECT_DIR"/.claude/harness/hooks/'
+HOOK_COMMAND_RE = re.compile(re.escape(HOOK_COMMAND_PREFIX) + r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def read_core_hooks(blob):
-    """The `PreToolUse` entries of settings/hooks-core.json. Every command must run a vendored hook."""
+    """The `PreToolUse` entries of settings/hooks-core.json. Every command must be exactly
+    `"$CLAUDE_PROJECT_DIR"/.claude/harness/hooks/<name>`: a vendored hook, reached from any directory."""
     if blob is None:
         return []
     try:
@@ -617,8 +621,8 @@ def read_core_hooks(blob):
                 if not isinstance(hook, dict) or hook.get("type") != "command":
                     raise ValueError("each hook must be of type command")
                 command = hook.get("command")
-                if not isinstance(command, str) or not command.startswith(HOOK_COMMAND_PREFIX):
-                    raise ValueError(f"each command must start with {HOOK_COMMAND_PREFIX}, got {command!r}")
+                if not isinstance(command, str) or not HOOK_COMMAND_RE.fullmatch(command):
+                    raise ValueError(f"each command must be {HOOK_COMMAND_PREFIX}<name>, got {command!r}")
     except (ValueError, KeyError, TypeError) as exc:
         raise HarnessError(f"{HOOKS_CORE} is invalid: {exc}")
     return entries

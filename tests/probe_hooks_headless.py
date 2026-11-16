@@ -11,11 +11,18 @@ case with `claude -p --permission-mode bypassPermissions --output-format stream-
   suite-lock     the session runs the full test command while the
                  static analysis command runs in the consumer     -> the hook's reason comes back
 
+Each case has a `-subdir` twin (`require-model-subdir`, `prod-ssh-subdir`, `suite-lock-subdir`)
+whose session first runs `cd sub && pwd` and only then the probed call: the host runs a hook
+command in the session's current directory, so a hook wired by a relative path is not found there
+and the call runs (Verifier finding 3). A twin also requires that `cd` call to have printed a
+directory ending in `/sub`.
+
 A case passes when the session's tool call has the probed shape, its tool result is an error that
 carries the hook's own message, and the command's own output is absent. Exit 0 every selected case
 passed, 1 one failed, 2 the CLI is missing. `-k <case>` selects one case; `--model` picks the
 session's model (default `haiku`); `CLAUDE_BIN` overrides the CLI path; `--keep` keeps the
-throwaway directory and prints its path.
+throwaway directory and prints its path; `--relative-commands` rewrites the synced hook commands
+to the pre-fix relative form `.claude/harness/hooks/<name>`, to show a `-subdir` case failing on it.
 """
 
 import argparse
@@ -37,7 +44,10 @@ from helpers import HarnessTestCase  # noqa: E402
 from test_core_release import core_files  # noqa: E402
 
 PROD_HOST = "prod.example.invalid"
-CASES = ["require-model", "prod-ssh", "suite-lock"]
+HOOKS = ["require-model", "prod-ssh", "suite-lock"]
+SUBDIR = "sub"
+CASES = HOOKS + [f"{h}-subdir" for h in HOOKS]
+PROJECT_DIR = '"$CLAUDE_PROJECT_DIR"/'
 
 
 def git(cwd, *args):
@@ -48,7 +58,7 @@ def git(cwd, *args):
     )
 
 
-def build(root, analysis_cmd, test_cmd):
+def build(root, analysis_cmd, test_cmd, relative=False):
     core, repo = root / "core", root / "consumer"
     core.mkdir()
     git(core, "init", "-q")
@@ -78,7 +88,15 @@ def build(root, analysis_cmd, test_cmd):
     )
     if sync.returncode != 0:
         raise SystemExit(f"probe: sync failed: {sync.stderr.strip()}")
-    settings = json.loads((repo / ".claude" / "settings.json").read_text())
+    (repo / SUBDIR).mkdir()
+    (repo / SUBDIR / "README.md").write_text("A subdirectory the session moves into.\n")
+    settings_path = repo / ".claude" / "settings.json"
+    settings = json.loads(settings_path.read_text())
+    if relative:
+        for entry in settings["hooks"]["PreToolUse"]:
+            for hook in entry["hooks"]:
+                hook["command"] = hook["command"].replace(PROJECT_DIR, "")
+        settings_path.write_text(json.dumps(settings, indent=2) + "\n")
     commands = [h["command"] for e in settings["hooks"]["PreToolUse"] for h in e["hooks"]]
     print(f"probe: consumer synced at {repo}; PreToolUse hooks: {', '.join(commands)}")
     return repo
@@ -115,11 +133,24 @@ def result_text(block):
     return str(content or "")
 
 
-def judge(events, tool, shape, marker, absent):
+def moved_into_subdir(events):
+    """Whether a Bash call `cd sub ...` ran before the probed call and printed a path ending in /sub."""
+    cds = {b["id"] for b in blocks_of(events, "tool_use")
+           if b.get("name") == "Bash" and str((b.get("input") or {}).get("command", "")).strip().startswith(f"cd {SUBDIR}")}
+    for block in blocks_of(events, "tool_result"):
+        if block.get("tool_use_id") in cds and not block.get("is_error"):
+            if any(line.strip().endswith(f"/{SUBDIR}") for line in result_text(block).splitlines()):
+                return True
+    return False
+
+
+def judge(events, tool, shape, marker, absent, subdir=False):
     mode = next((e.get("permissionMode") for e in events if e.get("type") == "system" and e.get("subtype") == "init"), None)
     calls = {b["id"]: b for b in blocks_of(events, "tool_use") if b.get("name") in tool and shape(b.get("input") or {})}
     if mode != "bypassPermissions":
         return False, f"the session's permission mode is {mode!r}, not bypassPermissions"
+    if subdir and not moved_into_subdir(events):
+        return False, f"the session did not first run `cd {SUBDIR} && pwd` ending in /{SUBDIR}"
     if not calls:
         used = [b.get("name") for b in blocks_of(events, "tool_use")]
         return False, f"the session made no probed {'/'.join(tool)} call (tool calls: {used})"
@@ -133,24 +164,27 @@ def judge(events, tool, shape, marker, absent):
 
 
 def probe(case, claude, repo, model, analysis_cmd, test_cmd):
-    if case == "require-model":
-        prompt = ("Call the Agent tool exactly once with subagent_type 'general-purpose', description 'probe' and "
+    hook, subdir = case.removesuffix("-subdir"), case.endswith("-subdir")
+    first = (f"First run this exact Bash command, unchanged, as its own call: cd {SUBDIR} && pwd\n"
+             "Then, in a separate call, " if subdir else "")
+    if hook == "require-model":
+        prompt = (first + "call the Agent tool exactly once with subagent_type 'general-purpose', description 'probe' and "
                   "prompt 'Reply with the single word pong.'. Do NOT pass the model parameter. When the tool "
                   "returns, reply with the single word DONE.")
         return judge(session(claude, repo, prompt, model)[1], ("Agent", "Task"),
-                     lambda i: not i.get("model"), "require-model:", None)
-    if case == "prod-ssh":
+                     lambda i: not i.get("model"), "require-model:", None, subdir)
+    if hook == "prod-ssh":
         command = f"ssh -o BatchMode=yes -o ConnectTimeout=2 {PROD_HOST} true"
-        prompt = (f"Run this exact Bash command once, unchanged, and nothing else: {command}\n"
+        prompt = (first + f"run this exact Bash command once, unchanged, and nothing else: {command}\n"
                   "When it returns, reply with the single word DONE.")
         return judge(session(claude, repo, prompt, model)[1], ("Bash",),
-                     lambda i: PROD_HOST in str(i.get("command", "")), "prod-ssh:", "Could not resolve")
+                     lambda i: PROD_HOST in str(i.get("command", "")), "prod-ssh:", "Could not resolve", subdir)
     analysis = subprocess.Popen(analysis_cmd.split(), cwd=str(repo))
     try:
-        prompt = (f"Run this exact Bash command once, unchanged, and nothing else: {test_cmd}\n"
+        prompt = (first + f"run this exact Bash command once, unchanged, and nothing else: {test_cmd}\n"
                   "When it returns, reply with the single word DONE.")
         return judge(session(claude, repo, prompt, model)[1], ("Bash",),
-                     lambda i: str(i.get("command", "")).strip() == test_cmd, "suite-lock:", "probe-suite-ran")
+                     lambda i: str(i.get("command", "")).strip() == test_cmd, "suite-lock:", "probe-suite-ran", subdir)
     finally:
         analysis.kill()
         analysis.wait()
@@ -161,6 +195,7 @@ def main(argv=None):
     parser.add_argument("-k", dest="case", choices=CASES + ["all"], default="all")
     parser.add_argument("--model", default="haiku")
     parser.add_argument("--keep", action="store_true")
+    parser.add_argument("--relative-commands", action="store_true")
     args = parser.parse_args(argv)
     claude = os.environ.get("CLAUDE_BIN") or shutil.which("claude")
     if not claude:
@@ -173,7 +208,7 @@ def main(argv=None):
     root = Path(tempfile.mkdtemp(prefix="hooks-probe-"))
     failed = 0
     try:
-        repo = build(root, analysis_cmd, test_cmd)
+        repo = build(root, analysis_cmd, test_cmd, args.relative_commands)
         for case in CASES if args.case == "all" else [args.case]:
             ok, detail = probe(case, claude, repo, args.model, analysis_cmd, test_cmd)
             failed += not ok

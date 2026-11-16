@@ -5,7 +5,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": ".claude/harness/hooks/require-model"
+          "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/harness/hooks/require-model"
         }
       ]
     },
@@ -14,7 +14,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": ".claude/harness/hooks/prod-ssh"
+          "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/harness/hooks/prod-ssh"
         }
       ]
     },
@@ -23,7 +23,7 @@
       "hooks": [
         {
           "type": "command",
-          "command": ".claude/harness/hooks/suite-lock"
+          "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/harness/hooks/suite-lock"
         }
       ]
     }
