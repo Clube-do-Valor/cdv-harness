@@ -1012,6 +1012,9 @@ def cmd_propose(args):
             present[relative] = root
         elif root.is_dir():
             for found in sorted(root.rglob("*")):
+                # a bytecode cache a vendored script wrote is not part of the core (as in skill_files)
+                if "__pycache__" in found.relative_to(root).parts or found.name.endswith(".pyc"):
+                    continue
                 if found.is_file() and not found.is_symlink():
                     present[found.relative_to(repo).as_posix()] = found
     changed = sorted(p for p, f in present.items() if p in locked and sha256_bytes(f.read_bytes()) != locked[p])

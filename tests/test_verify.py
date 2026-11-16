@@ -18,6 +18,15 @@ class VerifyTest(HarnessTestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.strip(), "harness: vendored core matches v0.1.0")
 
+    def test_a_bytecode_cache_in_a_vendored_skill_is_ignored(self):
+        _core, repo = self.synced()
+        cache = repo / ".claude/skills/cdv-debug/scripts/__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "lean_config.cpython-313.pyc").write_bytes(b"\x00pyc")
+        (repo / ".claude/skills/cdv-debug/scripts/stray.pyc").write_bytes(b"\x00pyc")
+        result = self.verify(repo)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_exit_1_lists_changed_created_and_deleted_files(self):
         _core, repo = self.synced()
         (repo / ".claude/skills/cdv-debug/SKILL.md").write_text("edited\n")

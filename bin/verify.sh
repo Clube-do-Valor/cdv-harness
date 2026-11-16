@@ -77,7 +77,8 @@ ref=$(sed -n 's/^  "ref": "\(.*\)",\{0,1\}$/\1/p' "$lock")
 
 current_files=$(printf '%s\n' "$locked_paths" | while IFS= read -r p; do
   if [ -n "$p" ] && [ -e "$p" ]; then
-    find "$p" -type f
+    # a bytecode cache (__pycache__/, *.pyc) that a vendored script wrote is not part of the core
+    find "$p" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' -print
   fi
 done | LC_ALL=C sort -u)
 

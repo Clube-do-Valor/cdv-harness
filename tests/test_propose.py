@@ -94,6 +94,16 @@ class ProposeTest(HarnessTestCase):
         result = self.propose("--no-pr")
         self.assertIn("nothing to propose", result.stdout)
 
+    def test_a_bytecode_cache_in_a_vendored_skill_is_not_proposed(self):
+        cache = self.consumer / ".claude/skills/cdv-debug/scripts/__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "lean_config.cpython-313.pyc").write_bytes(b"\x00pyc")
+        (self.consumer / ".claude/skills/cdv-debug/scripts/stray.pyc").write_bytes(b"\x00pyc")
+        proc = self.propose("--no-pr")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("nothing to propose", proc.stdout + proc.stderr)
+        self.assert_nothing_proposed()
+
     def test_created_and_deleted_files_are_proposed(self):
         (self.consumer / ".claude/skills/cdv-debug/references/added.md").write_text("added\n")
         (self.consumer / ".claude/rules/core/legacy.md").unlink()
