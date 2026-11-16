@@ -10,14 +10,15 @@ client whose `--help` lists a `pipelines` command (the bundled Bitbucket client:
 HEAD` in the root; with no git, the newest run). The last line printed is the status:
 `green: ...`, `red: <failed step>`, or `timeout: ...`.
 
-Exit 0 green, 1 red (the line names the failed step), 2 the client is not set or has no pipelines
-command, 3 no terminal state before --timeout.
+Exit 0 green, 1 red (the line names the failed step), 2 the client is not set, is not a command that
+exists, or has no pipelines command, 3 no terminal state before --timeout.
 """
 
 import argparse
 import json
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -146,6 +147,8 @@ def pick_client(root):
     if not value:
         raise WatchError("`pr_cli` is not set in the repository profile: no client to read the pipeline with")
     argv = client_argv(root, value)
+    if not shutil.which(argv[0]):
+        raise WatchError(f"cannot run `{argv[0]}` (profile pr_cli): no such command")
     if Path(argv[0]).name == "gh":
         return GitHub(argv, root)
     try:

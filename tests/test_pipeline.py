@@ -7,6 +7,7 @@ import subprocess
 import sys
 import time
 import unittest
+from pathlib import Path
 
 from helpers import REPO_ROOT, HarnessTestCase
 from test_kickoff_profile import sentences
@@ -122,6 +123,18 @@ class WatchPipelineTest(HarnessTestCase):
         proc = self.watch()
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertIn("pipelines", proc.stderr)
+        for value in (str(self.tmp / "no-such-dir" / "gh"), "gh-missing-client", "gh"):
+            with self.subTest(missing_client=value):
+                (self.root / ".claude" / "harness" / "profile.yaml").write_text(f"pr_cli: {value}\n")
+                env = dict(self.env, FAKE_PR_STATE=str(self.state), PATH=str(self.tmp / "empty-path"))
+                proc = subprocess.run(
+                    [sys.executable, str(WATCH), "--root", str(self.root), "--branch", "feat/invoice-export",
+                     "--timeout", "2", "--interval", "0.2"],
+                    capture_output=True, text=True, env=env, timeout=60,
+                )
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr)
+                self.assertIn(Path(value).name, proc.stderr)
 
     def test_missing_or_none_pr_cli_exits_2(self):
         for text in ("", "pr_cli: none\n"):
