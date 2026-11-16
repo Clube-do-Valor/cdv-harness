@@ -327,8 +327,9 @@ def validate_profile(profile, schema, relax=()):
             errors.append(f"key '{key}' must be a single value, not a list")
         elif kind == "enum" and str(value) not in spec.get("values", []):
             errors.append(f"key '{key}' must be one of {', '.join(spec.get('values', []))}, got '{value}'")
+    families = schema.get("families") if isinstance(schema.get("families"), dict) else {}
     for key in profile:
-        if key not in variables:
+        if key not in variables and not any(key.startswith(prefix) and key != prefix for prefix in families):
             warn(f"profile has unknown key '{key}'")
     if errors:
         raise HarnessError("invalid profile:\n  " + "\n  ".join(errors), 2)
