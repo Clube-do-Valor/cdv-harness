@@ -155,6 +155,10 @@ class ProdReadTest(HarnessTestCase):
             (["--job-runs", "nightly-sync"], [r"DB::table\('job_runs'\)", r"'job'", r"nightly-sync", r"'started_at'"]),
             (["--logs", "Timeout while"], [r"storage_path\('logs'\)", r"'Timeout while'"]),
         ]
+        # --logs is bounded where it runs: each file is read from its end and the read stops at
+        # prod_row_cap + 1 matching lines, so no log is loaded whole into production memory.
+        logs_bounded = [r"\$max = 51;", r"fseek\(\$handle, 0, SEEK_END\)", r"while \(\$found < \$max", r"if \(\+\+\$found >= \$max\) \{ break; \}"]
+        logs_whole = [r"\bfile\(", r"file_get_contents\(", r"\bfgets\(", r"SplFileObject"]
         for args, patterns in cases:
             with self.subTest(read=args[0]):
                 self.calls.unlink(missing_ok=True)
@@ -165,6 +169,11 @@ class ProdReadTest(HarnessTestCase):
                 self.assertTrue(call["stdin"].startswith(READONLY), call["stdin"])
                 for pattern in patterns:
                     self.assertRegex(call["stdin"], pattern)
+                if args[0] == "--logs":
+                    for pattern in logs_bounded:
+                        self.assertRegex(call["stdin"], pattern)
+                    for pattern in logs_whole:
+                        self.assertNotRegex(call["stdin"], pattern)
 
     def test_another_command_exits_3(self):
         for args in (["--artisan", "migrate"], ["--shell"], ["migrate:fresh"], ["--exec", "DB::table('invoices')->delete();"]):

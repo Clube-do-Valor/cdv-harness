@@ -192,11 +192,19 @@ def read_code(root, values, mode, value, cap):
             f"->orderByDesc({php(time_column)})->limit({cap + 1})->get() as $row) {{ echo json_encode($row), PHP_EOL; }}\n"
         )
     if mode == "--logs":
+        # Each file is read backwards in 64 KiB chunks and the read stops at <cap> + 1 matching
+        # lines, so a broad pattern never loads a whole log into production memory or sends it.
         return (
-            f"$pattern = {php(value)}; $files = glob(storage_path('logs') . '/*.log') ?: [];"
+            f"$pattern = {php(value)}; $max = {cap + 1}; $found = 0; $files = glob(storage_path('logs') . '/*.log') ?: [];"
             " usort($files, fn ($a, $b) => filemtime($b) <=> filemtime($a));"
-            " foreach (array_slice($files, 0, 2) as $file) { $lines = file($file, FILE_IGNORE_NEW_LINES) ?: [];"
-            " foreach (array_reverse($lines) as $line) { if (str_contains($line, $pattern)) { echo basename($file), ': ', $line, PHP_EOL; } } }\n"
+            " foreach (array_slice($files, 0, 2) as $file) { $handle = fopen($file, 'rb'); if (!$handle) { continue; }"
+            " fseek($handle, 0, SEEK_END); $position = ftell($handle); $tail = '';"
+            " while ($found < $max && ($position > 0 || $tail !== '')) { $size = min(65536, $position); $position -= $size;"
+            " fseek($handle, $position); $chunk = $size > 0 ? fread($handle, $size) : '';"
+            " $lines = explode(\"\\n\", $chunk . $tail); $tail = $position > 0 ? array_shift($lines) : '';"
+            " foreach (array_reverse($lines) as $line) { $line = rtrim($line, \"\\r\");"
+            " if ($line !== '' && str_contains($line, $pattern)) { echo basename($file), ': ', $line, PHP_EOL;"
+            " if (++$found >= $max) { break; } } } } fclose($handle); if ($found >= $max) { break; } }\n"
         )
     raise Stop(f"`{mode}` is not a read this script does", REFUSED)
 
