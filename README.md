@@ -54,7 +54,7 @@ The vendored copy is never edited in place: the gate fails the PR, and the core 
 
 ## Releases
 
-`bin/harness release` tags at most once a week and only when `main` changed since the last tag: minor when a `feat` commit landed, patch otherwise. Then it runs `sync --pr` in each consumer listed in a machine-local `~/.config/cdv-harness/consumers.yaml`. With no change, or with a tag younger than 7 days, it does nothing. `--dry-run` prints the decision. Nothing schedules it yet: it runs by hand.
+`bin/harness release` tags at most once a week and only when `main` changed since the last tag: minor when a `feat` commit landed, patch otherwise. Then it runs `sync --pr` in each consumer listed in a machine-local `~/.config/cdv-harness/consumers.yaml`. With no change, or with a tag younger than 7 days, it does nothing; `--adjust` cuts the next patch tag inside that window, for a fix that cannot wait a week. `--dry-run` prints the decision. Nothing schedules it yet: it runs by hand.
 
 ## Gates of this repository
 

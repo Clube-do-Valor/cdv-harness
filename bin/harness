@@ -1805,16 +1805,20 @@ def cmd_release(args):
                 raise HarnessError(f"--now must be YYYY-MM-DD, got '{args.now}'", 2)
         else:
             now = datetime.datetime.now(datetime.timezone.utc)
-        if now - tagged_at < datetime.timedelta(days=7):
-            info(f"last tag {last} is younger than 7 days")
-            return 0
         major, minor, patch = (int(x) for x in SEMVER_TAG_RE.match(last).groups())
-        subjects = git_out(core, "log", "--format=%s", f"{last}..{branch}").splitlines()
-        if any(re.match(r"^feat(\(.+\))?!?:", s) for s in subjects):
-            bump, version = "minor", f"v{major}.{minor + 1}.0"
+        if now - tagged_at < datetime.timedelta(days=7):
+            if not args.adjust:
+                info(f"last tag {last} is younger than 7 days")
+                return 0
+            # An adjustment inside the window is always a patch, whatever the commits say.
+            version, basis = f"v{major}.{minor}.{patch + 1}", f"adjustment patch from {last}, inside its 7-day window"
         else:
-            bump, version = "patch", f"v{major}.{minor}.{patch + 1}"
-        basis = f"{bump} bump from {last}"
+            subjects = git_out(core, "log", "--format=%s", f"{last}..{branch}").splitlines()
+            if any(re.match(r"^feat(\(.+\))?!?:", s) for s in subjects):
+                bump, version = "minor", f"v{major}.{minor + 1}.0"
+            else:
+                bump, version = "patch", f"v{major}.{minor}.{patch + 1}"
+            basis = f"{bump} bump from {last}"
     else:
         if int(git_out(core, "rev-list", "--count", branch)) == 0:
             raise HarnessError(f"branch '{branch}' has no commits")
@@ -1902,6 +1906,8 @@ def build_parser():
     p.add_argument("--core")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--now", help="YYYY-MM-DD (midnight UTC) used as the current date")
+    p.add_argument("--adjust", action="store_true",
+                   help="inside the 7-day window of the last tag, cut the next patch tag instead of nothing")
     p.add_argument("--consumers", help="file listing consumer repositories (default: ~/.config/cdv-harness/consumers.yaml)")
     p.add_argument("--branch", default="main")
     p.add_argument("--extra-patterns", action="append", metavar="FILE",
