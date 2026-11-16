@@ -87,7 +87,7 @@
       "owner": "augusto-henriques",
       "description": "Start a feature or a fix larger than a one-liner with one command - read the request (a card link, a chat thread, a brief) and the repository, propose the run profile through its scripts (track small/medium/big, mode, chain, workspace, roles, optional steps), ask one question screen for medium and big work and none for small, write and validate the run profile, then run the chain (grilling, tlc-spec-lean plan, build and Verifier, review, fixes, browser QA, PR, pipeline, card) with no prompt per stage, stopping only where the profile says. Triggers on \"start this feature\", \"kickoff\", \"/cdv-kickoff\", \"começa essa feature\", \"vamos fazer esse card\", or a hand-off from cdv-debug or cdv-grilling. Do NOT use for a pure root-cause investigation with no build (cdv-debug), an open interview (cdv-grilling), a review of an existing branch (cdv-code-review), or a factory run (cdv-factory-small-feature).",
       "path": "skills/cdv-kickoff",
-      "contentHash": "e93595b62025d90502f1c6c178c528a4e0dba8220f472549f049a2443053120d"
+      "contentHash": "2e7780e8c2520274bbcce0a32887cab891065e903a1920c8f6a82e8369bbd853"
     },
     {
       "name": "cdv-notion-ticket",

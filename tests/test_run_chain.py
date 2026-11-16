@@ -130,6 +130,10 @@ class RunStatusTest(RepoCase):
         self.ok("done", "verify")
         self.assertEqual(self.status("start", "verify").returncode, 0)
         self.ok("done", "verify")
+        before = self.status_path.read_bytes()
+        retried = self.status("retry", "verify")
+        self.assertEqual(retried.returncode, 3, retried.stdout + retried.stderr)
+        self.assertEqual(self.status_path.read_bytes(), before)
         third = self.status("start", "verify")
         self.assertEqual(third.returncode, 3, third.stdout + third.stderr)
         self.assertEqual(self.shown()["verify"].split()[1], "capped")
@@ -184,6 +188,15 @@ class RunStatusTest(RepoCase):
         self.assertEqual(third.returncode, 3, third.stdout + third.stderr)
         self.assertEqual(self.status_path.read_bytes(), before)
         self.assertIn("resume-2", self.shown()["grilling"])
+        self.ok("done", "grilling")
+        self.ok("start", "plan")
+        self.ok("done", "plan")
+        before = self.status_path.read_bytes()
+        for stage in ("plan", "build"):  # done and never retried, and not started yet
+            with self.subTest(stage=stage):
+                proc = self.status("retry", stage)
+                self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+                self.assertEqual(self.status_path.read_bytes(), before)
 
     def test_unknown_stage_exits_2(self):
         for stage in ("deploy", "research"):

@@ -162,7 +162,7 @@ Rules of the run:
 - After a Verifier round with findings, a builder or fixer child closes them and `verify` starts again. When `run_status.py start verify` exits `3` and marks the stage `capped` with findings open, write each open item, tagged `defect` or `proof-gap`, into the pull request description and continue to the review.
 - While the developer is away, stop and ask before any step that sends something to a person or a live automation, writes in production or deploys, whatever the mode and whatever the brief says.
 - The only external records a run creates unattended are its own test records (`unattended: own-test-records`), named with `profile.qa_test_marker` and deleted at the end.
-- A child that dies (memory, usage limit, restart): `run_status.py retry <stage> --child <new id>` and start one resume child with the status and its brief. The third retry of a stage exits `3`: stop and report.
+- A child that dies (memory, usage limit, restart) leaves its stage `running`: `run_status.py retry <stage> --child <new id>` and start one resume child with the status and its brief. `retry` takes only a `running` stage (a `done` stage or another Verifier round exits `3`), and the third retry of a stage exits `3`: stop and report.
 - Each optional step of the run profile runs from its recipe in `references/optional/<step>.md` of this skill, at the point the recipe names: [slack-draft](references/optional/slack-draft.md), [mock-before-after](references/optional/mock-before-after.md), [blind-judges](references/optional/blind-judges.md), [validation-page](references/optional/validation-page.md).
 - After every stage, print the stage's line of `run_status.py show`, so "where are we?" has an answer without a question.
 

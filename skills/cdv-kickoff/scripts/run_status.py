@@ -9,9 +9,11 @@
 `start` opens the next pending stage of the chain and refuses (exit 3, nothing changed) any other;
 `verify` may start again after it is done, while no later stage has started, until the run
 profile's `verify_rounds` rounds are recorded: the start after that exits 3 and marks it `capped`.
-A stage whose run profile value is `none` or `0` is `skipped` and never starts. `retry` reopens a
-stage that has started, at most twice per stage. `show` prints, per stage: name, state (`pending`,
-`running`, `done`, `skipped`, `capped`), start and end time (UTC), the child that ran it, its role.
+A stage whose run profile value is `none` or `0` is `skipped` and never starts. `retry` hands a
+`running` stage whose child died to a new child, at most twice per stage; on a stage in any other
+state it exits 3 with nothing changed, so it never reopens a `done` stage nor adds a Verifier round.
+`show` prints, per stage: name, state (`pending`, `running`, `done`, `skipped`, `capped`), start and
+end time (UTC), the child that ran it, its role.
 
 The status is `status.json` in the feature's work folder, beside `run.yaml` (or in `RUN-<slug>/`
 for a `RUN-<slug>.yaml` at the root). Exit 0 ok, 2 an unknown stage or no valid run profile, 3
@@ -144,8 +146,10 @@ class Run:
     def retry(self, stage, child):
         self.check_stage(stage)
         state = self.state(stage)
-        if state not in ("running", "done"):
-            raise ScriptError(f"`{stage}` is {state}: only a stage that has started can be retried", REFUSED)
+        if state != "running":
+            raise ScriptError(
+                f"`{stage}` is {state}: only a running stage (its child died) can be retried", REFUSED
+            )
         record = self.record(stage)
         if record.get("retries", 0) >= MAX_RETRIES:
             raise ScriptError(f"`{stage}` was retried {MAX_RETRIES} times already: stop and report", REFUSED)
