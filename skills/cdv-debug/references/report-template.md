@@ -25,7 +25,7 @@ Exact shape of the final report produced at the end of Step 7. Load this only wh
 > **Diagnóstico** — Causa raiz: <uma frase com o mecanismo, ex.: registro local referencia um objeto externo deletado; a chamada de atualização propaga o 404 como exceção genérica>.
 > **Hipóteses consideradas** — <candidata> — confirmada/descartada/inconclusiva — <evidência que decidiu>.
 > **Evidência** — tabela pequena, uma linha por registro, sempre com o campo que prova a hipótese.
-> **Refs de código** — [OrderService.php:972](app/Services/OrderService.php#L972) — <meia linha>.
+> **Refs de código** — `[OrderService.php:972](app/Services/OrderService.php#L972)` — <meia linha>.
 > **PRs / commits relacionados** — PR #NNN (merge YYYY-MM-DD) — <relação com o caso>.
 > **Próximos passos** — Mitigação imediata: <ação única concreta>. Follow-ups técnicos: <bullets opcionais>.
 

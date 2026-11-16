@@ -48,7 +48,7 @@ Refuse by naming exactly one. The category is for the task and the PR; the reque
 
 | Category | Applies when | Examples |
 |---|---|---|
-| **produção** | Doing or proving the change needs a real side effect: running something against production data, a backfill, a reprocess, a data fix, a deploy step, a PRODUCTION-AFFECTING command per [production-safety.md](../../cdv-plan-feature/references/production-safety.md) | "reprocessa os registros de ontem", "corrige o valor do cadastro X no banco", "roda a sincronização de novo" |
+| **produção** | Doing or proving the change needs a real side effect: running something against production data, a backfill, a reprocess, a data fix, a deploy step, a PRODUCTION-AFFECTING command per [production-safety.md](../../../harness/references/production-safety.md) | "reprocessa os registros de ontem", "corrige o valor do cadastro X no banco", "roda a sincronização de novo" |
 | **integração** | The change alters a contract with an external system or its client/job: an external system shared with production (`profile.production_writing_integrations`) | "manda esse campo pro CRM", "muda o payload do webhook", "puxa o dado novo da API externa" |
 | **envio de mensagem** | The change sends or alters something sent to a person: e-mail, notification, chat message, reminder | "avisa o responsável quando…", "muda o texto do e-mail" |
 | **ambíguo sem imagem nem rota** | You cannot locate the element (no image, no route, no unique screen name), or more than one trunk is open, or the one question was asked and the scope is still open, or the request is not a change (a question, an investigation, a vague complaint) | "o filtro tá estranho", "melhora o dashboard" |

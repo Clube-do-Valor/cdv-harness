@@ -2,7 +2,7 @@
 #
 # check-diff-size.sh — is a factory branch still "small"?
 #
-# The small tier of cdv-plan-feature (≤ ~3 files, no migration, no new
+# The small track of cdv-kickoff (≤ ~3 files, no migration, no new
 # screen) is a judgment call; the factory runs without a human, so the same
 # criterion is decided here, over the real diff, with an exit code.
 #

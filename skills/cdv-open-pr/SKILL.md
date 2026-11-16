@@ -64,7 +64,7 @@ The section, appended at the end of the description:
 
 ### Step 4 — Front-end changed, visually checked?
 
-When `git diff --name-only origin/<profile.default_branch>...HEAD` has `{app_dir}/resources/js/**/*.vue` or `*.ts` outside tests and this session ran no visual check (`cdv-interactive-qa` or Chrome on the local app), ask once: *"O PR mexe em tela; o QA visual já rodou (aqui ou em outra sessão)?"*. The answer does not block — QA usually runs in a fresh session — but a "não" goes into the report as a pending item.
+When `git diff --name-only origin/<profile.default_branch>...HEAD` has `{app_dir}/resources/js/**/*.vue` or `*.ts` outside tests and this session ran no visual check (`cdv-qa` or Chrome on the local app), ask once: *"O PR mexe em tela; o QA visual já rodou (aqui ou em outra sessão)?"*. The answer does not block — QA usually runs in a fresh session — but a "não" goes into the report as a pending item.
 
 ### Step 5 — Create
 

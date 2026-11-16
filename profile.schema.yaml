@@ -6,6 +6,10 @@
 # scalars written as `- item` lines under `key:`. Nested mappings, anchors and flow style are
 # rejected by `harness sync`.
 #
+# A key family (`families:` below) declares every key that starts with its prefix: `account_work`
+# and `account_personal` are both members of `account_`. Skills cite a family as
+# `profile.account_<name>`.
+#
 # Skills refer to a value as `profile.<key>`. A skill reads the profile in its step 0 and stops
 # when the file is missing. A required key that is missing is an error; an optional key that is
 # missing, or that holds `none`, means the repository does not have that thing, and the skill
@@ -264,6 +268,113 @@ variables:
     required: false
     description: External systems the application writes to; a code path that writes to one is production-affecting.
 
+  # Roles of a run: each `<account> <model alias> <effort>`, resolved through account_<name> and
+  # model_<alias> (the families below) by role_target.py. Never the alias `inherit`.
+  role_orchestrator:
+    type: string
+    required: false
+    description: Role of the session that runs the chain (`<account> <model alias> <effort>`, e.g. `work opus high`).
+  role_builder:
+    type: string
+    required: false
+    description: Role of the builder child.
+  role_builder_risk:
+    type: string
+    required: false
+    description: Role of the builder when the work touches access, money, a contract or a one-way door.
+  role_verifier:
+    type: string
+    required: false
+    description: Role of the Verifier child (never the builder).
+  role_reviewer:
+    type: string
+    required: false
+    description: Role of the code-review child.
+  role_fixer:
+    type: string
+    required: false
+    description: Role of the child that applies review findings, one commit per finding.
+  role_qa:
+    type: string
+    required: false
+    description: Role of the child that runs the browser QA.
+  role_research:
+    type: string
+    required: false
+    description: Role of the research-round children.
+  role_judge:
+    type: string
+    required: false
+    description: Role of the blind judges of a new screen.
+  delegate_tool:
+    type: string
+    required: false
+    description: Name of the host tool that starts a child on another account or model (for example an MCP tool `mcp__<server>__<tool>`); `none` runs each child as a native subagent on the role's model.
+
+  # Production reads (cdv-prod, .claude/harness/bin/prod-read and the prod-ssh hook)
+  prod_ssh_target:
+    type: string
+    required: false
+    description: SSH destination of the production host (an alias of the machine's ssh config); `none` means production is not read from here.
+  prod_app_container:
+    type: string
+    required: false
+    description: Name filter of the application container on the production host. Docker matches any part of a name, so anchor it (`^app$`) when another container's name contains it; only letters, digits, `_.:@-`, a leading `^` and `/`, and a trailing `$` are accepted.
+  prod_exec_user:
+    type: string
+    required: false
+    description: User the read runs as inside the container.
+  prod_hosts:
+    type: list
+    required: false
+    description: Host names and addresses of production; a free-form ssh to one of them is blocked by the prod-ssh hook.
+  prod_readonly_connection:
+    type: string
+    required: false
+    description: Database connection of the application that uses a read-only user; when set, every probe runs on it.
+  prod_session_readonly_sql:
+    type: string
+    required: false
+    description: Statement that makes the session read-only before the probe (default `SET SESSION TRANSACTION READ ONLY`).
+  prod_row_cap:
+    type: string
+    required: false
+    description: Maximum number of output lines a production read prints; the rest is cut with a count line.
+  prod_timeout_seconds:
+    type: string
+    required: false
+    description: Seconds after which a production read is stopped.
+  prod_job_runs_table:
+    type: string
+    required: false
+    description: "Where the application records its job runs, as `<table> <name column> <time column>`; read by `prod-read --job-runs <name>`, which exits 2 without it."
+  prod_log:
+    type: string
+    required: false
+    description: File that receives one line per production read (UTC time, mode, sha256 of the probe, exit code); belongs in profile.local.yaml.
+
+  # Browser QA (cdv-qa) and delivery (cdv-notion-ticket, cdv-rollout)
+  qa_side_stack_script:
+    type: string
+    required: false
+    description: Script that starts the application for a worktree beside the main one and prints its address and a login link; `none` when absent.
+  qa_test_marker:
+    type: string
+    required: false
+    description: Marker every record created in an external system during QA carries in its name, so it can be found and deleted.
+  ticket_status_pr_open:
+    type: string
+    required: false
+    description: Card status set when the pull request is opened; `none` skips the move.
+  ticket_status_merged:
+    type: string
+    required: false
+    description: Card status set when the pull request is merged; `none` skips the move.
+  ticket_status_deployed:
+    type: string
+    required: false
+    description: Card status set when the change is deployed; `none` skips the move.
+
   # Machine (normally in profile.local.yaml)
   main_checkout:
     type: string
@@ -273,3 +384,9 @@ variables:
     type: string
     required: false
     description: Local URL of the running app on this machine; belongs in profile.local.yaml.
+
+families:
+  account_:
+    description: "`account_<name>`: the host's provider id of the account a role line names (for example `account_personal`); belongs in profile.local.yaml."
+  model_:
+    description: "`model_<alias>`: the host's model id of the alias a role line names (for example `model_sonnet`); belongs in profile.local.yaml."

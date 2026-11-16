@@ -327,8 +327,9 @@ def validate_profile(profile, schema, relax=()):
             errors.append(f"key '{key}' must be a single value, not a list")
         elif kind == "enum" and str(value) not in spec.get("values", []):
             errors.append(f"key '{key}' must be one of {', '.join(spec.get('values', []))}, got '{value}'")
+    families = schema.get("families") if isinstance(schema.get("families"), dict) else {}
     for key in profile:
-        if key not in variables:
+        if key not in variables and not any(key.startswith(prefix) and key != prefix for prefix in families):
             warn(f"profile has unknown key '{key}'")
     if errors:
         raise HarnessError("invalid profile:\n  " + "\n  ".join(errors), 2)
@@ -400,7 +401,7 @@ def read_lock(path):
     return data
 
 
-def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files):
+def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files, hooks=None):
     def js(value):
         return json.dumps(value, ensure_ascii=False)
 
@@ -421,6 +422,8 @@ def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files):
     out.append(f'  "house_sha256": {js(house_sha)},')
     out += array("paths", sorted(paths, key=path_key))
     out += array("deny", list(deny))
+    if hooks is not None:
+        out += array("hooks", list(hooks))
     ordered = sorted(files, key=path_key)
     if ordered:
         out.append('  "files": {')
@@ -532,8 +535,12 @@ def select_vendored(tree):
             dest = ".claude/" + path
         elif parts[0] == "rules" and len(parts) == 3 and parts[1] == "core" and path.endswith(".md"):
             dest = ".claude/rules/core/" + parts[2]
-        elif path == "bin/verify.sh":
-            dest = ".claude/harness/bin/verify.sh"
+        elif parts[0] == "bin" and len(parts) == 2 and parts[1] != "harness":
+            dest = ".claude/harness/bin/" + parts[1]
+        elif parts[0] == "hooks" and len(parts) == 2:
+            dest = ".claude/harness/hooks/" + parts[1]
+        elif parts[0] == "references" and len(parts) == 2 and path.endswith(".md"):
+            dest = ".claude/harness/references/" + parts[1]
         if dest is None:
             continue
         if mode == "120000":
@@ -549,8 +556,8 @@ def lock_paths_for(vendored):
             paths.add("/".join(dest.split("/")[:3]))
         elif dest.startswith(".claude/rules/core/"):
             paths.add(".claude/rules/core")
-        elif dest.startswith(".claude/harness/bin/"):
-            paths.add(".claude/harness/bin")
+        elif dest.startswith(".claude/harness/"):
+            paths.add("/".join(dest.split("/")[:3]))
     return sorted(paths, key=path_key)
 
 
@@ -585,6 +592,67 @@ def apply_house(existing, tag, body):
 def extract_house(text):
     match = HOUSE_BLOCK_RE.search(text)
     return match.group("body") if match else None
+
+
+HOOKS_CORE = "settings/hooks-core.json"
+# The host runs a hook command in the session's current directory, which moves with every `cd`, so
+# a core hook is reached through the project directory the host exports to hooks (door 4).
+HOOK_COMMAND_PREFIX = '"$CLAUDE_PROJECT_DIR"/.claude/harness/hooks/'
+HOOK_COMMAND_RE = re.compile(re.escape(HOOK_COMMAND_PREFIX) + r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+def read_core_hooks(blob):
+    """The `PreToolUse` entries of settings/hooks-core.json. Every command must be exactly
+    `"$CLAUDE_PROJECT_DIR"/.claude/harness/hooks/<name>`: a vendored hook, reached from any directory."""
+    if blob is None:
+        return []
+    try:
+        doc = json.loads(blob)
+        entries = doc["PreToolUse"]
+        if not isinstance(entries, list):
+            raise ValueError("PreToolUse must be a list")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("matcher"), str):
+                raise ValueError("each entry needs a string matcher")
+            commands = entry.get("hooks")
+            if not isinstance(commands, list) or not commands:
+                raise ValueError("each entry needs a non-empty hooks list")
+            for hook in commands:
+                if not isinstance(hook, dict) or hook.get("type") != "command":
+                    raise ValueError("each hook must be of type command")
+                command = hook.get("command")
+                if not isinstance(command, str) or not HOOK_COMMAND_RE.fullmatch(command):
+                    raise ValueError(f"each command must be {HOOK_COMMAND_PREFIX}<name>, got {command!r}")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HarnessError(f"{HOOKS_CORE} is invalid: {exc}")
+    return entries
+
+
+def merge_settings(settings_text, core_deny, previous_deny, core_hooks=(), previous_hooks=()):
+    """Merge the core deny list into permissions.deny and the core hook entries into
+    hooks.PreToolUse. What the previous sync wrote and the core dropped is removed; every other
+    entry of the repository stays as it is."""
+    text = merge_deny(settings_text, core_deny, previous_deny)
+    data = json.loads(text)
+    core_hooks, previous_hooks = list(core_hooks), list(previous_hooks)
+    hooks = data.get("hooks")
+    if hooks is None and not core_hooks:
+        return text
+    if hooks is None:
+        hooks = {}
+        data["hooks"] = hooks
+    if not isinstance(hooks, dict):
+        raise HarnessError(".claude/settings.json: hooks must be an object")
+    pre = hooks.get("PreToolUse", [])
+    if not isinstance(pre, list):
+        raise HarnessError(".claude/settings.json: hooks.PreToolUse must be a list")
+    dropped = [entry for entry in previous_hooks if entry not in core_hooks]
+    merged = [entry for entry in pre if entry not in dropped]
+    for entry in core_hooks:
+        if entry not in merged:
+            merged.append(entry)
+    hooks["PreToolUse"] = merged
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
 def merge_deny(settings_text, core_deny, previous_deny):
@@ -702,6 +770,7 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
         if not tree.has(needed):
             raise HarnessError(f"{tag} has no {needed}")
     blobs = tree.read_many(wanted + ["settings/deny-core.json", "instructions/house.md"])
+    core_hooks = read_core_hooks(tree.read(HOOKS_CORE) if tree.has(HOOKS_CORE) else None)
 
     vendored = {}
     for dest, (src, executable) in selected.items():
@@ -723,6 +792,7 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
     previous = read_lock(lock_path) or {}
     previous_files = {p: s for p, s in (previous.get("files") or {}).items() if safe_lock_path(p)}
     previous_deny = previous.get("deny") or []
+    previous_hooks = previous.get("hooks") or []
 
     instructions_path = repo / instructions_rel
     settings_rel = ".claude/settings.json"
@@ -732,10 +802,12 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
     if instructions_path.is_symlink():
         raise HarnessError(f"{instructions_rel} is a symlink; refusing to write through it")
 
-    settings_text = merge_deny(
+    settings_text = merge_settings(
         settings_path.read_text(encoding="utf-8") if settings_path.is_file() else None,
         core_deny,
         previous_deny,
+        core_hooks,
+        previous_hooks,
     )
     instructions_text = apply_house(
         instructions_path.read_text(encoding="utf-8") if instructions_path.is_file() else None, tag, body
@@ -750,6 +822,7 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
         lock_paths_for(vendored),
         core_deny,
         file_shas,
+        core_hooks,
     )
 
     removals = sorted((p for p in previous_files if p not in vendored), key=path_key)
@@ -939,6 +1012,9 @@ def cmd_propose(args):
             present[relative] = root
         elif root.is_dir():
             for found in sorted(root.rglob("*")):
+                # a bytecode cache a vendored script wrote is not part of the core (as in skill_files)
+                if "__pycache__" in found.relative_to(root).parts or found.name.endswith(".pyc"):
+                    continue
                 if found.is_file() and not found.is_symlink():
                     present[found.relative_to(repo).as_posix()] = found
     changed = sorted(p for p, f in present.items() if p in locked and sha256_bytes(f.read_bytes()) != locked[p])
@@ -974,8 +1050,10 @@ def cmd_propose(args):
             return relative[len(".claude/") :]
         if relative.startswith(".claude/rules/core/"):
             return "rules/core/" + relative[len(".claude/rules/core/") :]
-        if relative == ".claude/harness/bin/verify.sh":
-            return "bin/verify.sh"
+        for vendored, source in ((".claude/harness/bin/", "bin/"), (".claude/harness/hooks/", "hooks/"),
+                                 (".claude/harness/references/", "references/")):
+            if relative.startswith(vendored) and "/" not in relative[len(vendored):]:
+                return source + relative[len(vendored):]
         raise HarnessError(f"{relative} has no place in the core")
 
     writes = []
@@ -1735,16 +1813,20 @@ def cmd_release(args):
                 raise HarnessError(f"--now must be YYYY-MM-DD, got '{args.now}'", 2)
         else:
             now = datetime.datetime.now(datetime.timezone.utc)
-        if now - tagged_at < datetime.timedelta(days=7):
-            info(f"last tag {last} is younger than 7 days")
-            return 0
         major, minor, patch = (int(x) for x in SEMVER_TAG_RE.match(last).groups())
-        subjects = git_out(core, "log", "--format=%s", f"{last}..{branch}").splitlines()
-        if any(re.match(r"^feat(\(.+\))?!?:", s) for s in subjects):
-            bump, version = "minor", f"v{major}.{minor + 1}.0"
+        if now - tagged_at < datetime.timedelta(days=7):
+            if not args.adjust:
+                info(f"last tag {last} is younger than 7 days")
+                return 0
+            # An adjustment inside the window is always a patch, whatever the commits say.
+            version, basis = f"v{major}.{minor}.{patch + 1}", f"adjustment patch from {last}, inside its 7-day window"
         else:
-            bump, version = "patch", f"v{major}.{minor}.{patch + 1}"
-        basis = f"{bump} bump from {last}"
+            subjects = git_out(core, "log", "--format=%s", f"{last}..{branch}").splitlines()
+            if any(re.match(r"^feat(\(.+\))?!?:", s) for s in subjects):
+                bump, version = "minor", f"v{major}.{minor + 1}.0"
+            else:
+                bump, version = "patch", f"v{major}.{minor}.{patch + 1}"
+            basis = f"{bump} bump from {last}"
     else:
         if int(git_out(core, "rev-list", "--count", branch)) == 0:
             raise HarnessError(f"branch '{branch}' has no commits")
@@ -1832,6 +1914,8 @@ def build_parser():
     p.add_argument("--core")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--now", help="YYYY-MM-DD (midnight UTC) used as the current date")
+    p.add_argument("--adjust", action="store_true",
+                   help="inside the 7-day window of the last tag, cut the next patch tag instead of nothing")
     p.add_argument("--consumers", help="file listing consumer repositories (default: ~/.config/cdv-harness/consumers.yaml)")
     p.add_argument("--branch", default="main")
     p.add_argument("--extra-patterns", action="append", metavar="FILE",

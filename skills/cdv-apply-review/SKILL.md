@@ -9,7 +9,7 @@ description: >
   against the code", "a code review has been made over this branch", "aplica os fixes do review",
   "triagem dos findings", "fix the nitpicks and commit", or the hand-off from cdv-pr-review /
   cdv-code-review. Do NOT use to produce a review (use cdv-code-review or cdv-pr-review), for fixes
-  that grow beyond finding-sized scope (use cdv-plan-feature), or to push/merge (finalize owns the
+  that grow beyond finding-sized scope (start them with cdv-kickoff), or to push/merge (finalize owns the
   wrap-up).
 metadata:
   version: 0.1.0
@@ -70,7 +70,7 @@ A finding the user declines gets its one-line reason recorded — the final repo
 
 For each accepted finding, in severity order:
 
-1. Apply the minimal fix for THAT finding only. If the fix reveals a larger problem (schema, contract, feature gap), stop and route to `cdv-plan-feature` — do not grow the fix silently.
+1. Apply the minimal fix for THAT finding only. If the fix reveals a larger problem (schema, contract, feature gap), stop and route to `cdv-kickoff` — do not grow the fix silently.
 2. Gates per fix, run where `profile.commands_run_on` says (through `profile.cmd_container_exec` when it is `container`): targeted backend tests (`profile.cmd_test_backend` with `profile.cmd_test_backend_filter`), targeted frontend tests (`profile.cmd_test_frontend`) when the fix touches the frontend, and the backend formatter limited to changed files (`profile.cmd_format_backend`). A fix that changes behavior ships its test adjustment in the same commit.
 3. Commit: `<type>(<scope>): <what the fix does>` — Conventional Commits in English with a scope, no `Co-Authored-By` trailer; the message describes the change, not "address review comment". The review directory is an ephemeral root file (`profile.ephemeral_patterns`): never stage it. Groups only when the user approved the grouping in Step 3.
 
@@ -87,5 +87,5 @@ Only with the remote in sync (or absent) does the close become a plain hand-off:
 ## Composition
 
 - `cdv-pr-review` / `cdv-code-review` — upstream producers of the findings; their review directory is this skill's native input.
-- `cdv-plan-feature` — escape hatch when a fix outgrows finding size.
+- `cdv-kickoff` — escape hatch when a fix outgrows finding size.
 - `cdv-finalize` — downstream wrap-up (PR description refresh + push offer).

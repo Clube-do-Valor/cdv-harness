@@ -4,7 +4,7 @@ The review scans the diff in six passes. Each pass produces zero or more draft f
 
 ## 1. Repo hard rules
 
-Sourced from the repository's instructions file (`profile.instructions_file`) and the path rules in [.claude/rules/](../../../rules/). Verified against them every run; do not memorize this list across sessions.
+Sourced from the repository's instructions file (`profile.instructions_file`) and the path rules under `.claude/rules/`. Verified against them every run; do not memorize this list across sessions.
 
 - **Thin controllers.** Controllers handle input, authorization, delegate to a service, and shape the Inertia response. Query builders, multi-step aggregations, and orchestration belong in the services layer. Inlined query/aggregation across multiple lines → `🛠️ Refactor suggestion | 🟠 Medium`.
 - **Services concentrate business logic.** Logic that ends up in jobs, models, or controllers when it belongs in a service → flag.
@@ -38,7 +38,7 @@ The product handles personal data of end users; the privacy law of the repositor
 
 **Production-affecting paths are faked in the suite + manual QA only. Smoke tests never touch production.**
 
-- A new test that calls a real external endpoint (any system in `profile.production_writing_integrations`, or any other real third-party service) → `⚠️ Potential issue | 🔴 High`. The replacement is a `profile.backend_test_framework` test with fakes + manual QA covered by a `cdv-plan-feature` QA artifact.
+- A new test that calls a real external endpoint (any system in `profile.production_writing_integrations`, or any other real third-party service) → `⚠️ Potential issue | 🔴 High`. The replacement is a `profile.backend_test_framework` test with fakes + the developer's QA step for the live run (`[PRODUCTION-AFFECTING]`, see [production-safety.md](../../../harness/references/production-safety.md)).
 - Production credentials referenced in a test setup → high.
 - A migration that backfills against live data without a guard, a dry-run, or a `--force` confirmation → high.
 - A new command that mutates production-shaped data without a `--dry-run` option → medium.
@@ -53,7 +53,7 @@ The product handles personal data of end users; the privacy law of the repositor
 
 ## 6. Naming language
 
-Canonical rule: [naming-language.md](../../cdv-plan-feature/references/naming-language.md), stated in the instructions file under "Language" (code in `profile.language_code`, user-facing copy in `profile.language_ui`). Scan only names the diff **introduces** — pre-existing identifiers in the other language in untouched lines are not findings.
+Canonical rule: [naming-language.md](../../../harness/references/naming-language.md), stated in the instructions file under "Language" (code in `profile.language_code`, user-facing copy in `profile.language_ui`). Scan only names the diff **introduces** — pre-existing identifiers in the other language in untouched lines are not findings.
 
 - **Mixed-language identifier.** One name carrying both languages → `🛠️ Refactor suggestion | 🔴 High`. It is unguessable for `grep` and for the next reader.
 - **New symbol in the UI language.** A new class, enum case name, method, variable, property, column, index, component, prop or type named in `profile.language_ui` instead of `profile.language_code` → high when it duplicates a concept already named in `profile.language_code` elsewhere, medium otherwise.

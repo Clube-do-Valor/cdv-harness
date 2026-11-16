@@ -1,6 +1,6 @@
 # Module opt-in — does this feature get born as a module?
 
-Loaded by the **Module gate** in Step 1. The decision that adopted modules, how to build and keep a module once it exists, and the repository's own examples are in the extension (`<profile.extension_dir>/cdv-plan-feature.md`, heading "Module opt-in"); a repository whose extension names no module convention skips the gate.
+Shared reference, vendored to `.claude/harness/references/`. Read it when a greenfield feature is planned (`tlc-spec-lean` Plan phase, started by `cdv-kickoff`). The decision that adopted modules, how to build and keep a module once it exists, and the repository's own examples are in the repository's note for this reference (`<profile.extension_dir>/references/module-opt-in.md`); a repository with no such note has no module convention and skips the question.
 
 **Scope test.** This applies when a **greenfield** feature is being planned and the opt-in question ("does it get born as a module?") is on the table. It does **not** apply to retrofitting existing code into modules (that requires a dedicated project, never a side effect of a feature), to features that clearly live inside an existing domain's services, or to frontend work (the frontend's own modularity stays where it is).
 

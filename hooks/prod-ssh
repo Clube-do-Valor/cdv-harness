@@ -1,0 +1,63 @@
+#!/usr/bin/env python3
+"""PreToolUse hook: production is reached only through the read script.
+
+Blocks (exit 2) a shell command that runs `ssh` to a host listed in the profile's `prod_hosts`,
+unless the command is a call of `.claude/harness/bin/prod-read`. With no `prod_hosts`, it allows
+everything.
+"""
+
+import sys
+
+sys.dont_write_bytecode = True
+from pathlib import Path  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness_hook as h  # noqa: E402
+
+PROD_READ = ".claude/harness/bin/prod-read"
+
+
+def host_of(word):
+    """The host a word names: `user@host`, `host:path` and `ssh://user@host:port` give `host`."""
+    word = word.strip().lower()
+    if word.startswith("ssh://"):
+        word = word[len("ssh://"):].split("/", 1)[0]
+    word = word.rsplit("@", 1)[-1]
+    if word.startswith("[") and "]" in word:
+        return word[1 : word.index("]")]
+    return word.split(":", 1)[0]
+
+
+def is_prod_read(words):
+    return bool(words) and (words[0] == PROD_READ or words[0].endswith("/" + PROD_READ))
+
+
+def main(tool, tool_input, profile):
+    if tool != "Bash":
+        return h.ALLOW, ""
+    hosts = profile.get("prod_hosts")
+    if not isinstance(hosts, list):
+        hosts = [hosts] if h.setting(profile, "prod_hosts") else []
+    hosts = {str(x).strip().lower() for x in hosts if str(x).strip()}
+    command = tool_input.get("command")
+    if not hosts or not isinstance(command, str):
+        return h.ALLOW, ""
+    for segment in h.segments(command):
+        words = h.command_words(segment)
+        if is_prod_read(words):
+            continue
+        for index, word in enumerate(words):
+            if word.rsplit("/", 1)[-1] != "ssh":
+                continue
+            reached = sorted({host_of(w) for w in words[index + 1 :]} & hosts)
+            if reached:
+                return h.BLOCK, (
+                    f"prod-ssh: `ssh` to the production host {reached[0]} is refused. Production is read "
+                    f"only through {PROD_READ} (a read-only session, rows capped, every call logged); "
+                    "see the cdv-prod skill. A production write is asked for, never run over a free-form ssh."
+                )
+    return h.ALLOW, ""
+
+
+if __name__ == "__main__":
+    h.entry(main)

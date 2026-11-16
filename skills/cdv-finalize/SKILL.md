@@ -1,7 +1,7 @@
 ---
 name: cdv-finalize
 description: >
-  Finalize a feature branch — ephemeral `<slug>-pr.md` at repo root (lean PR format, never committed), atomic conventional commits with inferred scope, branch guard, state report, then the push and the pull request opened (or updated) through `cdv-open-pr` at wrap-up (never merges). Triggers on "finaliza essa feature", "wrap up this branch", "gera o PR description e os commits", "comita isso e prepara o PR". Do NOT use for planning unimplemented work (cdv-plan-feature), PRD/PROGRESS artifacts, or merging.
+  Finalize a feature branch — ephemeral `<slug>-pr.md` at repo root (lean PR format, never committed), atomic conventional commits with inferred scope, branch guard, state report, then the push and the pull request opened (or updated) through `cdv-open-pr` at wrap-up (never merges). Triggers on "finaliza essa feature", "wrap up this branch", "gera o PR description e os commits", "comita isso e prepara o PR". Do NOT use for planning unimplemented work (cdv-kickoff), PRD/PROGRESS artifacts, or merging.
 metadata:
   version: 0.1.0
   owner: augusto-henriques
@@ -52,7 +52,7 @@ Then apply two guards on that output, **before** any plan is drafted:
 
 1. **Behind-default-branch guard.** If the `HEAD..origin/<profile.default_branch>` count > 0, surface it and propose the rebase (or merge, per user preference) *before* building the commit plan — resolving drift after commits is more expensive. Predictable conflict hotspot: area cards (`profile.area_cards_glob`, when it is not `none`) edited by parallel branches; resolve those by uniting sections, never by picking a side wholesale.
 2. **Stale-ephemerals sweep.** List ephemeral artifacts at the repo root that do not belong to the current slug (`profile.ephemeral_patterns`, e.g. `*-pr.md`, `QA-*.md`, `STATE-*.md`, `HANDOFF-*.md`, `handoff-*.md`, `decisions-*.md`, `delivery-*.md`, the review directories under `profile.pr_review_dir_prefix`, plus retired `FINALIZE-*.md` leftovers). Offer their cleanup in the Step 9 wrap-up — they are leftovers from finished branches and make "is everything committed?" ambiguous.
-3. **Verifier gate (plan-feature branches).** When `STATE-<slug>.md` exists and has no `## Verificação` section with the AC table, the branch was executed by `cdv-plan-feature` and never verified: dispatch the verifier now, per `cdv-plan-feature/references/verifier.md` (`model="opus"`, announced in one line), and only continue to Step 3 on a clean verdict. Never build commits for an unverified plan-feature branch. Branches with no STATE (debug direct fix, modo expresso, work planned elsewhere) are not gated here.
+3. **Verifier gate (`tlc-spec-lean` branches).** When the branch has `.specs/features/<f>/verification.md`, run `validate_verification.py <f>`; the gate passes when it exits `0` (the script is `.claude/skills/tlc-spec-lean/scripts/validate_verification.py`), or when the run status marks the Verifier stage `capped` with its open items, each tagged `defect` or `proof-gap`, in the pull request description (`<slug>-pr.md`). Otherwise refuse to commit: say which of the two is missing and stop — never build commits for an unverified plan. A branch with a `.specs/features/<f>/plan.md` and no `verification.md` was never verified: dispatch the Verifier now, per `tlc-spec-lean` (`references/verify.md`), on the model the profile's `role_verifier` line names, announced in one line, then gate as above. Branches with no feature folder (debug direct fix, modo expresso, work planned elsewhere) are not gated here.
 
 **This step is re-runnable and MUST be re-run immediately before any `git commit`** (see Step 8) — a resumed session, a compacted conversation, or user edits between plan and execution all invalidate the original snapshot.
 
@@ -84,7 +84,7 @@ Rules:
 - No emojis in body content (only in the section headers, which come from the template).
 - **No file inventory.** No architecture tree, no per-file bullets, no "Sem dependências novas"/"Nenhuma" filler sections. A new env var or dependency appears in "Como testar" (setup) or "Riscos e impactos" (operation) — where it has consequence.
 - Commands in "Como testar" must be runnable from `{app_dir}` (or wherever the actual command lives) — no placeholders.
-- **At least one external link is mandatory in the body** — inline in "O que muda e por quê" or "Riscos e impactos", never in the TL;DR. Mine the current conversation for public URLs that anchor the problem to its evidence: error-monitor issues, CRM records, workflow-tool executions, tickets, PRs and commits (the extension may list the hosts this repository uses). If the user shared screenshots, harvest the URL bar from those images. When the relevant public link is mentioned only in text, link it instead of citing the bare id ("[<KEY>](ticket-url)" not "<KEY>").
+- **At least one external link is mandatory in the body** — inline in "O que muda e por quê" or "Riscos e impactos", never in the TL;DR. Mine the current conversation for public URLs that anchor the problem to its evidence: error-monitor issues, CRM records, workflow-tool executions, tickets, PRs and commits (the extension may list the hosts this repository uses). If the user shared screenshots, harvest the URL bar from those images. When the relevant public link is mentioned only in text, link it instead of citing the bare id ("[<KEY>](<ticket-url>)" not "<KEY>").
 - **Do not link to private/internal team workspaces.** The evidence cited in the PR description must come from a public source the reviewer can open. When a piece of context exists only in an internal thread with no public counterpart, paraphrase it inline without a link.
 - When no public external link is available at all, at minimum link the originating ticket if one exists. If even that is missing, surface the gap explicitly in the plan preview (Step 6) so the user can supply one before commit.
 
@@ -140,7 +140,7 @@ Skip this part when `profile.area_cards_glob` is `none`. When the diff touches a
 
 On `sim` to either question, halt the commit plan until the diff includes the edit; a `não` is recorded in the wrap-up (Step 9).
 
-When `cdv-plan-feature` produced the Finalize seed with a "Documentation skipped — rationale" block, this gate must still re-prompt — the planning-time skip might no longer apply after the actual implementation landed.
+When the plan carried a "Documentation skipped — rationale" note, this gate must still re-prompt — the planning-time skip might no longer apply after the actual implementation landed.
 
 ### Step 5 — Build the atomic commit plan
 
@@ -240,6 +240,7 @@ After the last commit, regenerate the `<slug>-pr.md` body against `git log --one
 
 1. `git push -u origin <branch>` — feature branches only (a prefix from `profile.branch_prefixes`); on `profile.default_branch`/protected, refuse and point to Step 7. A rejected push (remote has commits the local branch lacks) stops here with the `⚠` bullet below; never `--force`.
 2. Invoke `cdv-open-pr` with `<slug>-pr.md` (it opens the PR through `profile.pr_cli`). With no open PR for the branch it creates one (ticket, title, reviewers) and deletes the file; with an open PR it offers to update the description only when this run added commits — a re-run after QA fixes lands there.
+3. Watch the pipeline of the pushed commit: `python3 .claude/skills/cdv-finalize/scripts/watch_pipeline.py --branch <branch> --timeout 1800` (exit `0` green; `1` red, its last line naming the failed step; `2` `profile.pr_cli` has no pipelines command, so say so and leave the pipeline to the host's page; `3` no end before the timeout). When the pipeline is red, fix the failure it names in the same pull request (a new commit on the same branch, pushed, never a new pull request and never a skipped check) and watch it again, at most twice; then report the status it ended on in the final state report. Inside a `cdv-kickoff` run the fix commit needs no confirmation (the run profile's chain is the authorization); outside one, show it first like any commit plan.
 
 Then print the **final state report**: ONE status line with fixed clauses in fixed order, then one `⚠` bullet per pending action or anomaly. Every clause is still a mandatory check — a clause may only be written after its command ran; any check that is not "ok" leaves the status line and becomes an expanded `⚠` bullet. Never omit a clause silently.
 
@@ -252,6 +253,7 @@ The remote clause comes from `git rev-list --count origin/<branch>..HEAD` after 
 - Guide or card skip recorded in Step 4.5.
 - Stale ephemerals found in Step 2, with the cleanup offer.
 - Push rejected or `origin/<branch>` still behind the local branch — name the count and the consequence: an open PR shows the **old** tree, so approving it merges the pre-commit code and orphans the local commits.
+- Pipeline not green: still red after the two fixes (the failed step and the run), not read (`watch_pipeline.py` exit `2`) or still running at the timeout (exit `3`).
 - Front-end change without a visual QA yet (reported by `cdv-open-pr`).
 - PR opened through the token fallback of `cdv-open-pr` (Claude in Chrome, Bitbucket only) because there was no credential — with the one-line recommendation to run `<profile.pr_cli> auth login` before the next PR.
 
@@ -259,7 +261,7 @@ The remote clause comes from `git rev-list --count origin/<branch>..HEAD` after 
 
 When the QA already ran, ask (AskUserQuestion): *"QA feito — posso apagar o `QA-<slug>.md` e o `STATE-<slug>.md`?"* with options **apagar** / **manter por enquanto**. On "manter", remind that they must never be committed.
 
-Beyond the push, the PR through `cdv-open-pr` and the optional `rm`, no further git writes; never merge.
+Beyond the push, the PR through `cdv-open-pr`, the pipeline fixes of Step 9 item 3 and the optional `rm`, no further git writes; never merge.
 
 ## Examples
 
@@ -314,7 +316,7 @@ Both are Step 9. Run them on the feature branch (`git push -u origin <branch>`, 
 Not a blocker: the push happens, and `cdv-open-pr` Step 0 asks whether to log in now (`<profile.pr_cli> auth login`, about 2 minutes) or, on Bitbucket, to open this PR through Claude in Chrome.
 
 ### "O que muda e por quê" is describing the parent ticket's root cause instead of this PR's diff
-Cause: the Finalize seed (from `cdv-plan-feature` upstream) inherited context from `cdv-debug`, which documented a *parent ticket* with a different root cause but a shared symptom. The seed pulled the parent's causa raiz forward.
+Cause: the plan (upstream of this skill) inherited context from `cdv-debug`, which documented a *parent ticket* with a different root cause but a shared symptom. The seed pulled the parent's causa raiz forward.
 Solution: refocus on what THIS branch's diff actually changes. Move the parent ticket to "Riscos e impactos" with an explicit relationship label (e.g., `ticket pai — causa raiz distinta, mesmo sintoma`). Delete every sentence that describes the parent's root cause; keep only sentences that describe the edge case this diff resolves. Re-run the 3-question scope-discipline self-check from Step 4 before re-submitting.
 
 ### The draft PR description exceeds 100 lines
@@ -332,4 +334,5 @@ Solution: prefer the spelling that appears most recently in `profile.default_bra
 ## Bundled scripts
 
 - [scripts/branch-from-master.sh](scripts/branch-from-master.sh) — fetch `origin/<profile.default_branch>` and check out a new branch from it. Aborts if the branch already exists. Used in Step 7 when the current branch is not a feature branch.
+- [scripts/watch_pipeline.py](scripts/watch_pipeline.py) — waits for the pipeline of the branch's commit through `profile.pr_cli` and exits `0` green, `1` red with the failed step, `2` when the client has no pipelines command, `3` at the timeout. Used in Step 9.
 - [scripts/lint-pr-description.sh](scripts/lint-pr-description.sh) — mechanical anti-bloat gate for `<slug>-pr.md`. Exit 0 required before presenting (Step 4) and after the Step 8.5 refresh.

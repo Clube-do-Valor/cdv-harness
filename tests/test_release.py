@@ -147,6 +147,27 @@ class ReleaseTest(HarnessTestCase):
         self.assertIn("missing-repo", result.stderr)
         self.assertEqual(len(self.cli_calls("gh")), 1)
 
+    def test_adjust_cuts_a_patch_inside_the_seven_day_window(self):
+        self.commit("fix: one bug")
+        self.commit("feat(skills): a new thing", name="other.txt")
+        dry = self.release("--adjust", "--dry-run", now="2026-01-04")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertIn("next version: v0.1.1", dry.stdout)
+        self.assertEqual(self.tags(), {"v0.1.0"})
+        result = self.release("--adjust", now="2026-01-04")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.tags(), {"v0.1.0", "v0.1.1"})
+        self.assertEqual(self.remote_tags(), {"v0.1.0", "v0.1.1"})
+        self.assertEqual(
+            self.git(self.core, "rev-parse", "v0.1.1^{commit}").stdout, self.git(self.core, "rev-parse", "main").stdout
+        )
+
+    def test_adjust_without_a_change_creates_no_tag(self):
+        result = self.release("--adjust", now="2026-01-04")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("no change on main since v0.1.0", result.stdout)
+        self.assertEqual(self.tags(), {"v0.1.0"})
+
     def test_first_release_when_there_is_no_tag(self):
         core = self.tmp / "fresh"
         core.mkdir()

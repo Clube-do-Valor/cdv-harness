@@ -4,7 +4,7 @@ This block is written by `harness sync` from the cdv-harness core. Change it in 
 
 ### The vendored core
 
-- `.claude/skills/cdv-*`, `.claude/rules/core/` and `.claude/harness/bin/` are copies of the core, pinned by `.claude/harness.lock`. The CI gate (`sh .claude/harness/bin/verify.sh`) fails a pull request that edits them. A change to them goes to the core first: `harness propose`, then a new tag and `harness sync`. An emergency commit that must touch them carries a `Harness-skip: <reason>` trailer.
+- `.claude/skills/` (the house skills and the vendored third-party ones), `.claude/rules/core/`, `.claude/harness/bin/`, `.claude/harness/hooks/` and `.claude/harness/references/` are copies of the core, pinned by `.claude/harness.lock`, and the core hooks are wired in `.claude/settings.json` under `hooks.PreToolUse`. The CI gate (`sh .claude/harness/bin/verify.sh`) fails a pull request that edits them. A change to them goes to the core first: `harness propose`, then a new tag and `harness sync`. An emergency commit that must touch them carries a `Harness-skip: <reason>` trailer.
 - A fact of this repository that a core skill needs goes to the profile or to that skill's extension (`<extension_dir>/cdv-<skill>.md`), never into the vendored copy.
 
 ### Load context before editing
@@ -16,13 +16,14 @@ The code is the source of truth. What it cannot hold — external contracts, agr
 - **Waiting:** never `sleep N` in Bash. One `Monitor` per long-running process; when it expires, re-arm it and say so.
 - **Automatic notifications** (a fork source, a notification for a waiter that was killed, a teammate idle notice) carry no user text. Answer with one line at most, or not at all. Never re-explain the session state or ask the pending question again — the user did not speak.
 - **Chrome MCP:** text before pixels. `get_page_text`/`read_page` first; screenshot only when layout matters; never navigate to or capture a `chrome-extension://` URL (the extension cannot see it). Heavy single-page apps freeze the renderer under repeated screenshots — one screenshot, then text tools.
+- **Production** is read only through `.claude/harness/bin/prod-read` (the `cdv-prod` skill): a free-form `ssh` to a host of the profile's `prod_hosts` is blocked by the `prod-ssh` hook.
 - **Investigating is not implementing.** In planning or debugging steps, probes are read-only one-line REPL queries (the profile's `cmd_tinker`), grep and file reads. No file is written — not in the app, not in a container's `/tmp` — before the user approves a plan. A probe that needs more than one line is asked for first.
 
 ### Working standards
 
-**Before starting a new feature:** ask the programmer whether to search the docs (the profile's `docs_dirs`), `.claude/rules/` and `.claude/skills/` for existing documentation, a rule or a skill covering the requested feature. Only skip this prompt if the request is clearly a bug fix or a small localized change.
+**Search first, always.** Before a feature, search the docs (the profile's `docs_dirs`), `.claude/rules/`, `.claude/skills/` and `.claude/harness/references/` for documentation, a rule or a skill that covers it — without asking first.
 
-**After finishing a task:** ask the programmer whether documentation should be created or updated — a rule under `.claude/rules/`, a skill extension under the profile's `extension_dir`, a repository skill, or a doc — to reflect what was built. Only skip this prompt for trivial fixes with no behavioral impact.
+**Start a feature with `cdv-kickoff`.** It reads the request, proposes the run profile (track, mode, chain, roles) and runs the chain; small work gets one line and no question. **Plan with `tlc-spec-lean`** (`.specs/features/<slug>/`), vendored in `.claude/skills/`.
 
 **Tests:**
 - Every change that introduces new behavior, wiring, validation rules, service logic, or API surface MUST ship with tests in the same PR.
@@ -32,11 +33,11 @@ The code is the source of truth. What it cannot hold — external contracts, agr
 
 **Commits:** use [Conventional Commits](https://www.conventionalcommits.org/) in English, with a scope (`feat(scope): ...`, `fix(scope): ...`, `refactor:`, `docs:`, `chore:`, `ci:`, `test:`). Describe intent, not the file changed. Never add a `Co-Authored-By` trailer. Push only feature branches (the profile's `branch_prefixes`), never with `--force`.
 
-**Language:** the profile's `language_code` is the default for everything an engineer types — classes, enum case names, methods, variables, columns, component filenames, tests, config keys, commits and docs. One concept has one name, in one language: mixed-language identifiers are prohibited, and there is no "established business term" exception. The profile's `language_ui` is allowed only in user-facing copy, in URL paths already published, in external contract field names quoted as string literals, and in already-persisted data values. Full rule with examples: `.claude/skills/cdv-plan-feature/references/naming-language.md`.
+**Language:** the profile's `language_code` is the default for everything an engineer types — classes, enum case names, methods, variables, columns, component filenames, tests, config keys, commits and docs. One concept has one name, in one language: mixed-language identifiers are prohibited, and there is no "established business term" exception. The profile's `language_ui` is allowed only in user-facing copy, in URL paths already published, in external contract field names quoted as string literals, and in already-persisted data values. Full rule with examples: [naming-language.md](.claude/harness/references/naming-language.md).
 
-**Ephemeral files:** the root files the skills write and never commit (the profile's `ephemeral_patterns`: `*-pr.md`, `QA-*`, `STATE-*`, `HANDOFF-*`, `handoff-*`, `decisions-*`, `delivery-*`, review directories) are ignored by git and deleted at the wrap-up.
+**Ephemeral files:** the root files the skills write and never commit (the profile's `ephemeral_patterns`: `*-pr.md`, `QA-*`, `HANDOFF-*`, `handoff-*`, `decisions-*`, `delivery-*`, review directories) and the run folder (`.specs/features/<slug>/`, or `RUN-<slug>/` with no plan) are ignored by git and deleted after the merge.
 
-**Subagents:** every `Agent`/`Task` call names `model` explicitly — `sonnet` for Explore, executors and mining or analysis agents; `opus` for the verifier and for judgement calls; never Fable in a subagent.
+**Subagents:** every child (native or delegated) names its model from the role table of the profile (the `role_<role>` lines: account, model alias, effort) — never inherited; the `require-model` hook refuses a child with no model. Use Fable only when the user names it.
 
 **Personal data:** e-mail addresses appear in clear as a work identifier in debugging, QA and reports; other personal data stays masked.
 

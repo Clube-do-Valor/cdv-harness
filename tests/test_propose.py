@@ -94,6 +94,16 @@ class ProposeTest(HarnessTestCase):
         result = self.propose("--no-pr")
         self.assertIn("nothing to propose", result.stdout)
 
+    def test_a_bytecode_cache_in_a_vendored_skill_is_not_proposed(self):
+        cache = self.consumer / ".claude/skills/cdv-debug/scripts/__pycache__"
+        cache.mkdir(parents=True)
+        (cache / "lean_config.cpython-313.pyc").write_bytes(b"\x00pyc")
+        (self.consumer / ".claude/skills/cdv-debug/scripts/stray.pyc").write_bytes(b"\x00pyc")
+        proc = self.propose("--no-pr")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn("nothing to propose", proc.stdout + proc.stderr)
+        self.assert_nothing_proposed()
+
     def test_created_and_deleted_files_are_proposed(self):
         (self.consumer / ".claude/skills/cdv-debug/references/added.md").write_text("added\n")
         (self.consumer / ".claude/rules/core/legacy.md").unlink()
@@ -217,6 +227,38 @@ class ProposeTest(HarnessTestCase):
         self.git(self.core, "branch", "-q", "-D", first)
         self.propose("--no-pr")
         self.assertNotEqual(self.branch(), first)
+
+    def test_vendored_hooks_references_and_bin_go_back_to_their_core_paths(self):
+        self.commit_core(
+            self.core,
+            {
+                "hooks/require-model": ("#!/bin/sh\nexit 0\n", True),
+                "references/naming-language.md": "One language.\n",
+                "bin/prod-read": ("#!/bin/sh\necho read\n", True),
+            },
+            message="feat: vendored directories",
+            tag="v0.2.0",
+        )
+        self.git(self.core, "push", "-q", "origin", "main", "--tags")
+        self.sync(self.consumer, self.core, "v0.2.0")
+        self.commit_all(self.consumer)
+        edits = {
+            ".claude/harness/hooks/require-model": "#!/bin/sh\nexit 0\n# local\n",
+            ".claude/harness/references/naming-language.md": "One language, always.\n",
+            ".claude/harness/bin/prod-read": "#!/bin/sh\necho read\n# local\n",
+        }
+        for relative, text in edits.items():
+            (self.consumer / relative).write_text(text)
+        result = self.propose("--no-pr")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        branch = self.branch()
+        self.assertEqual(self.core_show(branch, "hooks/require-model"), edits[".claude/harness/hooks/require-model"])
+        self.assertEqual(
+            self.core_show(branch, "references/naming-language.md"), edits[".claude/harness/references/naming-language.md"]
+        )
+        self.assertEqual(self.core_show(branch, "bin/prod-read"), edits[".claude/harness/bin/prod-read"])
+        mode = self.git(self.core, "ls-tree", branch, "hooks/require-model").stdout.split()[0]
+        self.assertEqual(mode, "100755")
 
 if __name__ == "__main__":
     unittest.main()

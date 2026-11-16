@@ -8,7 +8,7 @@ description: >
   do workflow", or a pasted stack trace. When the user signals fix intent ("vamos
   consertar", "plano de fix"), sizes the fix and asks: a small fix (≤ ~3 files,
   no migration, no new screen) can be done here as "fix direto" (fix + test +
-  express finalize); anything larger hands off to `cdv-plan-feature`. Never
+  express finalize); anything larger than small hands off to `cdv-kickoff`. Never
   produces a multi-phase plan. Do NOT use for feature implementation,
   refactors, frontend-only bugs, or generic Laravel questions.
 metadata:
@@ -32,8 +32,8 @@ Below, `profile.<key>` is a value from the profile. A key that is missing or `no
 - **Evidence over hypothesis.** Every claim in the final report must be backed by a file read, a REPL query, an external API call, or a git log entry. Zero invention.
 - **Ground in the area card.** The area card (`profile.area_cards_glob`) loads with the area's files; it carries the external contracts and invariants (each with its test) the code should keep. A doc is intent, not fact: when card and code diverge, the code wins, and the divergence itself becomes evidence in the report — plus a card-fix candidate.
 - **Competing hypotheses, held open.** Before the first SELECT (Step 3), write 2–4 candidate causes, each with the query or code path that would confirm or discard it. Update the block after each evidence step: strike the discarded, refine the survivors, add new ones. Do not collapse to a single hypothesis until the data forces it — the final report marks each as confirmada / descartada / inconclusiva, with the evidence.
-- **Two lanes when fix intent appears.** This skill stops at the root-cause report. The moment the user signals intent to fix (see Step 9 triggers), size the fix: a **pequeno** fix (≤ ~3 files, no migration, no new screen) is offered as *fix direto* here — fix + regression test + `cdv-finalize` in modo expresso; anything larger, or the user's choice, **invokes `cdv-plan-feature`** with the report as Shared Understanding context. Never produce a multi-phase fix plan here; producing one is a hard error.
-- **No frontend authoring or review here.** This skill investigates backend bugs; frontend-only bugs are explicitly out of scope. Frontend conventions are owned by `cdv-frontend` — a UI fix is routed through `cdv-plan-feature` (which loads it). Do not restate UI rules in this skill.
+- **Two lanes when fix intent appears.** This skill stops at the root-cause report. The moment the user signals intent to fix (see Step 9 triggers), size the fix: a fix on the **small** track (≤ ~3 files, no migration, no new screen) is offered as *fix direto* here — fix + regression test + `cdv-finalize` in modo expresso; a fix larger than small, or the user's choice, hands off to `cdv-kickoff` with the report as Shared Understanding context. Never produce a multi-phase fix plan here; producing one is a hard error.
+- **No frontend authoring or review here.** This skill investigates backend bugs; frontend-only bugs are explicitly out of scope. Frontend conventions are owned by `cdv-frontend` — a UI fix is routed through `cdv-kickoff` (its builder loads it). Do not restate UI rules in this skill.
 
 ## Workflow
 
@@ -131,14 +131,14 @@ Only triggered when `profile.ticket_system` is `notion` and the user wants the a
 
 Follow [references/notion-ticket-template.md](references/notion-ticket-template.md) for the exact "Análise técnica" structure and render the block as paste-ready text in the chat (or as ephemeral `analise-<slug>.md` at the repo root when the user prefers a file). When the Notion MCP is connected and the user confirms the draft, the block is appended below the card's original description through the MCP; otherwise the user pastes it into the card. Do not restate the card's title, status or properties in the block.
 
-### Step 9 — Two lanes when fix intent appears: fix direto or `cdv-plan-feature`
+### Step 9 — Two lanes when fix intent appears: fix direto or `cdv-kickoff`
 
 This skill is **debug-only**. The moment the user signals they want to move from "understand the bug" to "plan/implement the fix", stop investigating and pick the lane — with one question, never by assumption.
 
-**Size the fix first**, from the evidence you already have (same criterion as `cdv-plan-feature` Step 0): **pequeno** = up to ~3 files, no migration, no new screen; **grande** = anything else.
+**Size the fix first**, from the evidence you already have (the track rule of `cdv-kickoff`): **small** = up to ~3 files, no migration, no new screen; anything else is larger than small (the medium or big track).
 
-- **Pequeno → offer the direct lane.** One `AskUserQuestion`: *"O fix cabe em ~N arquivos, sem migration e sem tela nova. Corrijo aqui direto (fix + teste + finalize expresso) ou monto o plano?"* — recommended: direto. On "direto": ensure a feature branch on the main checkout (`.claude/skills/cdv-finalize/scripts/branch-from-master.sh fix/<slug>` from `profile.default_branch`; from another feature branch, ask), apply the minimal fix with its regression test in the same change, run the targeted suite (`profile.cmd_test_backend` with `profile.cmd_test_backend_filter`) + `profile.cmd_format_backend`, then invoke `cdv-finalize` and tell it **modo expresso**. No phases, no `STATE-*.md`, no QA artifacts — the PR's `## 🧪 Como testar` is the QA record. The verifier of plan-feature does not run in this lane; the regression test is the proof. If the fix grows past the criterion while you write it, stop and route to `cdv-plan-feature` with what you learned.
-- **Grande, or the user chose "plano" →** **invoke the `cdv-plan-feature` skill via the `Skill` tool**, passing the root-cause report + suggested next steps as the Shared Understanding block.
+- **Small → offer the direct lane.** One `AskUserQuestion`: *"O fix cabe em ~N arquivos, sem migration e sem tela nova. Corrijo aqui direto (fix + teste + finalize expresso) ou monto o plano?"* — recommended: direto. On "direto": ensure a feature branch on the main checkout (`.claude/skills/cdv-finalize/scripts/branch-from-master.sh fix/<slug>` from `profile.default_branch`; from another feature branch, ask), apply the minimal fix with its regression test in the same change, run the targeted suite (`profile.cmd_test_backend` with `profile.cmd_test_backend_filter`) + `profile.cmd_format_backend`, then invoke `cdv-finalize` and tell it **modo expresso**. No plan, no run profile, no QA artifacts — the PR's `## 🧪 Como testar` is the QA record. The `tlc-spec-lean` Verifier does not run in this lane; the regression test is the proof. If the fix grows past the criterion while you write it, stop and hand off to `cdv-kickoff` with what you learned.
+- **Larger than small, or the user chose "plano" →** hand off to `cdv-kickoff`: **invoke `cdv-kickoff` via the `Skill` tool**, passing the root-cause report + suggested next steps as the Shared Understanding block. The kickoff proposes the track and the run profile and plans with `tlc-spec-lean`.
 
 
 **Trigger phrases (non-exhaustive)** — treat any of these as a mandatory handoff signal:
@@ -149,7 +149,7 @@ This skill is **debug-only**. The moment the user signals they want to move from
 - "abra um plano", "monta o plano", "preciso de um plano de fix"
 - "open a PR for this", "let's PR this", "create the branch"
 
-**What to pass to `cdv-plan-feature`:**
+**What to pass to `cdv-kickoff`:**
 
 ```
 SHARED UNDERSTANDING (from cdv-debug)
@@ -197,7 +197,7 @@ Solution: surface the recommendation in the report but require explicit confirma
 
 ### User pivots from "understand the bug" to "implement the fix"
 Cause: debug session concluded; user wants to plan/build the correction.
-Solution: **invoke `cdv-plan-feature` via the `Skill` tool** with the Shared Understanding block from Step 9. Do not draft phases, file lists, or branch names from this skill. If you already started drafting a plan in chat, acknowledge the slip and hand off formally — the plan must live in `cdv-plan-feature`, not here.
+Solution: **invoke `cdv-kickoff` via the `Skill` tool** with the Shared Understanding block from Step 9. Do not draft phases, file lists, or branch names from this skill. If you already started drafting a plan in chat, acknowledge the slip and hand off formally — the plan must live in `tlc-spec-lean` (started by `cdv-kickoff`), not here.
 
 ## Tools assumed available
 

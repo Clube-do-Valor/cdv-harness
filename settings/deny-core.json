@@ -7,8 +7,11 @@
     "Bash(php -r *)",
     "Bash(php -f *)",
     "Edit(/.claude/skills/cdv-*/**)",
+    "Edit(/.claude/skills/tlc-spec-lean/**)",
     "Edit(/.claude/rules/core/**)",
     "Edit(/.claude/harness/bin/**)",
+    "Edit(/.claude/harness/hooks/**)",
+    "Edit(/.claude/harness/references/**)",
     "Edit(/.claude/harness.lock)"
   ]
 }

@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+"""PreToolUse hook: the full backend test suite and the static analysis never run together.
+
+Blocks (exit 2) a shell command that starts the profile's `cmd_test_backend` with no path and no
+filter while `cmd_static_analysis` is running in the same repository, and the reverse. Together
+they exhaust the memory of a laptop and have killed sessions. A filtered test run passes. The
+running command is found in the process list (Linux `/proc`, else `ps`), never in a lock file.
+"""
+
+import os
+import re
+import shlex
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+from pathlib import Path  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness_hook as h  # noqa: E402
+
+FILTER_OPTIONS = ("--filter", "--group", "--testsuite", "--test-suite", "--dirty")
+SHELL_OPERATORS = {";", "&&", "||", "|", "&"}
+# Options of PHPUnit, Pest and `artisan test` whose value is the next word (`-c phpunit.xml`,
+# `--log-junit report.xml`): that value names a config or report file, never a test to run.
+VALUE_OPTIONS = {
+    "-c", "-d", "--configuration", "--bootstrap", "--cache-directory", "--cache-result-file",
+    "--include-path", "--extension", "--printer", "--columns", "--processes", "--order-by",
+    "--random-order-seed", "--exclude-group", "--exclude-testsuite", "--exclude-filter", "--covers",
+    "--uses", "--requires-php-extension", "--test-suffix", "--env", "--shard",
+    "--coverage-clover", "--coverage-cobertura", "--coverage-crap4j", "--coverage-html",
+    "--coverage-php", "--coverage-xml", "--coverage-filter", "--log-junit", "--log-teamcity",
+    "--log-events-text", "--log-events-verbose-text", "--testdox-html", "--testdox-text",
+    "--generate-baseline", "--use-baseline",
+}
+
+
+def words_of(text):
+    try:
+        words = shlex.split(text)
+    except ValueError:
+        words = text.split()
+    return [w[2:] if w.startswith("./") else w for w in words]
+
+
+def command_of(value):
+    """The words of a profile command without its leading `cd <dir> &&` segments: the command proper,
+    as it shows in the process list (`cd` is a shell builtin and starts no process)."""
+    words = words_of(value or "")
+    while words[:1] == ["cd"]:
+        cut = [i for i, w in enumerate(words) if w in ("&&", ";")]
+        if not cut:
+            break
+        words = words[cut[0] + 1 :]
+    return words
+
+
+def match_at(words, wanted):
+    """Index just after the first occurrence of `wanted` as consecutive words, or -1."""
+    for start in range(len(words) - len(wanted) + 1):
+        if words[start : start + len(wanted)] == wanted:
+            return start + len(wanted)
+    return -1
+
+
+REDIRECT = re.compile(r"^\d*(?:&>>|&>|>>&?|>&|>\||<<<|<<-?|<>|<&|>|<)(.*)$")
+TEST_DIRECTORIES = {"test", "tests"}
+
+
+def selects(word):
+    """True when a positional word names a test: a `.php` file, `File::test`, a path that exists
+    (relative to the hook's directory) or a test directory (`tests/Unit`). Any other word with an
+    extension (`out.xml`, `build/report.json`) is the value of an option this hook does not know."""
+    if word.lower().endswith(".php") or "::" in word or os.path.exists(word):
+        return True
+    return any(part.lower() in TEST_DIRECTORIES for part in re.split(r"[/\\]", word))
+
+
+def unfiltered(rest, filter_options=()):
+    """True when what follows the test command selects nothing: no path, no filter.
+
+    It stops at a shell operator, skips a redirection with its target (`> out.txt`, `2>&1`), and
+    counts as a filter only a filter option (also those of `cmd_test_backend_filter`) or a word that
+    names a test (see `selects`): an option's value (`--processes 4`, `-c phpunit.xml`, `--log-junit=report.xml`)
+    selects nothing."""
+    options = FILTER_OPTIONS + tuple(filter_options)
+    index = 0
+    while index < len(rest):
+        word = rest[index]
+        index += 1
+        if word in SHELL_OPERATORS or word in h.OPERATORS:
+            break
+        if word.isdigit() and index < len(rest) and REDIRECT.match(rest[index]):
+            continue  # the file descriptor of `2>&1` or `2> err.txt`
+        redirect = REDIRECT.match(word)
+        if redirect:
+            if not redirect.group(1):
+                index += 1  # the redirection's target is the next word
+            continue
+        if word.startswith(options) or word == "-k":
+            return False
+        if word in VALUE_OPTIONS:
+            index += 1  # the option's value (a config or report file) is the next word
+            continue
+        if not word.startswith("-") and selects(word):
+            return False
+    return True
+
+
+def filter_options_of(profile, test):
+    """The options `cmd_test_backend_filter` adds after the test command (`--filter`)."""
+    words = command_of(h.setting(profile, "cmd_test_backend_filter"))
+    if words[: len(test)] != test:
+        return ()
+    return tuple(w.split("=", 1)[0] for w in words[len(test) :] if w.startswith("-") and len(w) > 1)
+
+
+def process_table():
+    """{pid: (ppid, args, cwd or None)} of the processes this user can see."""
+    table = {}
+    proc = Path("/proc")
+    if (proc / "self" / "cmdline").exists():
+        for entry in proc.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                args = [a for a in (entry / "cmdline").read_bytes().decode("utf-8", "replace").split("\0") if a]
+                stat = (entry / "stat").read_text()
+                ppid = int(stat.rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            try:
+                cwd = os.readlink(entry / "cwd")
+            except OSError:
+                cwd = None
+            table[int(entry.name)] = (ppid, args, cwd)
+        return table
+    listing = subprocess.run(["ps", "-axo", "pid=,ppid=,args="], capture_output=True, text=True, timeout=5).stdout
+    for line in listing.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = (int(parts[1]), parts[2].split(), None)
+    return table
+
+
+def ancestors(table):
+    seen, pid = set(), os.getpid()
+    while pid > 0 and pid not in seen:
+        seen.add(pid)
+        pid = table.get(pid, (0,))[0]
+    return seen
+
+
+def cwd_of(pid, known):
+    if known is not None:
+        return known
+    try:
+        out = subprocess.run(["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.stdout.splitlines():
+        if line.startswith("n"):
+            return line[1:]
+    return None
+
+
+def inside(path, root):
+    try:
+        path, root = os.path.realpath(path), os.path.realpath(root)
+        return os.path.commonpath([path, root]) == root
+    except ValueError:
+        return False
+
+
+def running(wanted, full_only, table, skip, root, filter_options=()):
+    """The pid of a process in this repository that runs `wanted` (unfiltered when full_only)."""
+    for pid, (_ppid, args, cwd) in sorted(table.items()):
+        if pid in skip:
+            continue
+        words = [w[2:] if w.startswith("./") else w for a in args for w in a.split()]
+        end = match_at(words, wanted)
+        if end < 0 or (full_only and not unfiltered(words[end:], filter_options)):
+            continue
+        place = cwd_of(pid, cwd)
+        if (place and inside(place, root)) or any(str(root) in a for a in args):
+            return pid
+    return None
+
+
+def main(tool, tool_input, profile):
+    if tool != "Bash":
+        return h.ALLOW, ""
+    test = command_of(h.setting(profile, "cmd_test_backend"))
+    analysis = command_of(h.setting(profile, "cmd_static_analysis"))
+    command = tool_input.get("command")
+    if not test or not analysis or not isinstance(command, str):
+        return h.ALLOW, ""
+    options = filter_options_of(profile, test)
+    starts_suite = starts_analysis = False
+    for segment in h.segments(command):
+        words = [w[2:] if w.startswith("./") else w for w in h.command_words(segment)]
+        if words[: len(test)] == test and unfiltered(words[len(test) :], options):
+            starts_suite = True
+        if words[: len(analysis)] == analysis:
+            starts_analysis = True
+    if not (starts_suite or starts_analysis):
+        return h.ALLOW, ""
+    table = process_table()
+    skip = ancestors(table)
+    root = h.repo_root()
+    if starts_suite:
+        pid = running(analysis, False, table, skip, root)
+        if pid:
+            return h.BLOCK, (
+                f"suite-lock: the static analysis is running in this repository (pid {pid}); the full "
+                "test suite and the static analysis never run together. Wait for it to finish, or run "
+                "the tests with a filter (profile.cmd_test_backend_filter)."
+            )
+    if starts_analysis:
+        pid = running(test, True, table, skip, root, options)
+        if pid:
+            return h.BLOCK, (
+                f"suite-lock: the full backend test suite is running in this repository (pid {pid}); the "
+                "static analysis and the full test suite never run together. Wait for the suite to finish."
+            )
+    return h.ALLOW, ""
+
+
+if __name__ == "__main__":
+    h.entry(main)

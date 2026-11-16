@@ -46,7 +46,7 @@ ls QA-<slug>.md STATE-<slug>.md <slug>-pr.md decisions-<slug>.md 2>/dev/null
 grep -n 'PRODUCTION-AFFECTING' QA-<slug>.md 2>/dev/null
 ```
 
-For `qa`: the fixtures come from the QA file's own steps (ids + display labels, the way `cdv-interactive-qa` needs them). For `review`: the ticket id via `cdv-code-review/scripts/resolve-ticket-id.sh` and whether a `<profile.pr_review_dir_prefix><TICKET>/` already exists. For `investigation`: the hypotheses block and the evidence table from the `cdv-debug` report, verbatim. For `continue-implementation`: the `STATE-<slug>.md` phase statuses, its `## Finalize seed` and whether `## Verificação` exists.
+For `qa`: the fixtures come from the QA file's own steps (ids + display labels, the way `cdv-qa` needs them; [qa-fixtures.md](../../harness/references/qa-fixtures.md)). For `review`: the ticket id via `cdv-code-review/scripts/resolve-ticket-id.sh` and whether a `<profile.pr_review_dir_prefix><TICKET>/` already exists. For `investigation`: the hypotheses block and the evidence table from the `cdv-debug` report, verbatim. For `continue-implementation`: the run profile and its status (`.specs/features/<slug>/run.yaml`, or `RUN-<slug>.yaml` with no plan, and what `run_status.py show` prints), and whether `.specs/features/<slug>/verification.md` exists.
 
 ### Step 2 — Render the block
 
@@ -67,7 +67,7 @@ ARMADILHA DO AMBIENTE  (only when the code is in a worktree and `profile.worktre
 - Baseline atual: <N passed (M assertions)>, formatador <PASS>, análise estática <OK>.
 
 O QUE FAZER
-- Invoque a skill <cdv-interactive-qa | cdv-code-review | cdv-debug | cdv-plan-feature>.
+- Invoque a skill <cdv-qa | cdv-code-review | cdv-debug | cdv-kickoff>.
 - <roteiro/arquivo a ler, with path> | <ticket id> | <report to start from>
 
 FIXTURES REAIS (validadas em <data>)
@@ -98,8 +98,8 @@ NÃO FAÇA
 ## Composition
 
 - `cdv-finalize` — prints the `qa` kind at its wrap-up using this template; when this skill is invoked on its own after a finalize, reuse the state report's numbers instead of re-deriving them.
-- `cdv-interactive-qa`, `cdv-code-review`, `cdv-debug`, `cdv-plan-feature` — the receivers. The block names which one to invoke.
-- `cdv-code-review` third-party mode — a review handoff for a colleague's PR says so explicitly (`branch de terceiro: sem apply-review`).
+- `cdv-qa`, `cdv-code-review`, `cdv-debug`, `cdv-kickoff` — the receivers. The block names which one to invoke.
+- `cdv-code-review` third-party mode — a review handoff for a colleague's PR says so explicitly (`branch de terceiro: aplicar os findings só com push perguntado`).
 
 ## Example (qa kind, condensed)
 
@@ -117,7 +117,7 @@ ARMADILHA DO AMBIENTE
 - Baseline: suíte de testes verde, formatador PASS, análise estática OK.
 
 O QUE FAZER
-- Invoque cdv-interactive-qa; roteiro em QA-export-stale-file.md (6 passos).
+- Invoque cdv-qa; roteiro em QA-export-stale-file.md (6 passos).
 
 FIXTURES REAIS (validadas na data do handoff)
 - relatório 7 (Vendas — semana) — exportado ontem, o arquivo antigo ainda existe (o caso a reparar)
