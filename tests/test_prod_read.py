@@ -16,6 +16,8 @@ from test_kickoff_profile import sentences
 PROD_READ = REPO_ROOT / "bin" / "prod-read"
 SKILL = REPO_ROOT / "skills" / "cdv-prod" / "SKILL.md"
 READONLY = "DB::statement('SET SESSION TRANSACTION READ ONLY');"
+# Landing row 11's fixed read for PROFILE: its table, name and time columns, prod_row_cap 50 + 1.
+JOB_RUNS_READ = "DB::table('job_runs')->where('job', 'like', '%nightly-sync%')->orderByDesc('started_at')->limit(51)->get()"
 DOOR_7 = "docker exec -i -u www-data $(docker ps -qf name=acme_app) sh -c 'php artisan tinker --execute \"$(cat)\"'"
 
 # The fake ssh records argv and stdin, prints $FAKE_SSH_OUTPUT, sleeps $FAKE_SSH_SLEEP, exits $FAKE_SSH_EXIT.
@@ -152,7 +154,7 @@ class ProdReadTest(HarnessTestCase):
         cases = [
             (["--migrate-status"], [r"Artisan::call\('migrate:status'\)"]),
             (["--failed-jobs"], [r"Artisan::call\('queue:failed'\)"]),
-            (["--job-runs", "nightly-sync"], [r"DB::table\('job_runs'\)", r"'job'", r"nightly-sync", r"'started_at'"]),
+            (["--job-runs", "nightly-sync"], [re.escape(JOB_RUNS_READ)]),
             (["--logs", "Timeout while"], [r"storage_path\('logs'\)", r"'Timeout while'"]),
         ]
         # --logs is bounded where it runs: each file is read from its end and the read stops at
