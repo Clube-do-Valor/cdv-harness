@@ -21,6 +21,18 @@ import harness_hook as h  # noqa: E402
 
 FILTER_OPTIONS = ("--filter", "--group", "--testsuite", "--test-suite", "--dirty")
 SHELL_OPERATORS = {";", "&&", "||", "|", "&"}
+# Options of PHPUnit, Pest and `artisan test` whose value is the next word (`-c phpunit.xml`,
+# `--log-junit report.xml`): that value names a config or report file, never a test to run.
+VALUE_OPTIONS = {
+    "-c", "-d", "--configuration", "--bootstrap", "--cache-directory", "--cache-result-file",
+    "--include-path", "--extension", "--printer", "--columns", "--processes", "--order-by",
+    "--random-order-seed", "--exclude-group", "--exclude-testsuite", "--exclude-filter", "--covers",
+    "--uses", "--requires-php-extension", "--test-suffix", "--env", "--shard",
+    "--coverage-clover", "--coverage-cobertura", "--coverage-crap4j", "--coverage-html",
+    "--coverage-php", "--coverage-xml", "--coverage-filter", "--log-junit", "--log-teamcity",
+    "--log-events-text", "--log-events-verbose-text", "--testdox-html", "--testdox-text",
+    "--generate-baseline", "--use-baseline",
+}
 
 
 def words_of(text):
@@ -53,7 +65,8 @@ def unfiltered(rest, filter_options=()):
 
     It stops at a shell operator, skips a redirection with its target (`> out.txt`, `2>&1`), and
     counts as a filter only a filter option (also those of `cmd_test_backend_filter`) or a word that
-    names a path: an option's value (`--processes 4`) selects nothing."""
+    names a path: an option's value (`--processes 4`, `-c phpunit.xml`, `--log-junit=report.xml`)
+    selects nothing."""
     options = FILTER_OPTIONS + tuple(filter_options)
     index = 0
     while index < len(rest):
@@ -70,6 +83,9 @@ def unfiltered(rest, filter_options=()):
             continue
         if word.startswith(options) or word == "-k":
             return False
+        if word in VALUE_OPTIONS:
+            index += 1  # the option's value (a config or report file) is the next word
+            continue
         if not word.startswith("-") and selects(word):
             return False
     return True

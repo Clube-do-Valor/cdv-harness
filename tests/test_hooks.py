@@ -2,6 +2,7 @@ import json
 import random
 import shutil
 import subprocess
+import sys
 import unittest
 from pathlib import Path
 
@@ -150,6 +151,14 @@ class SuiteLockTest(HookCase):
         self.addCleanup(proc.kill)
         return proc
 
+    def start_waiting(self, *args):
+        """A process in the repository whose arguments carry `args`, as a test runner's would."""
+        argv = [sys.executable, "-c", "import time; time.sleep(120)", *args]
+        proc = subprocess.Popen(argv, cwd=str(self.repo))
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        return proc
+
     def test_full_suite_while_static_analysis_runs_exits_2(self):
         self.start(self.analysis_cmd)
         self.assertBlocks(self.hook("suite-lock", self.bash(self.test_cmd)), "static analysis")
@@ -159,14 +168,26 @@ class SuiteLockTest(HookCase):
             f"{self.test_cmd} > out.txt",
             f"{self.test_cmd} >> out.txt 2> err.txt",
             f"{self.test_cmd} --processes 4 2>&1 | tee out.txt",
+            f"{self.test_cmd} -c phpunit.xml",
+            f"{self.test_cmd} --configuration phpunit.xml",
+            f"{self.test_cmd} --log-junit report.xml",
+            f"{self.test_cmd} --coverage-html build/coverage 2>&1 | tail -50",
         ):
             with self.subTest(command=command):
                 self.assertBlocks(self.hook("suite-lock", self.bash(command)), "static analysis")
 
     def test_static_analysis_while_full_suite_runs_exits_2(self):
-        self.start(self.test_cmd)
+        bare = self.start(self.test_cmd)
         self.assertBlocks(self.hook("suite-lock", self.bash(self.analysis_cmd)), "test suite")
         self.assertBlocks(self.hook("suite-lock", self.bash(f"{self.analysis_cmd} 2>&1 | tail -50")), "test suite")
+        bare.kill()
+        bare.wait()
+        for options in (["-c", "phpunit.xml"], ["--log-junit", "report.xml"], ["--coverage-html", "build/coverage"]):
+            with self.subTest(running=options):
+                suite = self.start_waiting(*self.test_cmd.split(), *options)
+                self.assertBlocks(self.hook("suite-lock", self.bash(self.analysis_cmd)), "test suite")
+                suite.kill()
+                suite.wait()
 
     def test_filtered_suite_or_nothing_running_exits_0(self):
         self.assertAllows(self.hook("suite-lock", self.bash(self.test_cmd)))
@@ -180,6 +201,8 @@ class SuiteLockTest(HookCase):
         self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} tests/Feature/InvoiceTest.php")))
         self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} --filter InvoiceTest > out.txt")))
         self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} tests/Feature 2>&1 | tail -50")))
+        self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} -c phpunit.xml tests/Feature/InvoiceTest.php")))
+        self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} --log-junit report.xml --filter InvoiceTest")))
         self.assertAllows(self.hook("suite-lock", self.bash("git status")))
 
 
