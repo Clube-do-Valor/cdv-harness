@@ -16,6 +16,7 @@
 - `profile.schema.yaml`: the role lines (`role_orchestrator` … `role_judge`), the key families `account_<name>` and `model_<alias>`, `delegate_tool`, the `prod_*` keys, `qa_side_stack_script`, `qa_test_marker` and the three `ticket_status_*` keys, all optional.
 - `release --adjust` cuts the next patch tag inside the 7-day window of the last tag.
 - The core deny list also covers `.claude/harness/hooks/`, `.claude/harness/references/` and `.claude/skills/tlc-spec-lean/`.
+- `cdv-code-review`'s `verify-anchors.sh` reads the cited file's length from `<head-ref>` instead of the working tree, so `verify-anchors.sh <dir> <base> <branch>` works without a checkout, as the PR-number mode promises. Before, every anchor reported `out-of-file` when the working tree was on another branch.
 - `sync` also stages `.claude/harness/profile.yaml` with `git add -f`, so a repository that ignores `.claude/` commits its profile with the first sync. `profile.local.yaml` stays out of git.
 
 ## v0.2.1

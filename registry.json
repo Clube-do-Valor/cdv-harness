@@ -15,7 +15,7 @@
       "owner": "augusto-henriques",
       "description": "Single-pass code review of a feature branch, emitting paste-ready inline-comment files under <profile.pr_review_dir_prefix>[TICKET]/ (prose in the repository's UI language, verified file:line anchors, _summary.md + INDEX.md). Triggers on 'revise esse PR', 'gera os comentários do code review', 'review my branch before I open the PR'. Read-only — never edits source, never posts. Do NOT use for the multi-agent protocol (\"review PR with subagents\" → cdv-pr-review), debugging (cdv-debug), planning (cdv-kickoff/cdv-grilling), or PR/commit generation (cdv-finalize).",
       "path": "skills/cdv-code-review",
-      "contentHash": "404659277f9da0dad4f4dd1b6ee8dd5f2685ff65b8e22e82e68a68c3810c203a"
+      "contentHash": "5af2a6fec57577cdbfc56cc693ba76e1acfdaa72724231f52403567e0597c40f"
     },
     {
       "name": "cdv-debug",

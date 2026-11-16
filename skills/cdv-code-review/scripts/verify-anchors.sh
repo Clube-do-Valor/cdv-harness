@@ -152,10 +152,12 @@ for i in "${!anchors[@]}"; do
   status=
   if [[ -z "${changed_set["$path"]:-}" ]]; then
     status="missing-from-diff"
-  elif [[ ! -f "$path" ]]; then
+  # Length is read from <head-ref>, the tree the diff describes, never from the working tree: the
+  # working tree may be on another branch, and then every anchor reported out-of-file.
+  elif ! git cat-file -e "$head_ref:$path" 2>/dev/null; then
     status="out-of-file"
   else
-    total="$(wc -l < "$path")"
+    total="$(git show "$head_ref:$path" | awk 'END { print NR }')"
     if (( line > total )); then
       status="out-of-file"
     elif [[ -z "${added_lines["$path:$line"]:-}" ]]; then
