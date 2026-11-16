@@ -53,7 +53,7 @@ repository does not have that thing: skip the step that needs it.
 - With `workspace: main`, the application of the main checkout is the one under test, at
   `profile.qa_url`.
 - With `workspace: worktree`, start `profile.qa_side_stack_script` from the worktree and read the address and the login link it prints. The final report gives the address and a login link of the side stack, so the developer can open what you tested.
-- When `profile.qa_side_stack_script` is `none`, ask to bring the branch to the main checkout (with its consequence: the main checkout leaves the branch it is on) and wait for the answer; never switch the branch of a checkout another session works in.
+- When `profile.qa_side_stack_script` is `none`, ask to bring the branch to the main checkout (through `profile.bring_branch_script` when the repository has one; the consequence: the main checkout leaves the branch it is on) and wait for the answer; never switch the branch of a checkout another session works in.
 
 Log in through the login link or the route the extension names; never type a password, and never
 ask for one.
