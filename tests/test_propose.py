@@ -218,5 +218,37 @@ class ProposeTest(HarnessTestCase):
         self.propose("--no-pr")
         self.assertNotEqual(self.branch(), first)
 
+    def test_vendored_hooks_references_and_bin_go_back_to_their_core_paths(self):
+        self.commit_core(
+            self.core,
+            {
+                "hooks/require-model": ("#!/bin/sh\nexit 0\n", True),
+                "references/naming-language.md": "One language.\n",
+                "bin/prod-read": ("#!/bin/sh\necho read\n", True),
+            },
+            message="feat: vendored directories",
+            tag="v0.2.0",
+        )
+        self.git(self.core, "push", "-q", "origin", "main", "--tags")
+        self.sync(self.consumer, self.core, "v0.2.0")
+        self.commit_all(self.consumer)
+        edits = {
+            ".claude/harness/hooks/require-model": "#!/bin/sh\nexit 0\n# local\n",
+            ".claude/harness/references/naming-language.md": "One language, always.\n",
+            ".claude/harness/bin/prod-read": "#!/bin/sh\necho read\n# local\n",
+        }
+        for relative, text in edits.items():
+            (self.consumer / relative).write_text(text)
+        result = self.propose("--no-pr")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        branch = self.branch()
+        self.assertEqual(self.core_show(branch, "hooks/require-model"), edits[".claude/harness/hooks/require-model"])
+        self.assertEqual(
+            self.core_show(branch, "references/naming-language.md"), edits[".claude/harness/references/naming-language.md"]
+        )
+        self.assertEqual(self.core_show(branch, "bin/prod-read"), edits[".claude/harness/bin/prod-read"])
+        mode = self.git(self.core, "ls-tree", branch, "hooks/require-model").stdout.split()[0]
+        self.assertEqual(mode, "100755")
+
 if __name__ == "__main__":
     unittest.main()

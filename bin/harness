@@ -400,7 +400,7 @@ def read_lock(path):
     return data
 
 
-def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files):
+def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files, hooks=None):
     def js(value):
         return json.dumps(value, ensure_ascii=False)
 
@@ -421,6 +421,8 @@ def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files):
     out.append(f'  "house_sha256": {js(house_sha)},')
     out += array("paths", sorted(paths, key=path_key))
     out += array("deny", list(deny))
+    if hooks is not None:
+        out += array("hooks", list(hooks))
     ordered = sorted(files, key=path_key)
     if ordered:
         out.append('  "files": {')
@@ -532,8 +534,12 @@ def select_vendored(tree):
             dest = ".claude/" + path
         elif parts[0] == "rules" and len(parts) == 3 and parts[1] == "core" and path.endswith(".md"):
             dest = ".claude/rules/core/" + parts[2]
-        elif path == "bin/verify.sh":
-            dest = ".claude/harness/bin/verify.sh"
+        elif parts[0] == "bin" and len(parts) == 2 and parts[1] != "harness":
+            dest = ".claude/harness/bin/" + parts[1]
+        elif parts[0] == "hooks" and len(parts) == 2:
+            dest = ".claude/harness/hooks/" + parts[1]
+        elif parts[0] == "references" and len(parts) == 2 and path.endswith(".md"):
+            dest = ".claude/harness/references/" + parts[1]
         if dest is None:
             continue
         if mode == "120000":
@@ -549,8 +555,8 @@ def lock_paths_for(vendored):
             paths.add("/".join(dest.split("/")[:3]))
         elif dest.startswith(".claude/rules/core/"):
             paths.add(".claude/rules/core")
-        elif dest.startswith(".claude/harness/bin/"):
-            paths.add(".claude/harness/bin")
+        elif dest.startswith(".claude/harness/"):
+            paths.add("/".join(dest.split("/")[:3]))
     return sorted(paths, key=path_key)
 
 
@@ -585,6 +591,63 @@ def apply_house(existing, tag, body):
 def extract_house(text):
     match = HOUSE_BLOCK_RE.search(text)
     return match.group("body") if match else None
+
+
+HOOKS_CORE = "settings/hooks-core.json"
+HOOK_COMMAND_PREFIX = ".claude/harness/hooks/"
+
+
+def read_core_hooks(blob):
+    """The `PreToolUse` entries of settings/hooks-core.json. Every command must run a vendored hook."""
+    if blob is None:
+        return []
+    try:
+        doc = json.loads(blob)
+        entries = doc["PreToolUse"]
+        if not isinstance(entries, list):
+            raise ValueError("PreToolUse must be a list")
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("matcher"), str):
+                raise ValueError("each entry needs a string matcher")
+            commands = entry.get("hooks")
+            if not isinstance(commands, list) or not commands:
+                raise ValueError("each entry needs a non-empty hooks list")
+            for hook in commands:
+                if not isinstance(hook, dict) or hook.get("type") != "command":
+                    raise ValueError("each hook must be of type command")
+                command = hook.get("command")
+                if not isinstance(command, str) or not command.startswith(HOOK_COMMAND_PREFIX):
+                    raise ValueError(f"each command must start with {HOOK_COMMAND_PREFIX}, got {command!r}")
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HarnessError(f"{HOOKS_CORE} is invalid: {exc}")
+    return entries
+
+
+def merge_settings(settings_text, core_deny, previous_deny, core_hooks=(), previous_hooks=()):
+    """Merge the core deny list into permissions.deny and the core hook entries into
+    hooks.PreToolUse. What the previous sync wrote and the core dropped is removed; every other
+    entry of the repository stays as it is."""
+    text = merge_deny(settings_text, core_deny, previous_deny)
+    data = json.loads(text)
+    core_hooks, previous_hooks = list(core_hooks), list(previous_hooks)
+    hooks = data.get("hooks")
+    if hooks is None and not core_hooks:
+        return text
+    if hooks is None:
+        hooks = {}
+        data["hooks"] = hooks
+    if not isinstance(hooks, dict):
+        raise HarnessError(".claude/settings.json: hooks must be an object")
+    pre = hooks.get("PreToolUse", [])
+    if not isinstance(pre, list):
+        raise HarnessError(".claude/settings.json: hooks.PreToolUse must be a list")
+    dropped = [entry for entry in previous_hooks if entry not in core_hooks]
+    merged = [entry for entry in pre if entry not in dropped]
+    for entry in core_hooks:
+        if entry not in merged:
+            merged.append(entry)
+    hooks["PreToolUse"] = merged
+    return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
 def merge_deny(settings_text, core_deny, previous_deny):
@@ -702,6 +765,7 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
         if not tree.has(needed):
             raise HarnessError(f"{tag} has no {needed}")
     blobs = tree.read_many(wanted + ["settings/deny-core.json", "instructions/house.md"])
+    core_hooks = read_core_hooks(tree.read(HOOKS_CORE) if tree.has(HOOKS_CORE) else None)
 
     vendored = {}
     for dest, (src, executable) in selected.items():
@@ -723,6 +787,7 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
     previous = read_lock(lock_path) or {}
     previous_files = {p: s for p, s in (previous.get("files") or {}).items() if safe_lock_path(p)}
     previous_deny = previous.get("deny") or []
+    previous_hooks = previous.get("hooks") or []
 
     instructions_path = repo / instructions_rel
     settings_rel = ".claude/settings.json"
@@ -732,10 +797,12 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
     if instructions_path.is_symlink():
         raise HarnessError(f"{instructions_rel} is a symlink; refusing to write through it")
 
-    settings_text = merge_deny(
+    settings_text = merge_settings(
         settings_path.read_text(encoding="utf-8") if settings_path.is_file() else None,
         core_deny,
         previous_deny,
+        core_hooks,
+        previous_hooks,
     )
     instructions_text = apply_house(
         instructions_path.read_text(encoding="utf-8") if instructions_path.is_file() else None, tag, body
@@ -750,6 +817,7 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
         lock_paths_for(vendored),
         core_deny,
         file_shas,
+        core_hooks,
     )
 
     removals = sorted((p for p in previous_files if p not in vendored), key=path_key)
@@ -974,8 +1042,10 @@ def cmd_propose(args):
             return relative[len(".claude/") :]
         if relative.startswith(".claude/rules/core/"):
             return "rules/core/" + relative[len(".claude/rules/core/") :]
-        if relative == ".claude/harness/bin/verify.sh":
-            return "bin/verify.sh"
+        for vendored, source in ((".claude/harness/bin/", "bin/"), (".claude/harness/hooks/", "hooks/"),
+                                 (".claude/harness/references/", "references/")):
+            if relative.startswith(vendored) and "/" not in relative[len(vendored):]:
+                return source + relative[len(vendored):]
         raise HarnessError(f"{relative} has no place in the core")
 
     writes = []
