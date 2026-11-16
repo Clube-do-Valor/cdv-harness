@@ -195,6 +195,25 @@ class SuiteLockTest(HookCase):
                 suite.kill()
                 suite.wait()
 
+    def test_a_profile_command_with_a_leading_cd_still_blocks_both_ways(self):
+        self.write_profile(
+            f"repo_name: app\ncmd_test_backend: cd . && {self.test_cmd}\n"
+            f"cmd_static_analysis: cd . && {self.analysis_cmd}\n"
+            f"cmd_test_backend_filter: cd . && {self.test_cmd} --filter\n"
+        )
+        analysis = self.start(self.analysis_cmd)
+        self.assertBlocks(self.hook("suite-lock", self.bash(f"cd . && {self.test_cmd}")), "static analysis")
+        self.assertBlocks(self.hook("suite-lock", self.bash(self.test_cmd)), "static analysis")
+        self.assertAllows(self.hook("suite-lock", self.bash(f"cd . && {self.test_cmd} --filter=InvoiceTest")))
+        analysis.kill()
+        analysis.wait()
+        suite = self.start(self.test_cmd)
+        self.assertBlocks(self.hook("suite-lock", self.bash(f"cd . && {self.analysis_cmd}")), "test suite")
+        self.assertBlocks(self.hook("suite-lock", self.bash(self.analysis_cmd)), "test suite")
+        suite.kill()
+        suite.wait()
+        self.assertAllows(self.hook("suite-lock", self.bash(f"cd . && {self.analysis_cmd}")))
+
     def test_filtered_suite_or_nothing_running_exits_0(self):
         self.assertAllows(self.hook("suite-lock", self.bash(self.test_cmd)))
         self.assertAllows(self.hook("suite-lock", self.bash(self.analysis_cmd)))

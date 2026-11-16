@@ -43,6 +43,18 @@ def words_of(text):
     return [w[2:] if w.startswith("./") else w for w in words]
 
 
+def command_of(value):
+    """The words of a profile command without its leading `cd <dir> &&` segments: the command proper,
+    as it shows in the process list (`cd` is a shell builtin and starts no process)."""
+    words = words_of(value or "")
+    while words[:1] == ["cd"]:
+        cut = [i for i, w in enumerate(words) if w in ("&&", ";")]
+        if not cut:
+            break
+        words = words[cut[0] + 1 :]
+    return words
+
+
 def match_at(words, wanted):
     """Index just after the first occurrence of `wanted` as consecutive words, or -1."""
     for start in range(len(words) - len(wanted) + 1):
@@ -97,7 +109,7 @@ def unfiltered(rest, filter_options=()):
 
 def filter_options_of(profile, test):
     """The options `cmd_test_backend_filter` adds after the test command (`--filter`)."""
-    words = words_of(h.setting(profile, "cmd_test_backend_filter") or "")
+    words = command_of(h.setting(profile, "cmd_test_backend_filter"))
     if words[: len(test)] != test:
         return ()
     return tuple(w.split("=", 1)[0] for w in words[len(test) :] if w.startswith("-") and len(w) > 1)
@@ -178,8 +190,8 @@ def running(wanted, full_only, table, skip, root, filter_options=()):
 def main(tool, tool_input, profile):
     if tool != "Bash":
         return h.ALLOW, ""
-    test = words_of(h.setting(profile, "cmd_test_backend"))
-    analysis = words_of(h.setting(profile, "cmd_static_analysis"))
+    test = command_of(h.setting(profile, "cmd_test_backend"))
+    analysis = command_of(h.setting(profile, "cmd_static_analysis"))
     command = tool_input.get("command")
     if not test or not analysis or not isinstance(command, str):
         return h.ALLOW, ""
