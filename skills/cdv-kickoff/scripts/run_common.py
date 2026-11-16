@@ -18,8 +18,8 @@ ALL_STAGES = STAGES + [INVESTIGATE]
 
 # The run profile key whose value `none` or `0` skips a stage.
 STAGE_SKIP_KEY = {
-    "grilling": "planner",
-    "plan": "planner",
+    "grilling": "planning",
+    "plan": "planning",
     "verify": "verify_rounds",
     "review": "review",
     "fix": "review",
@@ -55,7 +55,7 @@ RUN_SCALARS = {
     "feature": "slug",
     "track": ("small", "medium", "big"),
     "mode": ("investigate", "plan-then-build", "autonomous", "step-by-step"),
-    "planner": ("none", "tlc-spec-lean"),
+    "planning": ("none", "tlc-spec-lean"),
     "workspace": ("main", "worktree"),
     "builder": ("inline", "child"),
     "builder_role": ("builder", "builder_risk"),

@@ -118,17 +118,17 @@ class ProposeProfileTest(ProposeCase):
                 self.assertEqual(self.propose(**overrides)["track"], "big")
         self.assertEqual(self.propose(migration="schema")["track"], "medium")
 
-    def test_small_is_autonomous_without_planner(self):
+    def test_small_is_autonomous_without_planning(self):
         profile = self.on_track("small")
         self.assertEqual(profile["track"], "small")
-        self.assertEqual((profile["mode"], profile["planner"]), ("autonomous", "none"))
+        self.assertEqual((profile["mode"], profile["planning"]), ("autonomous", "none"))
 
     def test_medium_and_big_plan_then_build_with_tlc_spec_lean(self):
         for track in ("medium", "big"):
             with self.subTest(track=track):
                 profile = self.on_track(track)
                 self.assertEqual(profile["track"], track)
-                self.assertEqual((profile["mode"], profile["planner"]), ("plan-then-build", "tlc-spec-lean"))
+                self.assertEqual((profile["mode"], profile["planning"]), ("plan-then-build", "tlc-spec-lean"))
 
     def test_investigate_intent_wins_on_every_track(self):
         for track in TRACKS:
@@ -257,7 +257,7 @@ VALID_RUN = """schema: 1
 feature: invoice-export
 track: medium
 mode: plan-then-build
-planner: tlc-spec-lean
+planning: tlc-spec-lean
 workspace: main
 builder: child
 builder_role: builder

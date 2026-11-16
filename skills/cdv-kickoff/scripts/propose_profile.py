@@ -60,7 +60,7 @@ SIGNALS = {
 ANSWERABLE = [
     "track",
     "mode",
-    "planner",
+    "planning",
     "workspace",
     "builder",
     "builder_role",
@@ -159,7 +159,7 @@ def propose(s, answers=None):
     else:
         mode = "autonomous" if small else "plan-then-build"
     mode = pick("mode", mode)
-    planner = pick("planner", "none" if small else "tlc-spec-lean")
+    planning = pick("planning", "none" if small else "tlc-spec-lean")
     risk = s["access_kernel"] or s["money_or_contract"] or s["one_way_door"]
     screen = s["new_screen"] or s["changes_existing_screen"]
     if not screen:
@@ -184,7 +184,7 @@ def propose(s, answers=None):
         "feature": s["feature"],
         "track": track,
         "mode": mode,
-        "planner": planner,
+        "planning": planning,
         "workspace": pick("workspace", "main" if s["main_checkout_free"] and track != "big" else "worktree"),
         "builder": pick("builder", "inline" if small else "child"),
         "builder_role": pick("builder_role", "builder_risk" if risk else "builder"),

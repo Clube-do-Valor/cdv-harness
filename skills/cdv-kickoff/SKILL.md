@@ -107,7 +107,7 @@ for the plan: carry it into the grilling.
 When the screen is answered (or, on a small track, right after the one line), write the run
 profile file from the script's output, unedited:
 
-- with a plan (`planner: tlc-spec-lean`): `.specs/features/<feature>/run.yaml`, the work folder
+- with a plan (`planning: tlc-spec-lean`): `.specs/features/<feature>/run.yaml`, the work folder
   being `.specs/features/<feature>/`;
 - without one: `RUN-<feature>.yaml` at the repository root, the work folder being `RUN-<feature>/`.
 
