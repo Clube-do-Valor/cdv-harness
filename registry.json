@@ -114,6 +114,14 @@
       "contentHash": "30f29bf063385d151675cd3a2280a3796cd1961e23c041b67306bd58be731d28"
     },
     {
+      "name": "cdv-prod",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Answer a question about production the safe way - registry data from the local copy first, production itself only for run history, the state after a deploy and the environment, always through `.claude/harness/bin/prod-read` (one SSH hop into the application container on a read-only session, rows capped, every call logged); and a production write, when one is needed, only through its protocol (one question per mutation, guarded by the old value, the row printed before and after, never unattended). Triggers on \"olha em produção\", \"check production\", \"confere no banco de prod\", \"o job rodou hoje?\", \"subiu a migration?\", \"what does prod say\", a production step of cdv-rollout, or a production read inside cdv-debug. Do NOT use for local data questions the local copy answers, for a deploy (never), or for a smoke test that writes (production-affecting paths are the developer's).",
+      "path": "skills/cdv-prod",
+      "contentHash": "38193183d2173ae4ed867642ad272651d6baa6c8104fabb8ff0b57486f0bbde6"
+    },
+    {
       "name": "cdv-qa",
       "version": "0.1.0",
       "owner": "augusto-henriques",

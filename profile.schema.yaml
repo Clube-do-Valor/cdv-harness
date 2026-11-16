@@ -344,6 +344,10 @@ variables:
     type: string
     required: false
     description: Seconds after which a production read is stopped.
+  prod_job_runs_table:
+    type: string
+    required: false
+    description: "Where the application records its job runs, as `<table> <name column> <time column>`; read by `prod-read --job-runs <name>`, which exits 2 without it."
   prod_log:
     type: string
     required: false

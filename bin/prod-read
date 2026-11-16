@@ -1,0 +1,293 @@
+#!/usr/bin/env python3
+"""Read production through one SSH hop into the application container, on a read-only session.
+
+    prod-read --probe <file>          a PHP probe for `php artisan tinker` (no `<?php`, no `use` lines)
+    prod-read --migrate-status        the migration status
+    prod-read --failed-jobs           the failed queue jobs
+    prod-read --job-runs <name>       the recorded runs of the jobs whose name holds <name>
+    prod-read --logs <pattern>        the application log lines that hold <pattern>, newest first
+    (each also takes --root <repo>, default the current directory)
+
+Vendored to `.claude/harness/bin/prod-read` by `harness sync`. It reads the repository profile
+(`.claude/harness/profile.yaml`, with `profile.local.yaml` over it) and runs, with no local shell:
+
+    ssh <prod_ssh_target> "docker exec -i -u <prod_exec_user> $(docker ps -qf name=<prod_app_container>)
+        sh -c 'php artisan tinker --execute \"$(cat)\"'" < probe
+
+The text on stdin is `DB::setDefaultConnection('<prod_readonly_connection>');` when that key is set,
+then `DB::statement('<prod_session_readonly_sql>');`, then the probe or the fixed read. The output
+is cut at `prod_row_cap` lines with one line saying how many were cut, the call is stopped after
+`prod_timeout_seconds`, and every call appends one line to `prod_log`: UTC time, mode, sha256 of
+the probe, exit code - never the output.
+
+Exit 0 read, 2 no production target or another key missing, 3 a read this script does not do,
+4 SSH failed or timed out.
+"""
+
+import hashlib
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+OK, MISSING, REFUSED, SSH_FAILED = 0, 2, 3, 4
+DEFAULT_READONLY_SQL = "SET SESSION TRANSACTION READ ONLY"
+DEFAULT_ROW_CAP = 200
+DEFAULT_TIMEOUT = 60
+NAME_RE = re.compile(r"^[A-Za-z0-9_.:@-]+$")
+IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# mode -> number of values it takes
+MODES = {"--probe": 1, "--migrate-status": 0, "--failed-jobs": 0, "--job-runs": 1, "--logs": 1}
+
+
+class Stop(Exception):
+    def __init__(self, message, code):
+        super().__init__(message)
+        self.code = code
+
+
+# -- the profile: the flat subset (`key: value`, `key:` then `- item` lines) -------------------
+
+
+def parse_flat(text):
+    values, current = {}, None
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("- ") and current is not None:
+            current.append(line[2:].strip().strip("\"'"))
+            continue
+        match = re.match(r"^([A-Za-z_][A-Za-z0-9_.-]*):(?:\s+(.*))?$", raw.rstrip())
+        if not match or raw[:1] in (" ", "\t"):
+            current = None
+            continue
+        value = (match.group(2) or "").strip()
+        if value and value[0] in "\"'":
+            value = value[1:].split(value[0], 1)[0]
+        else:
+            value = re.split(r"\s#", value, maxsplit=1)[0].rstrip()
+        if value:
+            values[match.group(1)] = value
+            current = None
+        else:
+            current = values[match.group(1)] = []
+    return values
+
+
+def load_profile(root):
+    base = Path(root) / ".claude" / "harness" / "profile.yaml"
+    values = parse_flat(base.read_text(encoding="utf-8")) if base.is_file() else {}
+    local = base.with_name("profile.local.yaml")
+    if local.is_file():
+        values.update(parse_flat(local.read_text(encoding="utf-8")))
+    return values
+
+
+def setting(values, key):
+    value = values.get(key)
+    if not isinstance(value, str) or value.strip().lower() in ("", "none"):
+        return ""
+    return value.strip()
+
+
+def required(values, key, pattern=NAME_RE):
+    value = setting(values, key)
+    if not value:
+        raise Stop(f"`{key}` is missing or `none` in the repository profile: no production read from here", MISSING)
+    if pattern and not pattern.match(value):
+        raise Stop(f"`{key}` holds `{value}`, which is not a plain name", MISSING)
+    return value
+
+
+def number(values, key, default):
+    value = setting(values, key)
+    if not value:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        raise Stop(f"`{key}` holds `{value}`, not a whole number", MISSING) from None
+    if parsed < 1:
+        raise Stop(f"`{key}` must be at least 1", MISSING)
+    return parsed
+
+
+def php(text):
+    """A PHP single-quoted string literal."""
+    return "'" + str(text).replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+# -- the reads ---------------------------------------------------------------------------------
+
+
+def split_root(argv):
+    """(root, the other arguments): --root is read before anything can be refused, so a refused
+    call is still logged with the repository's profile."""
+    root, rest, args = ".", list(argv), []
+    while rest:
+        arg = rest.pop(0)
+        if arg == "--root":
+            root = rest.pop(0) if rest else "."
+        elif arg.startswith("--root="):
+            root = arg.split("=", 1)[1]
+        else:
+            args.append(arg)
+    return root, args
+
+
+def parse_args(argv):
+    mode, value, rest = None, None, list(argv)
+    while rest:
+        arg = rest.pop(0)
+        if arg in ("-h", "--help"):
+            print(__doc__)
+            raise SystemExit(OK)
+        name, _sep, inline = arg.partition("=")
+        if name not in MODES:
+            raise Stop(f"`{arg}` is not a read this script does: one of {', '.join(MODES)}", REFUSED)
+        if mode:
+            raise Stop("one read per call", REFUSED)
+        mode = name
+        if MODES[name]:
+            value = inline or (rest.pop(0) if rest else "")
+            if not value:
+                raise Stop(f"{name} needs a value", MISSING)
+        elif inline:
+            raise Stop(f"{name} takes no value", REFUSED)
+    if not mode:
+        raise Stop(f"name a read: one of {', '.join(MODES)}", MISSING)
+    return mode, value
+
+
+def read_code(root, values, mode, value, cap):
+    if mode == "--probe":
+        path = Path(value)
+        path = path if path.is_absolute() else Path(root) / path
+        if not path.is_file():
+            raise Stop(f"no probe file at {value}", MISSING)
+        return path.read_bytes().decode("utf-8")
+    if mode == "--migrate-status":
+        return "Artisan::call('migrate:status'); echo Artisan::output();\n"
+    if mode == "--failed-jobs":
+        return "Artisan::call('queue:failed'); echo Artisan::output();\n"
+    if mode == "--job-runs":
+        words = setting(values, "prod_job_runs_table").split()
+        if len(words) != 3 or not all(IDENTIFIER_RE.match(w) for w in words):
+            raise Stop(
+                "`prod_job_runs_table` is missing or not `<table> <name column> <time column>` in the repository profile",
+                MISSING,
+            )
+        if not NAME_RE.match(value):
+            raise Stop(f"job name `{value}` is not a plain name", MISSING)
+        table, name_column, time_column = words
+        return (
+            f"foreach (DB::table({php(table)})->where({php(name_column)}, 'like', {php('%' + value + '%')})"
+            f"->orderByDesc({php(time_column)})->limit({cap + 1})->get() as $row) {{ echo json_encode($row), PHP_EOL; }}\n"
+        )
+    if mode == "--logs":
+        return (
+            f"$pattern = {php(value)}; $files = glob(storage_path('logs') . '/*.log') ?: [];"
+            " usort($files, fn ($a, $b) => filemtime($b) <=> filemtime($a));"
+            " foreach (array_slice($files, 0, 2) as $file) { $lines = file($file, FILE_IGNORE_NEW_LINES) ?: [];"
+            " foreach (array_reverse($lines) as $line) { if (str_contains($line, $pattern)) { echo basename($file), ': ', $line, PHP_EOL; } } }\n"
+        )
+    raise Stop(f"`{mode}` is not a read this script does", REFUSED)
+
+
+def session_prefix(values):
+    lines = []
+    connection = setting(values, "prod_readonly_connection")
+    if connection:
+        if not NAME_RE.match(connection):
+            raise Stop(f"`prod_readonly_connection` holds `{connection}`, which is not a plain name", MISSING)
+        lines.append(f"DB::setDefaultConnection({php(connection)});")
+    lines.append(f"DB::statement({php(setting(values, 'prod_session_readonly_sql') or DEFAULT_READONLY_SQL)});")
+    return "\n".join(lines) + "\n"
+
+
+def remote_command(user, container):
+    return f"docker exec -i -u {user} $(docker ps -qf name={container}) sh -c 'php artisan tinker --execute \"$(cat)\"'"
+
+
+def run_ssh(target, command, text, timeout):
+    proc = subprocess.Popen(
+        ["ssh", target, command],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = proc.communicate(text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise Stop(f"ssh to {target} stopped after {timeout}s (prod_timeout_seconds)", SSH_FAILED) from None
+    except OSError as error:
+        raise Stop(f"cannot run ssh: {error}", SSH_FAILED) from None
+    return proc.returncode, out, err
+
+
+def print_capped(out, cap):
+    lines = out.splitlines()
+    for line in lines[:cap]:
+        print(line)
+    if len(lines) > cap:
+        print(f"... {len(lines) - cap} more lines cut (prod_row_cap {cap})")
+
+
+def log_line(path, mode, digest, code):
+    path = Path(os.path.expanduser(path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with path.open("a", encoding="utf-8") as log:
+        log.write(f"{stamp} mode={mode} sha256={digest} exit={code}\n")
+
+
+def main(argv=None):
+    root, argv = split_root(sys.argv[1:] if argv is None else argv)
+    values = load_profile(root)
+    log = setting(values, "prod_log")
+    mode, digest = "none", hashlib.sha256(b"").hexdigest()
+    try:
+        mode, value = parse_args(argv)
+        mode = mode.lstrip("-")
+        if not log:
+            raise Stop("`prod_log` is missing or `none` in the repository profile: every production read is logged", MISSING)
+        target = required(values, "prod_ssh_target")
+        user = required(values, "prod_exec_user")
+        container = required(values, "prod_app_container")
+        cap = number(values, "prod_row_cap", DEFAULT_ROW_CAP)
+        timeout = number(values, "prod_timeout_seconds", DEFAULT_TIMEOUT)
+        code_text = read_code(root, values, "--" + mode, value, cap)
+        digest = hashlib.sha256(code_text.encode("utf-8")).hexdigest()
+        returncode, out, err = run_ssh(target, remote_command(user, container), session_prefix(values) + code_text, timeout)
+        print_capped(out, cap)
+        if err.strip():
+            sys.stderr.write("\n".join(err.splitlines()[:cap]) + "\n")
+        if returncode != 0:
+            raise Stop(f"ssh exited {returncode}", SSH_FAILED)
+        code = OK
+    except Stop as stop:
+        print(f"prod-read: {stop}", file=sys.stderr)
+        code = stop.code
+        if mode == "none" and code == REFUSED:
+            mode = "refused"
+    if log:
+        log_line(log, mode, digest, code)
+    return code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
