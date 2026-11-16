@@ -154,10 +154,19 @@ class SuiteLockTest(HookCase):
         self.start(self.analysis_cmd)
         self.assertBlocks(self.hook("suite-lock", self.bash(self.test_cmd)), "static analysis")
         self.assertBlocks(self.hook("suite-lock", self.bash(f"cd src && {self.test_cmd} --parallel")))
+        for command in (
+            f"{self.test_cmd} 2>&1 | tail -50",
+            f"{self.test_cmd} > out.txt",
+            f"{self.test_cmd} >> out.txt 2> err.txt",
+            f"{self.test_cmd} --processes 4 2>&1 | tee out.txt",
+        ):
+            with self.subTest(command=command):
+                self.assertBlocks(self.hook("suite-lock", self.bash(command)), "static analysis")
 
     def test_static_analysis_while_full_suite_runs_exits_2(self):
         self.start(self.test_cmd)
         self.assertBlocks(self.hook("suite-lock", self.bash(self.analysis_cmd)), "test suite")
+        self.assertBlocks(self.hook("suite-lock", self.bash(f"{self.analysis_cmd} 2>&1 | tail -50")), "test suite")
 
     def test_filtered_suite_or_nothing_running_exits_0(self):
         self.assertAllows(self.hook("suite-lock", self.bash(self.test_cmd)))
@@ -169,6 +178,8 @@ class SuiteLockTest(HookCase):
         self.start(self.analysis_cmd)
         self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} --filter=InvoiceTest")))
         self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} tests/Feature/InvoiceTest.php")))
+        self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} --filter InvoiceTest > out.txt")))
+        self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} tests/Feature 2>&1 | tail -50")))
         self.assertAllows(self.hook("suite-lock", self.bash("git status")))
 
 

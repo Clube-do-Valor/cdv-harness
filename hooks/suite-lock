@@ -39,14 +39,48 @@ def match_at(words, wanted):
     return -1
 
 
-def unfiltered(rest):
-    """True when what follows the test command selects nothing: no path, no filter."""
-    for word in rest:
-        if word in SHELL_OPERATORS:
+REDIRECT = re.compile(r"^\d*(?:&>>|&>|>>&?|>&|>\||<<<|<<-?|<>|<&|>|<)(.*)$")
+PATH_LIKE = re.compile(r"[/\\]|::|\.[A-Za-z][A-Za-z0-9]*$")
+
+
+def selects(word):
+    """True when a positional word names a test path (a file, a directory or `File::test`)."""
+    return bool(PATH_LIKE.search(word)) or os.path.exists(word)
+
+
+def unfiltered(rest, filter_options=()):
+    """True when what follows the test command selects nothing: no path, no filter.
+
+    It stops at a shell operator, skips a redirection with its target (`> out.txt`, `2>&1`), and
+    counts as a filter only a filter option (also those of `cmd_test_backend_filter`) or a word that
+    names a path: an option's value (`--processes 4`) selects nothing."""
+    options = FILTER_OPTIONS + tuple(filter_options)
+    index = 0
+    while index < len(rest):
+        word = rest[index]
+        index += 1
+        if word in SHELL_OPERATORS or word in h.OPERATORS:
             break
-        if not word.startswith("-") or word.startswith(FILTER_OPTIONS) or word == "-k":
+        if word.isdigit() and index < len(rest) and REDIRECT.match(rest[index]):
+            continue  # the file descriptor of `2>&1` or `2> err.txt`
+        redirect = REDIRECT.match(word)
+        if redirect:
+            if not redirect.group(1):
+                index += 1  # the redirection's target is the next word
+            continue
+        if word.startswith(options) or word == "-k":
+            return False
+        if not word.startswith("-") and selects(word):
             return False
     return True
+
+
+def filter_options_of(profile, test):
+    """The options `cmd_test_backend_filter` adds after the test command (`--filter`)."""
+    words = words_of(h.setting(profile, "cmd_test_backend_filter") or "")
+    if words[: len(test)] != test:
+        return ()
+    return tuple(w.split("=", 1)[0] for w in words[len(test) :] if w.startswith("-") and len(w) > 1)
 
 
 def process_table():
@@ -106,14 +140,14 @@ def inside(path, root):
         return False
 
 
-def running(wanted, full_only, table, skip, root):
+def running(wanted, full_only, table, skip, root, filter_options=()):
     """The pid of a process in this repository that runs `wanted` (unfiltered when full_only)."""
     for pid, (_ppid, args, cwd) in sorted(table.items()):
         if pid in skip:
             continue
         words = [w[2:] if w.startswith("./") else w for a in args for w in a.split()]
         end = match_at(words, wanted)
-        if end < 0 or (full_only and not unfiltered(words[end:])):
+        if end < 0 or (full_only and not unfiltered(words[end:], filter_options)):
             continue
         place = cwd_of(pid, cwd)
         if (place and inside(place, root)) or any(str(root) in a for a in args):
@@ -129,10 +163,11 @@ def main(tool, tool_input, profile):
     command = tool_input.get("command")
     if not test or not analysis or not isinstance(command, str):
         return h.ALLOW, ""
+    options = filter_options_of(profile, test)
     starts_suite = starts_analysis = False
     for segment in h.segments(command):
         words = [w[2:] if w.startswith("./") else w for w in h.command_words(segment)]
-        if words[: len(test)] == test and unfiltered(words[len(test) :]):
+        if words[: len(test)] == test and unfiltered(words[len(test) :], options):
             starts_suite = True
         if words[: len(analysis)] == analysis:
             starts_analysis = True
@@ -150,7 +185,7 @@ def main(tool, tool_input, profile):
                 "the tests with a filter (profile.cmd_test_backend_filter)."
             )
     if starts_analysis:
-        pid = running(test, True, table, skip, root)
+        pid = running(test, True, table, skip, root, options)
         if pid:
             return h.BLOCK, (
                 f"suite-lock: the full backend test suite is running in this repository (pid {pid}); the "
