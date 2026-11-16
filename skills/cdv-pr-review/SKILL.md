@@ -211,7 +211,7 @@ After the verification gate passes, read every `<review dir>/raw/*.json`:
 ## Hand-off
 
 - "vamos consertar" / "aplica os fixes" / "check each finding and act" → `cdv-apply-review` with the review directory as input (per-finding triage + commits).
-- A fix that grows beyond finding-sized (new feature scope, schema change) → `cdv-plan-feature`.
+- A fix that grows beyond finding-sized (new feature scope, schema change) → `cdv-kickoff`.
 - "finaliza" → `cdv-finalize`.
 - Otherwise stop: the user pastes the comments on the PR host manually.
 

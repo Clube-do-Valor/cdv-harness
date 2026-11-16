@@ -1,6 +1,6 @@
 # Naming Language — One Language In Code
 
-Behavioral rule, not a style preference. Read before naming any file, symbol, column or route.
+Behavioral rule, not a style preference. Read before naming any file, symbol, column or route. Shared reference, vendored to `.claude/harness/references/`; the repository's own examples live in `<profile.extension_dir>/references/naming-language.md` when it has them.
 
 **One concept, one name, one language.** Mixed-language identifiers are always prohibited — there is no threshold, no "established term" exception, no per-module dialect.
 
@@ -12,7 +12,7 @@ Behavioral rule, not a style preference. Read before naming any file, symbol, co
 
 The reason is not purity: a codebase where a term in the UI language and its translation both name the same concept has no ubiquitous language, so `grep` misses half the call sites and every new contributor has to learn which half of the domain is translated.
 
-The examples below use German as a stand-in for `profile.language_ui` and English as `profile.language_code`; the extension carries the repository's own.
+The examples below use German as a stand-in for `profile.language_ui` and English as `profile.language_code`; the repository's note carries its own.
 
 ---
 

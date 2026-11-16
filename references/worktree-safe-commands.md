@@ -1,6 +1,6 @@
 # Worktree-safe commands
 
-Load when the session is isolated in a worktree (large tier, Step 0). When the session runs under a command guard (the extension says whether it does), the guard checks every Bash call of a worktree-isolated session and **refuses any command it cannot prove stays inside the worktree**. It judges the shape of the command, not its intent. These are the shapes that pass and the ones that do not.
+Shared reference, vendored to `.claude/harness/references/`. Load it when the session is isolated in a worktree (the run profile says `workspace: worktree`). When the session runs under a command guard (the repository's note `<profile.extension_dir>/references/worktree-safe-commands.md` says whether it does), the guard checks every Bash call of a worktree-isolated session and **refuses any command it cannot prove stays inside the worktree**. It judges the shape of the command, not its intent. These are the shapes that pass and the ones that do not.
 
 ## Refused shapes
 
@@ -27,6 +27,6 @@ Load when the session is isolated in a worktree (large tier, Step 0). When the s
 3. Need to script git? Write the script to the worktree with `Write`, then run it by literal path — or do one `git` per call.
 4. When the guard refuses, do not retry the same shape with cosmetic changes; pick a passing shape from this page.
 
-## Small tier does not need this page
+## A run on the main checkout does not need this page
 
-Small-tier work (≤ ~3 files, no migration, no new screen) runs on the main checkout after `profile.bring_branch_script` confirmed no other session's WIP is there — no worktree, no guard, the container prefix (`profile.cmd_container_exec`) works as usual.
+A run with `workspace: main` (small work: ≤ ~3 files, no migration, no new screen, and a free main checkout) runs on the main checkout after `profile.bring_branch_script` confirmed no other session's WIP is there — no worktree, no guard, the container prefix (`profile.cmd_container_exec`) works as usual.

@@ -1,6 +1,6 @@
 ---
 name: cdv-research-round
-description: Run a research round — survey the state of the art, the code and the usage evidence for a feature or idea through subagents — inside one folder on disk that holds a README, every subagent's output and the synthesis, tied to a task in the task tracker. Triggers on "rodada de pesquisa", "pesquisa essa feature", "levanta o estado da arte", "/cdv-research-round". Do NOT use to interview the user about decisions (`cdv-grilling`), to plan or implement a feature (`cdv-plan-feature`), or to debug (`cdv-debug`).
+description: Run a research round — survey the state of the art, the code and the usage evidence for a feature or idea through subagents — inside one folder on disk that holds a README, every subagent's output and the synthesis, tied to a task in the task tracker. Triggers on "rodada de pesquisa", "pesquisa essa feature", "levanta o estado da arte", "/cdv-research-round". Do NOT use to interview the user about decisions (`cdv-grilling`), to plan or implement a feature (`cdv-kickoff`), or to debug (`cdv-debug`).
 metadata:
   version: 0.1.0
   owner: augusto-henriques

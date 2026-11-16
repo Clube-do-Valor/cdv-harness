@@ -72,7 +72,7 @@ New tables ship with the minimum affordances the use case names — nothing spec
 
 ### Language
 
-Canonical rule: [naming-language.md](../cdv-plan-feature/references/naming-language.md). Frontend specifics:
+Canonical rule: [naming-language.md](../../harness/references/naming-language.md). Frontend specifics:
 
 - Product-facing **text**: `profile.language_ui` — labels, placeholders, empty states, error messages, tooltips, and the values in the translation files. The translation **keys** are in `profile.language_code`.
 - Everything an engineer types: `profile.language_code` — component filenames, props, emits, composables, types, functions, variables, test names, Inertia prop names.

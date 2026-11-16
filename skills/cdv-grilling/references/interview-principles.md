@@ -1,6 +1,6 @@
 # Interview principles — the shared rules for asking
 
-Loaded by `cdv-grilling` before its first question and by `cdv-plan-feature` Step 5 (through `references/question-rounds.md`). One file, two consumers: the rules that make a question cost the user a keystroke instead of a turn are the same in an open interview and in a planning Q&A. This file lives inside `cdv-grilling/` because that skill is installed on its own, per user, and must carry its references with it.
+Loaded by `cdv-grilling` before its first question, and read by `cdv-kickoff` before its question screen. The rules that make a question cost the user a keystroke instead of a turn are the same in an open interview and in a planning Q&A. This file lives inside `cdv-grilling/` because that skill is installed on its own, per user, and must carry its references with it.
 
 ## Classification — what to ask, what to skip
 

@@ -6,7 +6,7 @@ description: >
   anchors, _summary.md + INDEX.md). Triggers on 'revise esse PR', 'gera os comentários do code review',
   'review my branch before I open the PR'. Read-only — never edits source, never posts. Do NOT use for
   the multi-agent protocol ("review PR with subagents" → cdv-pr-review), debugging (cdv-debug),
-  planning (cdv-grilling/cdv-plan-feature), or PR/commit generation (cdv-finalize).
+  planning (cdv-kickoff/cdv-grilling), or PR/commit generation (cdv-finalize).
 metadata:
   version: 0.1.0
   owner: augusto-henriques
@@ -14,7 +14,7 @@ metadata:
 
 # Code Review
 
-Generates grounded, paste-ready inline-comment files for a feature branch. Read-only by design — sits between implementation (`cdv-plan-feature` execution / `cdv-finalize`) and the human opening the PR on the host.
+Generates grounded, paste-ready inline-comment files for a feature branch. Read-only by design — sits between implementation (the builder of a `cdv-kickoff` run / `cdv-finalize`) and the human opening the PR on the host.
 
 **Two destinations for the output — feeding `cdv-apply-review` is the common one.** The review directory (`<profile.pr_review_dir_prefix><TICKET>/` at the repo root; "the review directory" below) is most often consumed by `cdv-apply-review` (triage + fixes on the implementation branch); pasting the files as PR comments is optional. The typical rhythm for risky or large implementations: implement in one session → run this review in a **fresh session** (a reviewer without the implementer's context and biases) → back in the execution session (the same one that implemented), run `cdv-apply-review` referencing the generated directory.
 
@@ -30,7 +30,7 @@ Host-specific steps (reading a PR by number, pasting the comments) are in `refer
 - **Read-only.** Never edits source, never pushes, never posts to the PR host. The only writes are the comment files under the review directory at repo root. Facts may be probed with read-only one-line REPL queries (`profile.cmd_tinker`, `--execute` style), never writes; a probe longer than one line is asked for first.
 - **Pre-existing review directory = ask, never overwrite.** If the review directory already exists (this skill's or `cdv-pr-review`'s output), load its findings as existing comments and ask whether this run is a *continuation* (only new findings, skip covered `{path,line}`) or a *re-review* (archive the old directory to `<profile.pr_review_dir_prefix><TICKET>-prev/` first). Silently clobbering the other skill's output is forbidden.
 - **Evidence over hypothesis.** Every cited `file:line` is verified against the real source via [scripts/verify-anchors.sh](scripts/verify-anchors.sh) before any comment file is written. Wrong line = wrong comment.
-- **Repo conventions are the judgement basis.** The repository's instructions file (`profile.instructions_file`, already in context), and the path rules in [.claude/rules/](../../rules/) whose `paths:` match the diff — area cards (`profile.area_cards_glob`) included. Read the matching rule files explicitly: a rule loads on its own only when a matching file is read, and a review starts from the diff. Generic framework idioms are not the standard — these are.
+- **Repo conventions are the judgement basis.** The repository's instructions file (`profile.instructions_file`, already in context), and the path rules under `.claude/rules/` whose `paths:` match the diff — area cards (`profile.area_cards_glob`) included. Read the matching rule files explicitly: a rule loads on its own only when a matching file is read, and a review starts from the diff. Generic framework idioms are not the standard — these are.
 - **Findings as facts, not weighed choices.** Each `Fix sugerido:` is a single recommendation backed by a doc, commit, or PR reference. No A/B menus.
 - **Tests in the same PR is a hard rule.** New behavior/wiring/validation/API surface without tests in this branch is `⚠️ Potential issue | 🔴 High`. "Tests in follow-up PR" is a blocker, never a nitpick.
 - **PII discipline.** PII over-fetch or PII in logs/payloads is `⚠️ Potential issue` (security). Never echo an end user's personal data in the comment prose — use placeholders or local-id refs. An e-mail address used as a work identifier (to name the account in a reproduction) is written in clear; other personal data stays masked.
@@ -49,7 +49,7 @@ Host-specific steps (reading a PR by number, pasting the comments) are in `refer
 
 - The user asks for the **multi-agent protocol** ("cdv-pr-review", "review PR with subagents", "multi-agent code review") → use `cdv-pr-review`. This skill is the single-pass lane; both emit the same review-directory format.
 - Bug investigation from a stack trace, error-tracker issue, or application log → use `cdv-debug`.
-- Planning a not-yet-implemented feature → use `cdv-grilling` (decisions) → `cdv-plan-feature` (plan).
+- Planning a not-yet-implemented feature → start it with `cdv-kickoff` (decisions in `cdv-grilling`, the plan in `tlc-spec-lean`).
 - Generating the PR description or atomic commits → use `cdv-finalize`.
 - Implementing fixes from this review's findings → hand off to `cdv-apply-review` (Step 10). Never edit source from inside this skill.
 - Auto-posting to the PR host — out of scope by design. The user pastes manually or runs the API path themselves.
@@ -63,7 +63,7 @@ Confirm the current branch is a feature branch (a prefix from `profile.branch_pr
 - If on `profile.default_branch` or any protected branch: refuse and ask the user to switch first. This skill reviews work that is already on a feature branch; it never creates one.
 - Otherwise: resolve the ticket id with [scripts/resolve-ticket-id.sh](scripts/resolve-ticket-id.sh), which extracts a key matching `profile.ticket_key_pattern` from the branch name and falls back to a positional override. If neither resolves, ask the user once for the ticket id before any other step.
 
-**Whose branch is it?** Ask once, in the same turn as the ticket id when that is asked: *"Branch sua (tem sessão que implementou) ou de terceiro (PR de outra pessoa)?"* Skip the question when the answer is evident from the conversation (the user names the author, or this session's history shows the implementation). The answer changes Step 10: a third-party branch gets the comment files and the chat explanation, and is **never** routed to `cdv-apply-review` — that skill only makes sense when a session that implemented the branch exists to triage and commit on it. Record the answer for Step 10.
+**Whose branch is it?** Ask once, in the same turn as the ticket id when that is asked: *"Branch sua (tem sessão que implementou) ou de terceiro (PR de outra pessoa)?"* Skip the question when the answer is evident from the conversation (the user names the author, or this session's history shows the implementation). The answer changes Step 10: on a colleague's branch, applying the findings on that branch is offered as an option beside pasting the comments, and nothing is pushed to that branch before the user says so. Record the answer for Step 10.
 
 ### Step 1 — Load base context (always, parallel)
 
@@ -171,8 +171,8 @@ Write the comment files under the review directory at repo root (untracked, like
 
 Then route by intent — **but first by ownership** (Step 0):
 
-- **Third-party branch:** the deliverable is the comment files and the explanation above. Do not offer `cdv-apply-review` (there is no implementing session to triage on). If the user wants a fix applied anyway, treat it as a new request outside this skill: a fresh branch from the remote branch, with the user deciding whether to push over the author's branch.
-- **Own branch:** "vamos consertar X" / "aplica esse fix" / "implementa as correções" / "check each finding and act" → hand off to `cdv-apply-review` with the review directory as input (per-finding triage + commits on the same branch). Only a fix that outgrows finding size (new feature scope, schema change) routes to `cdv-plan-feature`.
+- **A colleague's branch (third party):** offer the two options in one question: apply the findings on that branch (a worktree on the PR branch, `cdv-apply-review` with the review directory as input, one commit per finding, then QA) or paste the comment files on the host. Applying is an option, never a refusal. Ask before pushing to that branch — it is the author's — and never post to the PR unless asked.
+- **Own branch:** "vamos consertar X" / "aplica esse fix" / "implementa as correções" / "check each finding and act" → hand off to `cdv-apply-review` with the review directory as input (per-finding triage + commits on the same branch). Only a fix that outgrows finding size (new feature scope, schema change) routes to `cdv-kickoff`.
 - "finaliza" / "wrap up" → hand off to `cdv-finalize`.
 - "investiga isso" / pasted stack trace → hand off to `cdv-debug`.
 - Otherwise: stop. The user pastes the comments and continues on the host.
@@ -197,4 +197,4 @@ The canonical template, field rules, and anti-patterns live in [references/comme
 - **Never echo an end user's personal data** (national id number, full name with surname, personal e-mail, phone, address, ID document, birth date, and the fields the extension lists) in the comment prose. Use placeholders or local-id refs. (An e-mail address used as a work identifier is the one exception, per the PII principle above.)
 - **Never auto-post to the PR host.** API posting is out of scope by design.
 - **One finding per file.** Consolidated documents do not paste correctly into the host's comment editor.
-- **Never edit source code.** Hand off to `cdv-plan-feature` for any fix work.
+- **Never edit source code.** Hand off to `cdv-apply-review` for the findings, or to `cdv-kickoff` for larger fix work.

@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Removed skills:** `cdv-plan-feature`, `cdv-flows` and `cdv-interactive-qa`. `sync` deletes them from each repository. Planning is `tlc-spec-lean`, started by `cdv-kickoff`; the browser QA is `cdv-qa`. A consumer moves what its extension files for the three skills held, and drops every pointer to them from its instructions file, rules and skills index.
+- **Shared references:** `references/naming-language.md`, `module-opt-in.md`, `production-safety.md`, `worktree-safe-commands.md` and the new `qa-fixtures.md` are vendored to `.claude/harness/references/`. A repository's own notes for one of them live in `<extension_dir>/references/<name>.md` (the headings "Module opt-in", "Production safety" and "QA authoring" of the extension of the removed planning skill move there).
+- **`tlc-spec-lean` is vendored into repositories again** (`"vendor": false` removed from `third-party.json`), so a child on any account loads it from the checkout; `sync --user` still installs it per user.
+- **Hooks:** `hooks/require-model`, `hooks/prod-ssh` and `hooks/suite-lock` are vendored to `.claude/harness/hooks/`, and `sync` merges `settings/hooks-core.json` into `.claude/settings.json` under `hooks.PreToolUse` (the repository's own hooks stay; an entry the core drops is removed). The lock records the merged entries under the new key `hooks`; `schema` stays `1` and `verify.sh` is unchanged.
+- `sync` vendors every `bin/` script but `harness` to `.claude/harness/bin/` (for `prod-read`).
+- The house block no longer asks whether to search the docs before a feature or whether to update documentation after one: search first, always; every child names its model from the role table; Fable only when the user names it; plan with `tlc-spec-lean`; start a feature with `cdv-kickoff`.
+- `profile.schema.yaml`: the role lines (`role_orchestrator` … `role_judge`), the key families `account_<name>` and `model_<alias>`, `delegate_tool`, the `prod_*` keys, `qa_side_stack_script`, `qa_test_marker` and the three `ticket_status_*` keys, all optional.
+- `release --adjust` cuts the next patch tag inside the 7-day window of the last tag.
+- The core deny list also covers `.claude/harness/hooks/`, `.claude/harness/references/` and `.claude/skills/tlc-spec-lean/`.
 - `sync` also stages `.claude/harness/profile.yaml` with `git add -f`, so a repository that ignores `.claude/` commits its profile with the first sync. `profile.local.yaml` stays out of git.
 
 ## v0.2.1
