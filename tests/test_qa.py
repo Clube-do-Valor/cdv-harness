@@ -93,6 +93,19 @@ class QaReportTest(RunFolderCase):
             self.assertRegex(line, rf"\b{result}\b")
             self.assertRegex(line, r"!\[[^\]]*\]\(" + re.escape(path) + r"\)")
 
+    def test_render_encodes_a_screenshot_path_with_a_space_or_a_parenthesis(self):
+        spaced = self.shot("Screenshot 2026-11-16 at 10.00.00.png")
+        paren = self.shot("step (2).png")
+        self.assertEqual(self.step(what="Open the list", screenshot=spaced).returncode, 0)
+        self.assertEqual(self.step(what="Click Export", screenshot=paren).returncode, 0)
+        proc = script("qa_report.py", "render", "--root", self.root)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        first, second = [line for line in proc.stdout.splitlines() if line.strip()]
+        self.assertTrue(
+            first.endswith("![step 1](RUN-invoice-export/shots/Screenshot%202026-11-16%20at%2010.00.00.png)"), first
+        )
+        self.assertTrue(second.endswith("![step 2](RUN-invoice-export/shots/step%20%282%29.png)"), second)
+
     def test_add_refuses_a_screenshot_that_does_not_exist(self):
         proc = self.step(screenshot="RUN-invoice-export/shots/missing.png")
         self.assertEqual(proc.returncode, 2)

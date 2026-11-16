@@ -14,6 +14,7 @@ Exit 0, 2 on a missing or bad field or when no work folder is found.
 import argparse
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -55,13 +56,18 @@ def add(args):
     print(f"step {len(steps)} recorded: {step['result']} - {step['what']}")
 
 
+def link(path):
+    """The path as a Markdown link destination: spaces, parentheses and other unsafe characters encoded."""
+    return quote(path, safe="/:@!$&'*+,;=-._~")
+
+
 def render(args):
     steps = read_list(work_folder(args.root, args.dir, args.run) / REPORT)
     for number, step in enumerate(steps, start=1):
         note = f" ({step['note']})" if step.get("note") else ""
         print(
             f"{number}. {step['what']} - expected: {step['expected']} - result: **{step['result']}**{note} "
-            f"![step {number}]({step['screenshot']})"
+            f"![step {number}]({link(step['screenshot'])})"
         )
 
 

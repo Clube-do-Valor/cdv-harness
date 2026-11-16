@@ -127,7 +127,7 @@
       "owner": "augusto-henriques",
       "description": "Browser QA of a feature branch, run by the agent itself - open the local application (or the worktree's side stack), do each step the plan promises the way a user would, take a screenshot of what it saw, record every step with qa_report.py and put the rendered list in the final report; external test records are registered in qa_manifest.py before they are created, named with the repository's test marker and deleted at the end. A step-by-step mode hands each step to the developer instead. Triggers on the `qa` stage of a cdv-kickoff run, \"testa no navegador\", \"faz o QA\", \"run the browser QA\", \"test it in Chrome\". Do NOT use for writing unit or feature tests (the builder's work), for a design judgement of a screen (the repository's design skill), for a production smoke test (never), or for code review (cdv-code-review).",
       "path": "skills/cdv-qa",
-      "contentHash": "1372d4413e26de4164613a62ca226c36919218e7a296a1d6b089cf012916d208"
+      "contentHash": "792d324e82b5e3ba09f1ab77a6f6c28baaadecc1a69aaa671ec1402076ed8652"
     },
     {
       "name": "cdv-research-round",
