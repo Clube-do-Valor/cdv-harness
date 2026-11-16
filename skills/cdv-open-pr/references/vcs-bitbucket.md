@@ -21,7 +21,7 @@ Read when `profile.vcs_host` is `bitbucket`. `profile.pr_cli` is the bundled cli
 | read a PR back | `bb pr view <N>` |
 | list PRs | `bb pr list [--state OPEN\|MERGED\|DECLINED]` |
 | comment (only when the user asks to post) | `bb pr comment <N> --body-file <f>` |
-| CI status of a branch | `bb pipelines --branch <branch>` |
+| CI status of a branch | `bb pipelines --branch <branch>`; the steps of build N: `bb pipelines --steps N` |
 | mention a person in a description | `bb mention <name>` → the `@{account_id}` markup |
 
 ## Fallback without a token — Claude in Chrome

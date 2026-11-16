@@ -47,7 +47,7 @@
       "owner": "augusto-henriques",
       "description": "Finalize a feature branch — ephemeral `<slug>-pr.md` at repo root (lean PR format, never committed), atomic conventional commits with inferred scope, branch guard, state report, then the push and the pull request opened (or updated) through `cdv-open-pr` at wrap-up (never merges). Triggers on \"finaliza essa feature\", \"wrap up this branch\", \"gera o PR description e os commits\", \"comita isso e prepara o PR\". Do NOT use for planning unimplemented work (cdv-kickoff), PRD/PROGRESS artifacts, or merging.",
       "path": "skills/cdv-finalize",
-      "contentHash": "e0f92083e78588c39ea5685fecdf08721e326c87a5774fc41f11d44170b4b1d2"
+      "contentHash": "09a84c1485ffed8de2b47eca4ba3d88c506850e8645f7fc41ef20ba8ad6fe226"
     },
     {
       "name": "cdv-frontend",
@@ -87,15 +87,15 @@
       "owner": "augusto-henriques",
       "description": "Start a feature or a fix larger than a one-liner with one command - read the request (a card link, a chat thread, a brief) and the repository, propose the run profile through its scripts (track small/medium/big, mode, chain, workspace, roles, optional steps), ask one question screen for medium and big work and none for small, write and validate the run profile, then run the chain (grilling, tlc-spec-lean plan, build and Verifier, review, fixes, browser QA, PR, pipeline, card) with no prompt per stage, stopping only where the profile says. Triggers on \"start this feature\", \"kickoff\", \"/cdv-kickoff\", \"começa essa feature\", \"vamos fazer esse card\", or a hand-off from cdv-debug or cdv-grilling. Do NOT use for a pure root-cause investigation with no build (cdv-debug), an open interview (cdv-grilling), a review of an existing branch (cdv-code-review), or a factory run (cdv-factory-small-feature).",
       "path": "skills/cdv-kickoff",
-      "contentHash": "675c9972862ca0c05a846323db8d1cccaf1c34975c886d05fefd142ceaf3f704"
+      "contentHash": "093b0789d8ec23fd019c3f95cd58be661edf75403c9776e83ef862fa2769edc1"
     },
     {
       "name": "cdv-notion-ticket",
       "version": "0.1.0",
       "owner": "augusto-henriques",
-      "description": "Write the business-facing delivery note on a feature's Notion card — short pt-BR delivery-note layout (TL;DR callout, Antes/Agora table, como usar, próximos passos with the PR link) grounded in the branch's real diff, written into the card through the Notion MCP after the user confirms the draft. Sits beside cdv-finalize — that one produces the technical PR description; this one produces the business delivery description (Notion). Triggers on \"gera o ticket da entrega\", \"descrição pra o card do Notion\", \"nota de entrega\", \"delivery note\", \"o que escrevo no ticket dessa feature\". Do NOT use for the PR description (cdv-finalize), bug-analysis Notion blocks (cdv-debug Step 8 owns the Análise técnica template), or planning artifacts.",
+      "description": "Write the business-facing delivery note on a feature's Notion card — short pt-BR delivery-note layout (TL;DR callout, Antes/Agora table, como usar, próximos passos with the PR link) grounded in the branch's real diff, written into the card through the Notion MCP after the user confirms the draft (inside a cdv-kickoff run, without the question); once the PR exists the card follows the layout of the project's three most recent cards, links the PR both ways and moves to the PR-open status. Sits beside cdv-finalize — that one produces the technical PR description; this one produces the business delivery description (Notion). Triggers on \"gera o ticket da entrega\", \"descrição pra o card do Notion\", \"nota de entrega\", \"delivery note\", \"o que escrevo no ticket dessa feature\". Do NOT use for the PR description (cdv-finalize), bug-analysis Notion blocks (cdv-debug Step 8 owns the Análise técnica template), or planning artifacts.",
       "path": "skills/cdv-notion-ticket",
-      "contentHash": "c018dd444ade653ce2cc71b5226e19d479669ee780f511a03ed28b8b2dadbfd7"
+      "contentHash": "0fefaeda434c8074deab1de99e6e4ee3cee37e986c45d09e83a276f52537bef2"
     },
     {
       "name": "cdv-open-pr",
@@ -103,7 +103,7 @@
       "owner": "augusto-henriques",
       "description": "Open or update the pull request of a branch through the host's API (`profile.pr_cli`, the bundled `bb` client for Bitbucket or `gh` for GitHub) — conventional title, the finalize description plus the `🏷️ Ticket` section with the ticket hyperlinked, the default reviewers, close-source-branch. Called by `cdv-finalize` Step 9 right after the push; triggers on its own on \"abre o PR\", \"open the PR\", \"abre os PRs dos workers\", \"atualiza a descrição do PR\", \"comenta no PR\". Claude in Chrome only as the fallback when the developer has no token and does not want to create one now; do NOT use to merge, approve or decline.",
       "path": "skills/cdv-open-pr",
-      "contentHash": "dbf82748f5acb97b4137dba33eb254a647d80ab33a73dbb2cf6f1a523b886136"
+      "contentHash": "67afd0eb8d70c936c068e34c8c0683a17446adc69c801844928ec39dd7cf3b47"
     },
     {
       "name": "cdv-pr-review",
@@ -128,6 +128,14 @@
       "description": "Run a research round — survey the state of the art, the code and the usage evidence for a feature or idea through subagents — inside one folder on disk that holds a README, every subagent's output and the synthesis, tied to a task in the task tracker. Triggers on \"rodada de pesquisa\", \"pesquisa essa feature\", \"levanta o estado da arte\", \"/cdv-research-round\". Do NOT use to interview the user about decisions (`cdv-grilling`), to plan or implement a feature (`cdv-kickoff`), or to debug (`cdv-debug`).",
       "path": "skills/cdv-research-round",
       "contentHash": "c9111d7729bc300b0941d00d0caa4cd27439c1a0892820bd23560cc1bdeff7a6"
+    },
+    {
+      "name": "cdv-rollout",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "After a pull request is merged or deployed - move the card to the status of that event, then list the production steps the deploy does not run by itself (migrations run by hand, configuration, backfills, flags, a worker restart, a data fix) and take the developer through them one per question, each read through cdv-prod and each write through its protocol. Triggers on \"mergeou\", \"merged\", \"foi pro ar\", \"deployed\", \"subiu em produção\", \"o que falta em produção?\", \"rollout dessa feature\". Do NOT use to merge, tag or deploy (the developer does that, or says so explicitly), before the pull request exists (cdv-finalize), or for an investigation in production (cdv-debug with cdv-prod).",
+      "path": "skills/cdv-rollout",
+      "contentHash": "e62be31b8c3f95f35224561775393ddb8d17307499d9960b8f56b0e2276f4309"
     },
     {
       "name": "create-adr",

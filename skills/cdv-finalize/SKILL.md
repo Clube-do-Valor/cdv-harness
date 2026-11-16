@@ -240,6 +240,7 @@ After the last commit, regenerate the `<slug>-pr.md` body against `git log --one
 
 1. `git push -u origin <branch>` — feature branches only (a prefix from `profile.branch_prefixes`); on `profile.default_branch`/protected, refuse and point to Step 7. A rejected push (remote has commits the local branch lacks) stops here with the `⚠` bullet below; never `--force`.
 2. Invoke `cdv-open-pr` with `<slug>-pr.md` (it opens the PR through `profile.pr_cli`). With no open PR for the branch it creates one (ticket, title, reviewers) and deletes the file; with an open PR it offers to update the description only when this run added commits — a re-run after QA fixes lands there.
+3. Watch the pipeline of the pushed commit: `python3 .claude/skills/cdv-finalize/scripts/watch_pipeline.py --branch <branch> --timeout 1800` (exit `0` green; `1` red, its last line naming the failed step; `2` `profile.pr_cli` has no pipelines command, so say so and leave the pipeline to the host's page; `3` no end before the timeout). When the pipeline is red, fix the failure it names in the same pull request (a new commit on the same branch, pushed, never a new pull request and never a skipped check) and watch it again, at most twice; then report the status it ended on in the final state report. Inside a `cdv-kickoff` run the fix commit needs no confirmation (the run profile's chain is the authorization); outside one, show it first like any commit plan.
 
 Then print the **final state report**: ONE status line with fixed clauses in fixed order, then one `⚠` bullet per pending action or anomaly. Every clause is still a mandatory check — a clause may only be written after its command ran; any check that is not "ok" leaves the status line and becomes an expanded `⚠` bullet. Never omit a clause silently.
 
@@ -252,6 +253,7 @@ The remote clause comes from `git rev-list --count origin/<branch>..HEAD` after 
 - Guide or card skip recorded in Step 4.5.
 - Stale ephemerals found in Step 2, with the cleanup offer.
 - Push rejected or `origin/<branch>` still behind the local branch — name the count and the consequence: an open PR shows the **old** tree, so approving it merges the pre-commit code and orphans the local commits.
+- Pipeline not green: still red after the two fixes (the failed step and the run), not read (`watch_pipeline.py` exit `2`) or still running at the timeout (exit `3`).
 - Front-end change without a visual QA yet (reported by `cdv-open-pr`).
 - PR opened through the token fallback of `cdv-open-pr` (Claude in Chrome, Bitbucket only) because there was no credential — with the one-line recommendation to run `<profile.pr_cli> auth login` before the next PR.
 
@@ -259,7 +261,7 @@ The remote clause comes from `git rev-list --count origin/<branch>..HEAD` after 
 
 When the QA already ran, ask (AskUserQuestion): *"QA feito — posso apagar o `QA-<slug>.md` e o `STATE-<slug>.md`?"* with options **apagar** / **manter por enquanto**. On "manter", remind that they must never be committed.
 
-Beyond the push, the PR through `cdv-open-pr` and the optional `rm`, no further git writes; never merge.
+Beyond the push, the PR through `cdv-open-pr`, the pipeline fixes of Step 9 item 3 and the optional `rm`, no further git writes; never merge.
 
 ## Examples
 
@@ -332,4 +334,5 @@ Solution: prefer the spelling that appears most recently in `profile.default_bra
 ## Bundled scripts
 
 - [scripts/branch-from-master.sh](scripts/branch-from-master.sh) — fetch `origin/<profile.default_branch>` and check out a new branch from it. Aborts if the branch already exists. Used in Step 7 when the current branch is not a feature branch.
+- [scripts/watch_pipeline.py](scripts/watch_pipeline.py) — waits for the pipeline of the branch's commit through `profile.pr_cli` and exits `0` green, `1` red with the failed step, `2` when the client has no pipelines command, `3` at the timeout. Used in Step 9.
 - [scripts/lint-pr-description.sh](scripts/lint-pr-description.sh) — mechanical anti-bloat gate for `<slug>-pr.md`. Exit 0 required before presenting (Step 4) and after the Step 8.5 refresh.

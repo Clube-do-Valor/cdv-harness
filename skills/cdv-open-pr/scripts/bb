@@ -22,6 +22,7 @@ Default destination branch of `pr create`: `default_branch` in .claude/harness/p
   bb pr comment N (--body TEXT | --body-file F)
   bb mention NAME                              the @{account_id} markup that mentions NAME in a description
   bb pipelines [--branch BRANCH]
+  bb pipelines --steps N                       steps of build N: STATE<tab>RESULT<tab>name per line
 
 `create` sends close_source_branch and the repository's default reviewers minus yourself (the API
 does not apply them, nor the description template). Descriptions get the Claude Code footer once.
@@ -209,7 +210,7 @@ def main() -> None:
     sub.add_parser('whoami')
     p = sub.add_parser('auth'); p.add_argument('action', choices=['login', 'status', 'logout'])
     p = sub.add_parser('mention'); p.add_argument('name')
-    p = sub.add_parser('pipelines'); p.add_argument('--branch')
+    p = sub.add_parser('pipelines'); p.add_argument('--branch'); p.add_argument('--steps', metavar='BUILD')
     pr = sub.add_parser('pr').add_subparsers(dest='action', required=True)
     p = pr.add_parser('for-branch'); p.add_argument('branch', nargs='?')
     p = pr.add_parser('create')
@@ -232,6 +233,14 @@ def main() -> None:
         if len(matches) != 1:
             sys.exit(f"{len(matches)} matches for {args.name!r} among recent PR authors and reviewers")
         print(f"@{{{matches[0]['account_id']}}}")
+    elif args.cmd == 'pipelines' and args.steps:
+        found = call('GET', '/pipelines/?sort=-created_on&pagelen=50').get('values', [])
+        run = next((r for r in found if str(r.get('build_number')) == args.steps.lstrip('#')), None)
+        if not run:
+            sys.exit(f'no pipeline #{args.steps} among the 50 newest')
+        for step in call('GET', f"/pipelines/{urllib.parse.quote(run['uuid'])}/steps/").get('values', []):
+            result = (step['state'].get('result') or {}).get('name', '')
+            print(f"{step['state']['name']}\t{result}\t{step.get('name', '')}")
     elif args.cmd == 'pipelines':
         query = '?sort=-created_on&pagelen=5' + (f'&target.branch={args.branch}' if args.branch else '')
         for run in call('GET', f'/pipelines/{query}').get('values', []):

@@ -157,6 +157,7 @@ Rules of the run:
 
 - In `plan-then-build` and `autonomous` mode, when a stage ends, start the next stage at once, without a prompt from the developer: the only waits are the run profile's `stops`.
 - In `step-by-step` mode every stage is a stop: say what the stage did and what the next one will do, and wait for the developer.
+- On a big track, write the approved plan to a page under the project in the ticket system (`profile.ticket_system`, the project the card belongs to), and never add it to a commit: the working copy stays in `.specs/features/<feature>/plan.md`, which git ignores, and the page is updated when the plan changes during the build.
 - When the approved plan lists a one-way door in its `Landing` table, switch the run profile to `builder_role: builder_risk` (and validate it again) before you dispatch the builder.
 - After a Verifier round with findings, a builder or fixer child closes them and `verify` starts again. When `run_status.py start verify` exits `3` and marks the stage `capped` with findings open, write each open item, tagged `defect` or `proof-gap`, into the pull request description and continue to the review.
 - While the developer is away, stop and ask before any step that sends something to a person or a live automation, writes in production or deploys, whatever the mode and whatever the brief says.
