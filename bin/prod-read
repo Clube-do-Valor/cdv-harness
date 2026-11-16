@@ -41,6 +41,8 @@ DEFAULT_READONLY_SQL = "SET SESSION TRANSACTION READ ONLY"
 DEFAULT_ROW_CAP = 200
 DEFAULT_TIMEOUT = 60
 NAME_RE = re.compile(r"^[A-Za-z0-9_.:@-]+$")
+# Docker's `name=` filter matches any part of a name, so the container may be anchored (`^app$`, `^/app$`).
+CONTAINER_RE = re.compile(r"^\^?/?[A-Za-z0-9_.:@-]+\$?$")
 IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # mode -> number of values it takes
 MODES = {"--probe": 1, "--migrate-status": 0, "--failed-jobs": 0, "--job-runs": 1, "--logs": 1}
@@ -275,7 +277,7 @@ def main(argv=None):
             raise Stop("`prod_log` is missing or `none` in the repository profile: every production read is logged", MISSING)
         target = required(values, "prod_ssh_target")
         user = required(values, "prod_exec_user")
-        container = required(values, "prod_app_container")
+        container = required(values, "prod_app_container", CONTAINER_RE)
         cap = number(values, "prod_row_cap", DEFAULT_ROW_CAP)
         timeout = number(values, "prod_timeout_seconds", DEFAULT_TIMEOUT)
         code_text = read_code(root, values, "--" + mode, value, cap)

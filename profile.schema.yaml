@@ -319,7 +319,7 @@ variables:
   prod_app_container:
     type: string
     required: false
-    description: Name filter of the application container on the production host.
+    description: Name filter of the application container on the production host. Docker matches any part of a name, so anchor it (`^app$`) when another container's name contains it; only letters, digits, `_.:@-`, a leading `^` and `/`, and a trailing `$` are accepted.
   prod_exec_user:
     type: string
     required: false

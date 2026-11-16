@@ -105,6 +105,24 @@ class ProdReadTest(HarnessTestCase):
         self.assertNotIn("setDefaultConnection", text)
         self.assertEqual(text[len(READONLY):].strip(), self.probe.read_text().strip())
 
+    def test_an_anchored_container_name_lands_literally_in_the_name_filter(self):
+        self.profile(prod_app_container="^acme_app$")
+        proc = self.read("--probe", self.probe, output="12\n")
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        [call] = self.ssh_calls()
+        self.assertEqual(call["argv"], ["prod.example.invalid", DOOR_7.replace("name=acme_app", "name=^acme_app$")])
+        self.assertIn("name=^acme_app$)", call["argv"][1])
+
+    def test_a_container_name_with_a_shell_character_exits_2_without_connecting(self):
+        for value in ("acme_app;id", "acme_app'x", 'acme_app"x', "acme app", "acme_app$(id)", "a$b", "acme_app^", "$acme_app", "acme|app"):
+            with self.subTest(prod_app_container=value):
+                self.profile(prod_app_container=f'"{value}"' if '"' not in value else "'" + value + "'")
+                proc = self.read("--probe", self.probe)
+                self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+                self.assertIn("prod_app_container", proc.stderr)
+                self.assertIn("not a plain name", proc.stderr)
+                self.assertEqual(self.ssh_calls(), [])
+
     def test_readonly_connection_comes_before_the_statement(self):
         self.profile(prod_readonly_connection="mysql_readonly")
         self.assertEqual(self.read("--probe", self.probe).returncode, 0)
