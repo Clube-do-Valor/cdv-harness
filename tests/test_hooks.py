@@ -172,6 +172,9 @@ class SuiteLockTest(HookCase):
             f"{self.test_cmd} --configuration phpunit.xml",
             f"{self.test_cmd} --log-junit report.xml",
             f"{self.test_cmd} --coverage-html build/coverage 2>&1 | tail -50",
+            f"{self.test_cmd} --testdox-xml out.xml",
+            f"{self.test_cmd} --some-future-report out/report.json",
+            f"{self.test_cmd} --log-custom=build/report.log",
         ):
             with self.subTest(command=command):
                 self.assertBlocks(self.hook("suite-lock", self.bash(command)), "static analysis")
@@ -182,7 +185,10 @@ class SuiteLockTest(HookCase):
         self.assertBlocks(self.hook("suite-lock", self.bash(f"{self.analysis_cmd} 2>&1 | tail -50")), "test suite")
         bare.kill()
         bare.wait()
-        for options in (["-c", "phpunit.xml"], ["--log-junit", "report.xml"], ["--coverage-html", "build/coverage"]):
+        for options in (
+            ["-c", "phpunit.xml"], ["--log-junit", "report.xml"], ["--coverage-html", "build/coverage"],
+            ["--testdox-xml", "out.xml"],
+        ):
             with self.subTest(running=options):
                 suite = self.start_waiting(*self.test_cmd.split(), *options)
                 self.assertBlocks(self.hook("suite-lock", self.bash(self.analysis_cmd)), "test suite")
@@ -203,6 +209,11 @@ class SuiteLockTest(HookCase):
         self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} tests/Feature 2>&1 | tail -50")))
         self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} -c phpunit.xml tests/Feature/InvoiceTest.php")))
         self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} --log-junit report.xml --filter InvoiceTest")))
+        self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} Tests/Unit/InvoiceTest::testTotal")))
+        self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} --testdox-xml out.xml --filter InvoiceTest")))
+        self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} tests/Unit")))
+        (self.repo / "modules").mkdir()
+        self.assertAllows(self.hook("suite-lock", self.bash(f"{self.test_cmd} modules")))
         self.assertAllows(self.hook("suite-lock", self.bash("git status")))
 
 
