@@ -603,6 +603,144 @@ class RecordsGuardTest(RepoCase):
         verdict(partial, "records_guard", "check", "PARTIAL")
 
 
+class InstructionPathsTest(RepoCase):
+    """Every path an instruction file names exists, and the list of exceptions only shrinks, judged from git."""
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / "app" / "Billing").mkdir()
+        (self.repo / "app" / "Billing" / "Invoice.php").write_text("<?php\n")
+        self.agents = self.repo / "AGENTS.md"
+        self.agents.write_text("# Rules\n\nThe exporter is `app/InvoiceExporter.php`; the guide is [here](docs/guide.md).\n")
+        self.start = commit(self.repo, "instruction file")
+        self.allow = self.folder / "instruction-paths.allow"
+
+    def paths(self, *args):
+        return run("instruction_paths.py", "--instructions", "AGENTS.md", "--instructions", "docs/", *args, cwd=self.repo)
+
+    def test_a_path_that_does_not_exist_is_refused_and_one_that_does_passes(self):
+        ok = self.paths()
+        self.assertEqual(ok.returncode, 0, ok.stdout)
+        verdict(ok, "instruction_paths", "check", "PASS")
+        self.agents.write_text("# Rules\n\nThe exporter is `app/Gone.php`, see `docs/old-guide.md:12`.\n")
+        bad = self.paths()
+        self.assertEqual(bad.returncode, 1)
+        self.assertIn("NEW    AGENTS.md:3  `app/Gone.php` does not exist", bad.stdout)
+        self.assertIn("`docs/old-guide.md` does not exist", bad.stdout)
+        verdict(bad, "instruction_paths", "check", "FAIL")
+
+    def test_placeholders_links_prose_and_ignored_paths_are_read_as_the_source_reads_them(self):
+        (self.repo / ".gitignore").write_text("vendor/\n")
+        self.agents.write_text(
+            "See `app/<Name>.php`, `app/{a,b}.php`, `$HOME/x/y`, `vendor/autoload.php`, glob `app/*.php`, "
+            "[site](https://example.com/a/b.md), and `app/Missing/*.php`.\n"
+            "Prose mention of app/Index.php and of app/Nowhere/Thing.php.\n"
+            "```sh\nphp app/Billing/Invoice.php app/Billing/Gone.php\n```\n"
+        )
+        listed = [line.split()[1] for line in self.paths("--list").stdout.splitlines() if line.startswith("  AGENTS.md")]
+        self.assertEqual(sorted(listed), ["app/Billing/Gone.php", "app/Missing/*.php", "app/Nowhere/Thing.php"])
+
+    def test_where_paths_resolve_comes_from_the_arguments(self):
+        self.agents.write_text("# Rules\n\nSee `Billing/Missing.php`.\n")
+        self.assertEqual(self.paths().returncode, 0, "no known first folder: not read as a path")
+        known = self.paths("--resolve-from", "app")
+        self.assertEqual(known.returncode, 1)
+        self.assertIn("`Billing/Missing.php`", known.stdout)
+        self.agents.write_text("# Rules\n\nSee `Billing/Invoice.php`.\n")
+        self.assertEqual(self.paths("--resolve-from", "app").returncode, 0)
+
+    def test_instruction_files_and_resolve_from_can_live_in_the_state_folder(self):
+        self.folder.mkdir(parents=True)
+        self.folder.joinpath("instruction-paths.json").write_text(json.dumps({"instructions": ["AGENTS.md"], "resolve_from": ["app"]}))
+        self.agents.write_text("# Rules\n\nSee `Billing/Missing.php`.\n")
+        result = run("instruction_paths.py", "--folder", str(self.folder), cwd=self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("`Billing/Missing.php`", result.stdout)
+
+    def test_the_allow_list_only_shrinks_judged_from_git(self):
+        self.agents.write_text("# Rules\n\n`app/Gone.php` and `app/AlsoGone.php`.\n")
+        base = commit(self.repo, "two dangling references")
+        self.folder.mkdir(parents=True)
+        created = run("instruction_paths.py", "--folder", str(self.folder), "--instructions", "AGENTS.md", "--write-allowlist", cwd=self.repo)
+        self.assertEqual(created.returncode, 0, created.stderr)
+        verdict(created, "instruction_paths", "write-allowlist", "PASS")
+        self.assertEqual(run("instruction_paths.py", "--folder", str(self.folder), "--instructions", "AGENTS.md", "--write-allowlist", cwd=self.repo).returncode, 2, "never overwrites")
+        commit(self.repo, "the commit that creates the list")
+        args = ("--folder", str(self.folder), "--instructions", "AGENTS.md", "--base", base)
+        listed = run("instruction_paths.py", *args, cwd=self.repo)
+        self.assertEqual(listed.returncode, 0, listed.stdout)
+        verdict(listed, "instruction_paths", "check", "PASS")
+
+        self.agents.write_text("# Rules\n\n`app/Gone.php`, `app/AlsoGone.php` and `app/Third.php`.\n")
+        self.allow.write_text(self.allow.read_text() + "AGENTS.md\tapp/Third.php\n")
+        commit(self.repo, "list one more instead of fixing it")
+        grew = run("instruction_paths.py", *args, cwd=self.repo)
+        self.assertEqual(grew.returncode, 1)
+        self.assertIn("GREW   commit", grew.stdout)
+        self.assertIn("app/Third.php", grew.stdout)
+        verdict(grew, "instruction_paths", "check", "FAIL")
+
+        self.agents.write_text("# Rules\n\n`app/Gone.php`.\n")
+        commit(self.repo, "fix two references, leave the list")
+        stale = run("instruction_paths.py", *args, cwd=self.repo)
+        self.assertIn("STALE  AGENTS.md  `app/AlsoGone.php` no longer dangles", stale.stdout)
+
+    def test_a_listed_reference_that_is_fixed_demands_its_removal_and_a_shrink_passes(self):
+        self.agents.write_text("# Rules\n\n`app/Gone.php` and `app/AlsoGone.php`.\n")
+        base = commit(self.repo, "two dangling references")
+        self.folder.mkdir(parents=True)
+        run("instruction_paths.py", "--folder", str(self.folder), "--instructions", "AGENTS.md", "--write-allowlist", cwd=self.repo)
+        commit(self.repo, "list them")
+        self.agents.write_text("# Rules\n\n`app/Gone.php`.\n")
+        self.allow.write_text("\n".join(l for l in self.allow.read_text().splitlines() if "AlsoGone" not in l) + "\n")
+        commit(self.repo, "fix one and shrink the list")
+        result = run("instruction_paths.py", "--folder", str(self.folder), "--instructions", "AGENTS.md", "--base", base, cwd=self.repo)
+        self.assertEqual(result.returncode, 0, result.stdout)
+
+    def test_the_base_comes_from_state_and_without_one_the_run_is_partial(self):
+        self.agents.write_text("# Rules\n\n`app/Gone.php`.\n")
+        commit(self.repo, "one dangling reference")
+        self.folder.mkdir(parents=True)
+        run("instruction_paths.py", "--folder", str(self.folder), "--instructions", "AGENTS.md", "--write-allowlist", cwd=self.repo)
+        commit(self.repo, "list it")
+        args = ("--folder", str(self.folder), "--instructions", "AGENTS.md")
+        partial = run("instruction_paths.py", *args, cwd=self.repo)
+        self.assertEqual(partial.returncode, 4, "the list cannot be judged from git without a base")
+        verdict(partial, "instruction_paths", "check", "PARTIAL")
+        run("refactor_state.py", "--folder", str(self.folder), "init", "--base", self.start, cwd=self.repo)
+        from_state = run("instruction_paths.py", *args, "--base", cwd=self.repo)
+        self.assertEqual(from_state.returncode, 0, from_state.stdout)
+
+    def test_exit_codes_and_the_verdict_line(self):
+        none = run("instruction_paths.py", cwd=self.repo)
+        self.assertEqual(none.returncode, 2, "nothing says which files are instruction files")
+        verdict(none, "instruction_paths", "check", "FAIL")
+        nothing = run("instruction_paths.py", "--instructions", "nowhere/*.md", cwd=self.repo)
+        self.assertEqual(nothing.returncode, 4, "no instruction file matched: nothing was read")
+        verdict(nothing, "instruction_paths", "check", "PARTIAL")
+        unknown = self.paths("--allow", str(self.allow), "--base", "0000000000000000000000000000000000000000")
+        self.assertEqual(unknown.returncode, 0, "no allow file: no history to judge")
+        self.folder.mkdir(parents=True)
+        self.allow.write_text("AGENTS.md\tapp/X.php\n")
+        commit(self.repo, "an allow file")
+        bad = self.paths("--allow", str(self.allow), "--base", "0000000000000000000000000000000000000000")
+        self.assertEqual(bad.returncode, 2)
+        with tempfile.TemporaryDirectory() as outside:
+            elsewhere = run("instruction_paths.py", "--instructions", "AGENTS.md", cwd=outside)
+            self.assertEqual(elsewhere.returncode, 3)
+            verdict(elsewhere, "instruction_paths", "check", "FAIL")
+
+    def test_folders_the_harness_lock_pins_are_copies_of_the_core_and_skipped(self):
+        (self.repo / ".claude").mkdir()
+        (self.repo / ".claude" / "harness.lock").write_text(json.dumps({"paths": [".claude/skills/pinned"]}))
+        (self.repo / ".claude" / "skills" / "pinned").mkdir(parents=True)
+        (self.repo / ".claude" / "skills" / "pinned" / "SKILL.md").write_text("See `app/Gone.php`.\n")
+        commit(self.repo, "a pinned skill")
+        args = ("--instructions", ".claude/skills/")
+        self.assertEqual(run("instruction_paths.py", *args, cwd=self.repo).returncode, 4, "skipped: nothing was read")
+        self.assertEqual(run("instruction_paths.py", *args, "--include-vendored", cwd=self.repo).returncode, 1)
+
+
 class SkillTextTest(unittest.TestCase):
     def test_the_skill_names_its_scripts_and_its_references_exist(self):
         text = (SKILL / "SKILL.md").read_text()
