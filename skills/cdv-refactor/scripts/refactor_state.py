@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Keep the state of a refactor: its phases and slices, in one file a script owns.
 
-    refactor_state.py --folder <state folder> init [--slug <slug>]
+    refactor_state.py --folder <state folder> init [--slug <slug>] [--base <rev>]
     refactor_state.py --folder <state folder> phase add <id> <goal ...>
     refactor_state.py --folder <state folder> phase start|done <id>
     refactor_state.py --folder <state folder> slice add <id> --phase <phase> <title ...>
@@ -19,7 +19,13 @@ done only when none of its slices is still open. `where` prints one line per pha
 `render` writes `LEDGER.md` whole and the block between the `refactor-state` markers of `STATE.md`,
 counting commits and files from git, so that no document carries a number someone typed.
 
-Exit 0 ok, 2 an unknown id or a bad argument, 3 refused.
+Two commits are recorded here so that nobody types them: `init` writes `base` (HEAD, or `--base <rev>`)
+and `phase start` writes the phase's `start` (HEAD). `ratchet.py check --base`, `records_guard.py` and
+`docs_follow_code.py` read the start of the running phase, else `base`, when they are given none.
+Outside a git repository both stay empty.
+
+Last line: `refactor_state <command>: PASS|FAIL - ...`. Exit 0 ok, 2 an unknown id or a bad argument,
+3 refused (a step out of order, a second `init`).
 """
 
 import argparse
@@ -32,6 +38,8 @@ from pathlib import Path
 sys.dont_write_bytecode = True  # nothing written beside the vendored scripts
 
 OK, BAD_INPUT, REFUSED = 0, 2, 3
+TOOL = "refactor_state"
+DASH = "\u2014"
 BEGIN, END = "<!-- refactor-state:begin -->", "<!-- refactor-state:end -->"
 OPEN = ("pending", "running", "built")
 
@@ -42,6 +50,10 @@ class Refused(Exception):
 
 class BadInput(Exception):
     pass
+
+
+def verdict(mode, status, text):
+    print(f"{TOOL} {mode}: {status} {DASH} {text}")
 
 
 def now():
@@ -94,8 +106,12 @@ def cmd_init(folder, args):
     folder.mkdir(parents=True, exist_ok=True)
     if (folder / "state.json").exists():
         raise Refused("state.json already exists")
-    save(folder, {"schema": 1, "slug": args.slug or folder.name, "created": now(), "phases": [], "slices": []})
+    base = args.base or git(folder, "rev-parse", "HEAD")
+    if args.base and git(folder, "rev-parse", "--verify", "-q", f"{args.base}^{{commit}}") is None:
+        raise BadInput(f"{args.base} is not a commit")
+    save(folder, {"schema": 1, "slug": args.slug or folder.name, "created": now(), "base": base, "phases": [], "slices": []})
     print(f"state.json created in {folder}")
+    return f"state.json created, base {base[:12] if base else 'not recorded (no git commit here)'}"
 
 
 def cmd_phase(folder, args):
@@ -112,7 +128,7 @@ def cmd_phase(folder, args):
         if args.action == "start":
             if phase["status"] != "pending":
                 raise Refused(f"phase {args.id} is {phase['status']}")
-            phase.update(status="running", started=now())
+            phase.update(status="running", started=now(), start=git(folder, "rev-parse", "HEAD"))
         else:
             still = [s["id"] for s in state["slices"] if s["phase"] == args.id and s["status"] in OPEN]
             if still:
@@ -122,6 +138,7 @@ def cmd_phase(folder, args):
             phase.update(status="done", done=now())
     save(folder, state)
     print(f"phase {args.id}: {args.action}")
+    return f"phase {args.id} {args.action}"
 
 
 def cmd_slice(folder, args):
@@ -158,6 +175,7 @@ def cmd_slice(folder, args):
             item.update(status="dropped", reason=reason, dropped=now())
     save(folder, state)
     print(f"slice {args.id}: {args.action}")
+    return f"slice {args.id} {args.action}"
 
 
 def need_range(args):
@@ -221,18 +239,27 @@ def cmd_render(folder, _args):
         text = f"# {state['slug']} - state\n\n## Now\n\n\n## Slices\n\n{block}\n\n## Waiting for the developer\n\n"
     state_md.write_text(text, encoding="utf-8")
     print(f"LEDGER.md and STATE.md rendered in {folder}")
+    return f"{len(state['slices'])} slice(s) rendered"
 
 
 def cmd_where(folder, _args):
-    print("\n".join(lines_where(load(folder))))
+    state = load(folder)
+    print("\n".join(lines_where(state)))
+    return f"{len(state['phases'])} phase(s), {len(state['slices'])} slice(s)"
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise BadInput(message)
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(description="State of a refactor: phases and slices.")
+    parser = Parser(description="State of a refactor: phases and slices.")
     parser.add_argument("--folder", required=True, help="the refactor's state folder")
     commands = parser.add_subparsers(dest="command", required=True)
     init = commands.add_parser("init")
     init.add_argument("--slug")
+    init.add_argument("--base", help="the commit the refactor starts from; default HEAD")
     phase = commands.add_parser("phase")
     phase.add_argument("action", choices=("add", "start", "done"))
     phase.add_argument("id")
@@ -253,19 +280,26 @@ def build_parser():
 
 
 def main(argv=None):
-    args = build_parser().parse_args(argv)
-    folder = Path(args.folder)
     handlers = {"init": cmd_init, "phase": cmd_phase, "slice": cmd_slice, "where": cmd_where, "render": cmd_render}
+    command = "state"
     try:
+        args = build_parser().parse_args(argv)
+        command = args.command
+        folder = Path(args.folder)
         if args.command == "slice" and args.action == "add" and not args.phase:
             raise BadInput("`slice add` needs --phase")
-        handlers[args.command](folder, args)
+        done = handlers[args.command](folder, args)
+    except SystemExit as error:  # --help
+        return error.code or 0
     except BadInput as error:
         print(f"refactor_state: {error}", file=sys.stderr)
+        verdict(command, "FAIL", f"usage: {error}")
         return BAD_INPUT
     except Refused as error:
         print(f"refactor_state: refused - {error}", file=sys.stderr)
+        verdict(command, "FAIL", f"refused: {error}")
         return REFUSED
+    verdict(command, "PASS", done)
     return OK
 
 

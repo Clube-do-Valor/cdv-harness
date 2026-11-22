@@ -135,7 +135,7 @@
       "owner": "augusto-henriques",
       "description": "Run a refactor or a migration that must keep behaviour - split a large class or screen, dissolve a hub file, give a concept one home, delete dead code, move code into another structure, port it to another framework or language - as a project in phases, with the old code as the source of truth, proof recorded before each change, the state of the work kept on disk and one independent verifier per phase. Triggers on \"refactor this\", \"split this class\", \"break up this file\", \"migrate this module\", \"reorganize the codebase\", \"make the codebase easier for agents\", \"refatora\", \"quebra esse arquivo\", \"migra esse módulo\", \"/cdv-refactor\", or a hand-off from cdv-kickoff. Do NOT use for a feature or a fix, however small (cdv-kickoff), for a root-cause investigation (cdv-debug), for a review of a branch (cdv-code-review), or for a change that alters behaviour on purpose: a refactor that also changes behaviour is two pieces of work, and the behaviour change goes through cdv-kickoff.",
       "path": "skills/cdv-refactor",
-      "contentHash": "ef7752cd580f9e6350c9a380e5784bab353589adc4af776dade846739a70e833"
+      "contentHash": "0d65969ca60964010cd4333fff7b9f1cdd0ec4c6215e7a58f76a0ee8442add4f"
     },
     {
       "name": "cdv-research-round",

@@ -1,7 +1,9 @@
 """cdv-refactor: the state of a refactor is kept by a script, documents follow the code that moved,
-and counters only move one way."""
+counters only move one way, a record changes only with a declaration, and every tool ends with one
+verdict line."""
 
 import json
+import re
 import subprocess
 import sys
 import tempfile
@@ -31,6 +33,17 @@ def commit(repo, message, *paths):
 
 def run(script, *args, cwd):
     return subprocess.run([sys.executable, str(SCRIPTS / script), *args], cwd=cwd, capture_output=True, text=True)
+
+
+def verdict(result, tool, mode, status):
+    """The last line of stdout is the one verdict line of the tool, and the exit code agrees with its status."""
+    last = result.stdout.rstrip("\n").splitlines()[-1] if result.stdout.strip() else ""
+    found = re.fullmatch(rf"{tool} ([\w-]+): (PASS|FAIL|PARTIAL) \u2014 .+", last)
+    assert found, f"no verdict line in {result.stdout!r} / {result.stderr!r}"
+    assert found.group(1) == mode and found.group(2) == status, last
+    assert (result.returncode == 0) == (status == "PASS"), (result.returncode, last)
+    assert (result.returncode == 4) == (status == "PARTIAL"), (result.returncode, last)
+    return last
 
 
 class RepoCase(unittest.TestCase):
@@ -116,6 +129,35 @@ class StateTest(RepoCase):
         self.assertIn("range not found", self.folder.joinpath("LEDGER.md").read_text())
 
 
+    def test_init_records_the_base_and_phase_start_the_start_of_the_phase(self):
+        self.state("init")
+        state = json.loads(self.folder.joinpath("state.json").read_text())
+        self.assertEqual(state["base"], self.base)
+        self.state("phase", "add", "1", "goal")
+        (self.repo / "app" / "Later.php").write_text("<?php\n")
+        later = commit(self.repo, "later", "app/Later.php")
+        self.state("phase", "start", "1")
+        phase = json.loads(self.folder.joinpath("state.json").read_text())["phases"][0]
+        self.assertEqual(phase["start"], later)
+        explicit = self.folder.parent / "other"
+        done = run("refactor_state.py", "--folder", str(explicit), "init", "--base", later, cwd=self.repo)
+        self.assertEqual(done.returncode, 0)
+        self.assertEqual(json.loads(explicit.joinpath("state.json").read_text())["base"], later)
+        unknown = run("refactor_state.py", "--folder", str(explicit.parent / "third"), "init", "--base", "nope", cwd=self.repo)
+        self.assertEqual(unknown.returncode, 2)
+
+    def test_every_command_ends_with_the_verdict_line(self):
+        verdict(self.state("init"), "refactor_state", "init", "PASS")
+        verdict(self.state("init"), "refactor_state", "init", "FAIL")  # refused: exit 3
+        verdict(self.state("phase", "add", "1", "goal"), "refactor_state", "phase", "PASS")
+        verdict(self.state("phase", "done", "9"), "refactor_state", "phase", "FAIL")  # unknown id: exit 2
+        verdict(self.state("where"), "refactor_state", "where", "PASS")
+        verdict(self.state("render"), "refactor_state", "render", "PASS")
+        self.assertEqual(self.state("slice", "add", "1a", "t").returncode, 2)
+        self.assertEqual(self.state("phase", "bogus", "1").returncode, 2, "a bad argument is a usage error with a verdict line")
+        verdict(self.state("phase", "bogus", "1"), "refactor_state", "state", "FAIL")
+
+
 class DocsFollowCodeTest(RepoCase):
     def docs(self, *args):
         return run("docs_follow_code.py", "--base", self.base, *args, cwd=self.repo)
@@ -169,6 +211,35 @@ class DocsFollowCodeTest(RepoCase):
         self.assertEqual(only_readme.returncode, 1)
         self.assertNotIn("docs/guide.md", only_readme.stdout)
         self.assertIn("(deleted)", only_readme.stdout)
+
+
+    def test_the_base_comes_from_state_and_every_exit_has_its_verdict(self):
+        state = ["--folder", str(self.folder)]
+        run("refactor_state.py", *state, "init", cwd=self.repo)
+        (self.repo / "docs" / "guide.md").write_text("# Guide\n\n`app/InvoiceExporter.php`\n")
+        commit(self.repo, "guide")
+        git(self.repo, "rm", "-q", "app/InvoiceExporter.php")
+        commit(self.repo, "delete")
+        stale = run("docs_follow_code.py", *state, cwd=self.repo)
+        self.assertEqual(stale.returncode, 1)
+        verdict(stale, "docs_follow_code", "check", "FAIL")
+        self.assertEqual(run("docs_follow_code.py", cwd=self.repo).returncode, 2, "no base anywhere")
+        verdict(run("docs_follow_code.py", cwd=self.repo), "docs_follow_code", "check", "FAIL")
+        (self.repo / "docs" / "guide.md").write_text("# Guide\n")
+        verdict(self.docs(), "docs_follow_code", "check", "PASS")
+        self.assertEqual(self.docs("--docs", "docs/missing").returncode, 2)
+        with tempfile.TemporaryDirectory() as outside:
+            elsewhere = run("docs_follow_code.py", "--base", "x", cwd=outside)
+            self.assertEqual(elsewhere.returncode, 3, "not a git repository is an environment problem")
+            verdict(elsewhere, "docs_follow_code", "check", "FAIL")
+
+    def test_no_document_searched_is_partial_never_a_pass(self):
+        (self.repo / "docs" / "guide.md").unlink()
+        git(self.repo, "rm", "-q", "--cached", "docs/guide.md")
+        commit(self.repo, "no guide")
+        result = self.docs()
+        self.assertEqual(result.returncode, 4)
+        verdict(result, "docs_follow_code", "check", "PARTIAL")
 
 
 class RatchetTest(RepoCase):
