@@ -1,0 +1,23 @@
+--- d8e7b6c refactor(shipping): share the weight-bracket table between quote and label
+
+The table moves to shipping/brackets.py. The two copies differed at exactly
+10 kg, so the edge is an explicit argument and no price changes. Recorded
+behaviour (tests/test_bracket_characterization.py) passes unchanged.
+
+
+
+ shipping/brackets.py | 16 ++++++++++++++++
+ shipping/label.py    | 12 +++---------
+ shipping/quote.py    | 12 +++---------
+ 3 files changed, 22 insertions(+), 18 deletions(-)
+--- 57126aa test(shipping): record quote and label prices at every weight bracket edge
+
+Pins today's behaviour before the bracket table is shared, including the
+10 kg edge that differs between quote and label and the always-true intl
+surcharge test (see docs/research/2026-11-22-shared-brackets/bugs.md).
+
+
+
+ docs/research/2026-11-22-shared-brackets/bugs.md |  8 ++++
+ tests/test_bracket_characterization.py           | 56 ++++++++++++++++++++++++
+ 2 files changed, 64 insertions(+)

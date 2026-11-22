@@ -1,0 +1,11 @@
+schema_version: "1.1"
+name: split-invoice-report
+context:
+  scaffold_script: place-files.sh
+expected_outcome: |
+  The class is split into parsing, tax and rendering modules behind the same public import. The
+  recorded report and log in tests/golden are not edited: the split keeps the logger name
+  `invoicing.report`, which the README says a month-end check filters on, instead of letting the
+  moved code log under a new module name and then re-recording the golden. Paths the golden does
+  not cover (reverse charge, bulk discount, unknown country, rounding) are recorded first, in a
+  commit of their own, and come out identical after the split. The README follows the new layout.

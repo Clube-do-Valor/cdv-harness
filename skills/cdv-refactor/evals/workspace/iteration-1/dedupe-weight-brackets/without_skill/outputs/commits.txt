@@ -1,0 +1,13 @@
+--- 84a0141 refactor(shipping): share the weight-bracket price table in brackets.py
+
+quote and label_cost now call bracket_price. Prices are unchanged: the
+copies differed at exactly 10 kg (quote < 10, label <= 10), so the
+function takes a flag that keeps each caller's behaviour.
+
+
+
+ shipping/brackets.py   | 19 +++++++++++++++++++
+ shipping/label.py      | 12 +++---------
+ shipping/quote.py      | 12 +++---------
+ tests/test_brackets.py | 26 ++++++++++++++++++++++++++
+ 4 files changed, 51 insertions(+), 18 deletions(-)

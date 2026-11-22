@@ -1,0 +1,114 @@
+diff --git a/shipping/brackets.py b/shipping/brackets.py
+new file mode 100644
+index 0000000..72e481e
+--- /dev/null
++++ b/shipping/brackets.py
+@@ -0,0 +1,19 @@
++"""Weight-bracket base price shared by the customer quote and the carrier label."""
++
++
++def bracket_price(weight_kg, *, ten_kg_in_heavy_bracket=False):
++    """Base price for a parcel weight, before any surcharge, fee or factor.
++
++    Brackets: up to 1 kg, up to 5 kg, up to 10 kg, above.
++
++    The two callers disagree on exactly 10 kg and that is kept as it was:
++    the quote prices it in the heaviest bracket (pass True), the label
++    cost prices it in the 5-10 kg bracket (default False).
++    """
++    if weight_kg <= 1:
++        return 5.0
++    if weight_kg <= 5:
++        return 9.5
++    if weight_kg < 10 or (weight_kg == 10 and not ten_kg_in_heavy_bracket):
++        return 14.0
++    return 20.0
+diff --git a/shipping/label.py b/shipping/label.py
+index 045577f..bbafa08 100644
+--- a/shipping/label.py
++++ b/shipping/label.py
+@@ -1,5 +1,7 @@
+ """Cost of printing and buying the carrier label, charged to us by the carrier."""
+ 
++from shipping.brackets import bracket_price
++
+ HANDLING_FEE = 1.25
+ 
+ 
+@@ -7,14 +9,6 @@ def label_cost(weight_kg):
+     if weight_kg <= 0:
+         raise ValueError("weight must be positive")
+ 
+-    # weight bracket
+-    if weight_kg <= 1:
+-        price = 5.0
+-    elif weight_kg <= 5:
+-        price = 9.5
+-    elif weight_kg <= 10:
+-        price = 14.0
+-    else:
+-        price = 20.0
++    price = bracket_price(weight_kg)
+ 
+     return round(price + HANDLING_FEE, 2)
+diff --git a/shipping/quote.py b/shipping/quote.py
+index 60e9c9a..3befa42 100644
+--- a/shipping/quote.py
++++ b/shipping/quote.py
+@@ -1,5 +1,7 @@
+ """Price quoted to the customer at checkout."""
+ 
++from shipping.brackets import bracket_price
++
+ EXPRESS_FACTOR = 1.2
+ INTL_SURCHARGE = 7.5
+ EU_SURCHARGE = 3.0
+@@ -9,15 +11,7 @@ def quote(weight_kg, zone, express=False):
+     if weight_kg <= 0:
+         raise ValueError("weight must be positive")
+ 
+-    # weight bracket
+-    if weight_kg <= 1:
+-        price = 5.0
+-    elif weight_kg <= 5:
+-        price = 9.5
+-    elif weight_kg < 10:
+-        price = 14.0
+-    else:
+-        price = 20.0
++    price = bracket_price(weight_kg, ten_kg_in_heavy_bracket=True)
+ 
+     # zone surcharge
+     if zone == "eu":
+diff --git a/tests/test_brackets.py b/tests/test_brackets.py
+new file mode 100644
+index 0000000..c5d05f9
+--- /dev/null
++++ b/tests/test_brackets.py
+@@ -0,0 +1,26 @@
++import unittest
++
++from shipping.brackets import bracket_price
++from shipping.label import label_cost
++from shipping.quote import quote
++
++
++class BracketPriceTest(unittest.TestCase):
++    def test_bracket_edges(self):
++        self.assertEqual(bracket_price(1), 5.0)
++        self.assertEqual(bracket_price(1.01), 9.5)
++        self.assertEqual(bracket_price(5), 9.5)
++        self.assertEqual(bracket_price(5.01), 14.0)
++        self.assertEqual(bracket_price(9.99), 14.0)
++        self.assertEqual(bracket_price(10.01), 20.0)
++
++    def test_exactly_ten_kg_differs_by_caller(self):
++        # Kept as it was before the extraction: label is 5-10 kg, quote is heavy.
++        self.assertEqual(bracket_price(10), 14.0)
++        self.assertEqual(bracket_price(10, ten_kg_in_heavy_bracket=True), 20.0)
++        self.assertEqual(label_cost(10), 15.25)
++        self.assertEqual(quote(10, "domestic"), 27.5)
++
++
++if __name__ == "__main__":
++    unittest.main()

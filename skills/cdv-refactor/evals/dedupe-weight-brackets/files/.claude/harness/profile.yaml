@@ -1,0 +1,10 @@
+repo_name: parcel-rates
+default_branch: main
+language_code: en
+language_ui: en
+extension_dir: .claude/harness/extensions
+docs_dirs: [docs]
+research_dir: docs/research
+cmd_test_backend: python3 -m unittest discover -s tests
+role_builder: none
+role_verifier: none

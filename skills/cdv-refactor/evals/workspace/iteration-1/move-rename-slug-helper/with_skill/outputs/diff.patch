@@ -1,0 +1,208 @@
+diff --git a/.github/workflows/ci.yml b/.github/workflows/ci.yml
+index 33cb481..263b02e 100644
+--- a/.github/workflows/ci.yml
++++ b/.github/workflows/ci.yml
+@@ -3,7 +3,7 @@ on:
+   pull_request:
+     paths:
+       - 'lib/**'
+-      - 'src/titles.js'
++      - 'src/**'
+       - 'bin/**'
+       - 'test/**'
+       - 'package.json'
+diff --git a/AGENTS.md b/AGENTS.md
+index 6bb4ef4..3f0d400 100644
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,5 +1,5 @@
+ # Notes for coding agents
+ 
+-- A new text helper goes next to `lib/helpers/slugify.js`, with its tests in `test/` (see `test/slugify.test.js`).
+-- Every URL slug comes from `mkSlug`; never build one by hand.
++- A new text helper goes next to `src/text/slug.js`, with its tests in `test/` (see `test/slug.test.js`).
++- Every URL slug comes from `toSlug`; never build one by hand.
+ - `npm test` must pass, floor included. The floor in `test-floor.json` only goes up.
+diff --git a/README.md b/README.md
+index 45bcf83..4f6dbd6 100644
+--- a/README.md
++++ b/README.md
+@@ -2,9 +2,9 @@
+ 
+ Slugs and titles for the article pages.
+ 
+-- `lib/helpers/slugify.js` - `mkSlug(title, separator)`, the slug of every article URL.
++- `src/text/slug.js` - `toSlug(title, separator)`, the slug of every article URL.
+ - `lib/helpers/truncate.js` - `truncate(text, max)`.
+ - `src/titles.js` - `articlePath` and `cardTitle`, built on the helpers.
+-- `bin/cli.js` - `slugkit slug <text>`, `slugkit slug --legacy <text>`, `slugkit truncate <text> <max>`.
++- `bin/cli.js` - `slugkit slug <text>`, `slugkit truncate <text> <max>`.
+ 
+ `npm test` runs the suite and the test floor (`test-floor.json`).
+diff --git a/bin/cli.js b/bin/cli.js
+index f5cec73..ace4318 100755
+--- a/bin/cli.js
++++ b/bin/cli.js
+@@ -1,27 +1,25 @@
+ #!/usr/bin/env node
+ 'use strict';
+ 
+-// slugkit <command> [--legacy] <text>
++// slugkit <command> <text>
+ // Commands are resolved from this table, so a helper can be added without touching the parser.
+ const path = require('path');
+ 
+ const COMMANDS = {
+-  slug: { file: path.join(__dirname, '..', 'lib', 'helpers', 'slugify.js'), fn: 'mkSlug', legacyFn: 'mkSlugLegacy' },
++  slug: { file: path.join(__dirname, '..', 'src', 'text', 'slug.js'), fn: 'toSlug' },
+   truncate: { file: path.join(__dirname, '..', 'lib', 'helpers', 'truncate.js'), fn: 'truncate' },
+ };
+ 
+ function main(argv) {
+   const [command, ...rest] = argv;
+-  const legacy = rest.includes('--legacy');
+-  const args = rest.filter((arg) => arg !== '--legacy');
++  const args = rest;
+   const entry = COMMANDS[command];
+   if (!entry) {
+     process.stderr.write(`unknown command: ${command}\n`);
+     return 2;
+   }
+   const mod = require(entry.file);
+-  const fnName = legacy && entry.legacyFn ? entry.legacyFn : entry.fn;
+-  const result = command === 'truncate' ? mod[fnName](args[0], Number(args[1])) : mod[fnName](args.join(' '));
++  const result = command === 'truncate' ? mod[entry.fn](args[0], Number(args[1])) : mod[entry.fn](args.join(' '));
+   process.stdout.write(result + '\n');
+   return 0;
+ }
+diff --git a/docs/architecture.md b/docs/architecture.md
+index e3f78a5..27469b5 100644
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -1,4 +1,4 @@
+ # Architecture
+ 
+-`src/titles.js` builds article paths with `mkSlug` from `lib/helpers/slugify.js`. The CLI in
++`src/titles.js` builds article paths with `toSlug` from `src/text/slug.js`. The CLI in
+ `bin/cli.js` resolves its commands from a table of helper files, so it never imports them directly.
+diff --git a/lib/helpers/slugify.js b/src/text/slug.js
+similarity index 54%
+rename from lib/helpers/slugify.js
+rename to src/text/slug.js
+index 1677fe0..00dbd8c 100644
+--- a/lib/helpers/slugify.js
++++ b/src/text/slug.js
+@@ -1,7 +1,7 @@
+ 'use strict';
+ 
+ // Turn any title into a URL slug: accents removed, lower case, one separator between words.
+-function mkSlug(input, separator = '-') {
++function toSlug(input, separator = '-') {
+   return String(input)
+     .normalize('NFKD')
+     .replace(/[̀-ͯ]/g, '')
+@@ -11,9 +11,4 @@ function mkSlug(input, separator = '-') {
+     .replace(new RegExp(`^${separator}+|${separator}+$`, 'g'), '');
+ }
+ 
+-// The slug format used before the URL migration: spaces become underscores, nothing else changes.
+-function mkSlugLegacy(input) {
+-  return String(input).trim().toLowerCase().replace(/\s+/g, '_');
+-}
+-
+-module.exports = { mkSlug, mkSlugLegacy };
++module.exports = { toSlug };
+diff --git a/src/titles.js b/src/titles.js
+index 730b1bb..e1bc350 100644
+--- a/src/titles.js
++++ b/src/titles.js
+@@ -1,11 +1,11 @@
+ 'use strict';
+ 
+-const { mkSlug } = require('../lib/helpers/slugify');
++const { toSlug } = require('./text/slug');
+ const { truncate } = require('../lib/helpers/truncate');
+ 
+ function articlePath(title, date) {
+   const day = date.toISOString().slice(0, 10);
+-  return `/articles/${day}/${mkSlug(title)}`;
++  return `/articles/${day}/${toSlug(title)}`;
+ }
+ 
+ function cardTitle(title) {
+diff --git a/test/cli.test.js b/test/cli.test.js
+new file mode 100644
+index 0000000..a30b845
+--- /dev/null
++++ b/test/cli.test.js
+@@ -0,0 +1,24 @@
++'use strict';
++const test = require('node:test');
++const assert = require('node:assert');
++const path = require('path');
++const { spawnSync } = require('child_process');
++
++const cli = path.join(__dirname, '..', 'bin', 'cli.js');
++const run = (...args) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8' });
++
++test('cli slug prints the slug of the words', () => {
++  const result = run('slug', 'Crème', 'Brûlée', '&', 'Co');
++  assert.strictEqual(result.status, 0);
++  assert.strictEqual(result.stdout, 'creme-brulee-and-co\n');
++});
++test('cli truncate prints the truncated text', () => {
++  const result = run('truncate', 'abcdefghij', '5');
++  assert.strictEqual(result.status, 0);
++  assert.strictEqual(result.stdout, 'abcd…\n');
++});
++test('cli rejects an unknown command', () => {
++  const result = run('nope');
++  assert.strictEqual(result.status, 2);
++  assert.match(result.stderr, /unknown command: nope/);
++});
+diff --git a/test/legacy.test.js b/test/legacy.test.js
+deleted file mode 100644
+index 9b8957f..0000000
+--- a/test/legacy.test.js
++++ /dev/null
+@@ -1,8 +0,0 @@
+-'use strict';
+-const test = require('node:test');
+-const assert = require('node:assert');
+-const { mkSlugLegacy } = require('../lib/helpers/slugify');
+-
+-test('legacy: spaces become underscores', () => assert.strictEqual(mkSlugLegacy('Hello World'), 'hello_world'));
+-test('legacy: punctuation is kept', () => assert.strictEqual(mkSlugLegacy('Hi, there!'), 'hi,_there!'));
+-test('legacy: trims', () => assert.strictEqual(mkSlugLegacy('  Hi  '), 'hi'));
+diff --git a/test/slug.test.js b/test/slug.test.js
+new file mode 100644
+index 0000000..dfa725d
+--- /dev/null
++++ b/test/slug.test.js
+@@ -0,0 +1,10 @@
++'use strict';
++const test = require('node:test');
++const assert = require('node:assert');
++const { toSlug } = require('../src/text/slug');
++
++test('lower case and dashes', () => assert.strictEqual(toSlug('Hello World'), 'hello-world'));
++test('accents are removed', () => assert.strictEqual(toSlug('Crème Brûlée'), 'creme-brulee'));
++test('ampersand becomes and', () => assert.strictEqual(toSlug('Salt & Pepper'), 'salt-and-pepper'));
++test('edges are trimmed', () => assert.strictEqual(toSlug('  --Hi!--  '), 'hi'));
++test('custom separator', () => assert.strictEqual(toSlug('a b c', '_'), 'a_b_c'));
+diff --git a/test/slugify.test.js b/test/slugify.test.js
+deleted file mode 100644
+index 209d427..0000000
+--- a/test/slugify.test.js
++++ /dev/null
+@@ -1,10 +0,0 @@
+-'use strict';
+-const test = require('node:test');
+-const assert = require('node:assert');
+-const { mkSlug } = require('../lib/helpers/slugify');
+-
+-test('lower case and dashes', () => assert.strictEqual(mkSlug('Hello World'), 'hello-world'));
+-test('accents are removed', () => assert.strictEqual(mkSlug('Crème Brûlée'), 'creme-brulee'));
+-test('ampersand becomes and', () => assert.strictEqual(mkSlug('Salt & Pepper'), 'salt-and-pepper'));
+-test('edges are trimmed', () => assert.strictEqual(mkSlug('  --Hi!--  '), 'hi'));
+-test('custom separator', () => assert.strictEqual(mkSlug('a b c', '_'), 'a_b_c'));

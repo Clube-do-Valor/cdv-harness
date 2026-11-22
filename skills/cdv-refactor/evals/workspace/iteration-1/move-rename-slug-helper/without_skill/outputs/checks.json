@@ -1,0 +1,34 @@
+{
+  "01": {
+    "passed": true,
+    "evidence": "check-floor: PASS - 10 tests, floor 10"
+  },
+  "02": {
+    "passed": true,
+    "evidence": "new=True old=False toSlug=function mkSlug left: none"
+  },
+  "03": {
+    "passed": true,
+    "evidence": "every named path exists; no old name"
+  },
+  "04": {
+    "passed": true,
+    "evidence": "base='creme-brulee-a-la-carte' head='creme-brulee-a-la-carte' rc=0"
+  },
+  "05": {
+    "passed": false,
+    "evidence": "R100 commits: none"
+  },
+  "06": {
+    "passed": true,
+    "evidence": "floor base=10 head=10; tests ran=10"
+  },
+  "07": {
+    "passed": null,
+    "evidence": "--legacy prints 'legacy-hello-world' (base 'hello_world'); otherwise read the report"
+  },
+  "08": {
+    "passed": true,
+    "evidence": "paths filter: ['lib/**', 'src/titles.js', 'src/text/**', 'bin/**', 'test/**', 'package.json', 'test-floor.json']"
+  }
+}

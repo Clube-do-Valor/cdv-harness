@@ -9,10 +9,11 @@ description: >
   with no prompt per stage, stopping only where the profile says. Triggers on "start this feature",
   "kickoff", "/cdv-kickoff", "começa essa feature", "vamos fazer esse card", or a hand-off from
   cdv-debug or cdv-grilling. Do NOT use for a pure root-cause investigation with no build
-  (cdv-debug), an open interview (cdv-grilling), a review of an existing branch (cdv-code-review), or
-  a factory run (cdv-factory-small-feature).
+  (cdv-debug), an open interview (cdv-grilling), a review of an existing branch (cdv-code-review), a
+  factory run (cdv-factory-small-feature), or a refactor or migration that must keep behaviour
+  (cdv-refactor).
 metadata:
-  version: 0.1.0
+  version: 0.1.1
   owner: augusto-henriques
 ---
 
@@ -45,6 +46,13 @@ Below, `profile.<key>` is a value from the profile. A key that is missing or `no
 repository does not have that thing: skip the step that needs it.
 
 ## Step 1 - Read the request and the repository, fill the signals
+
+**A refactor or a migration is not a feature.** When the request changes the structure of working
+code and must keep what it does - split a class or a screen, dissolve a hub file, delete dead code,
+move or port code - stop here and load `cdv-refactor`. This chain starts from a written plan, and
+in a refactor the old code is the source: a plan in between gets read instead of it. A request that
+mixes both is two runs: the structure through `cdv-refactor`, the change of behaviour through this
+skill.
 
 Read the request whole (the card with its comments, the thread, the brief) and the code it touches.
 Search the docs first, always. From what you read, fill the signals object. The signals are facts,

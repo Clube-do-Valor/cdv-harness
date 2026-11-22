@@ -1,0 +1,25 @@
+--- c7c094e refactor(text): move the slug helper to src/text/slug.js and rename mkSlug to toSlug
+
+No re-export at lib/helpers/slugify.js. Updates titles, the CLI table, the docs,
+AGENTS.md and the CI path filter (src/text/** was not watched). Also removes
+mkSlugLegacy, dead since the URL migration, with its tests and the CLI --legacy flag.
+
+
+ .github/workflows/ci.yml                   |  1 +
+ AGENTS.md                                  |  4 ++--
+ README.md                                  |  4 ++--
+ bin/cli.js                                 |  9 ++++-----
+ docs/architecture.md                       |  2 +-
+ lib/helpers/slugify.js => src/text/slug.js |  9 ++-------
+ src/titles.js                              |  4 ++--
+ test/legacy.test.js                        |  8 --------
+ test/slug.test.js                          | 10 ++++++++++
+ test/slugify.test.js                       | 10 ----------
+ 10 files changed, 24 insertions(+), 37 deletions(-)
+--- 666f4f0 test(truncate): cover the truncate helper
+
+It had no tests. Needed to keep the suite at the test floor once the dead legacy tests are removed.
+
+
+ test/truncate.test.js | 8 ++++++++
+ 1 file changed, 8 insertions(+)

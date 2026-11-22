@@ -1,0 +1,7 @@
+customer,item,qty,unit_price,country,reverse_charge
+Acme Tools,hammer,2,12.50,DE,no
+Acme Tools,nails (box),3,4.20,DE,no
+Blue Harbour,rope,1,30.00,PT,no
+Blue Harbour,anchor,x,90.00,PT,no
+Cedar & Pine,saw,1,45.99,FR,no
+broken line

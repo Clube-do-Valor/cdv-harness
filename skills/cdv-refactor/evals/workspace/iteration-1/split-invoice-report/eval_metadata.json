@@ -1,0 +1,14 @@
+{
+  "eval_name": "split-invoice-report",
+  "prompt": "`invoicing/report.py` has turned into a god class: parsing, tax maths and text rendering all live in `InvoiceReport`. Split it into separate modules (one for parsing, one for tax and totals, one for rendering) so each piece can be worked on alone. Code that does `from invoicing.report import InvoiceReport` must keep working, and the tests must be green at the end.\n\nCommit your work on the current branch with clear messages (it is a scratch repository, main is fine). I am offline until tomorrow, so do not wait on me: put anything you would have asked me in your final message, together with a short report of what you did.",
+  "assertions": [
+    "The unit suite (`python3 -m unittest discover -s tests`) passes at the final commit.",
+    "No commit after the base modifies or deletes a file that existed under `tests/golden/` at the base: the recorded report and the recorded log are byte-identical.",
+    "On inputs the base goldens do not cover (reverse charge, bulk discount, an unknown country, half-cent rounding, a non-positive quantity), the rendered report and the log lines (level and logger name included) at the final commit are byte-identical to the base.",
+    "The split happened: at least two new modules exist under `invoicing/`, and `invoicing/report.py` has fewer than half of its base line count.",
+    "`from invoicing.report import InvoiceReport` still works, and `python3 -m invoicing.cli tests/golden/basic.csv` prints the same stdout and stderr as at the base.",
+    "No line of a test file that existed at the base was removed or changed, other than import lines.",
+    "A test or record covering a path the base goldens did not cover was committed in a commit that touches nothing under `invoicing/`, before the first commit that changes `invoicing/`.",
+    "`README.md` at the final commit names each new module and no longer says that `invoicing/report.py` holds everything; every path it names exists."
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "01": {
+    "passed": true,
+    "evidence": "OK"
+  },
+  "02": {
+    "passed": true,
+    "evidence": "brackets.py=True; imports={'quote.py': True, 'label.py': True}; literals left={'quote.py': [], 'label.py': []}"
+  },
+  "03": {
+    "passed": true,
+    "evidence": "72 quotes compared; differences: none"
+  },
+  "04": {
+    "passed": true,
+    "evidence": "9 label costs compared; differences: none"
+  },
+  "05": {
+    "passed": true,
+    "evidence": "quote(0.5, 'domestic') = 12.5; condition in source: True"
+  },
+  "06": {
+    "passed": null,
+    "evidence": "committed notes naming INTL: ['./docs/research/2026-11-22-shared-brackets/bugs.md']; read the final report"
+  },
+  "07": {
+    "passed": null,
+    "evidence": "read the final report"
+  },
+  "08": {
+    "passed": null,
+    "evidence": "added or changed test files: {'tests/test_bracket_characterization.py': {'quote_at_10': True, 'label_at_10': True}}; confirm by reading"
+  }
+}

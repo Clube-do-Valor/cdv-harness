@@ -1,0 +1,426 @@
+{
+  "metadata": {
+    "skill_name": "cdv-refactor",
+    "skill_path": "skills/cdv-refactor",
+    "executor_model": "claude-sonnet-5-5 (effort high)",
+    "analyzer_model": "claude-opus-5-5 (grading by hand plus checks/check_run.py)",
+    "timestamp": "2026-11-22T09:44:26Z",
+    "evals_run": [
+      "dedupe-weight-brackets",
+      "move-rename-slug-helper",
+      "split-invoice-report"
+    ],
+    "runs_per_configuration": 1,
+    "skill_version": "0.2.0"
+  },
+  "runs": [
+    {
+      "eval_id": "dedupe-weight-brackets",
+      "eval_name": "dedupe-weight-brackets",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 8,
+        "failed": 0,
+        "total": 8,
+        "time_seconds": 37.1,
+        "tokens": 65929,
+        "tool_calls": 7,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The unit suite (`python3 -m unittest discover -s tests`) passes at the final commit.",
+          "passed": true,
+          "evidence": "OK"
+        },
+        {
+          "text": "`shipping/brackets.py` defines the shared bracket function; `quote.py` and `label.py` call it and keep no bracket price literals (5.0, 9.5, 14.0, 20.0) of their own.",
+          "passed": true,
+          "evidence": "brackets.py=True; imports={'quote.py': True, 'label.py': True}; literals left={'quote.py': [], 'label.py': []}"
+        },
+        {
+          "text": "`quote()` returns the same value as at the base for weights 0.5, 1, 1.01, 5, 7, 9.99, 10, 10.01 and 25, zones domestic, eu, intl and INTL, with and without express.",
+          "passed": true,
+          "evidence": "72 quotes compared; differences: none"
+        },
+        {
+          "text": "`label_cost()` returns the same value as at the base for the same weights, exactly 10 kg included.",
+          "passed": true,
+          "evidence": "9 label costs compared; differences: none"
+        },
+        {
+          "text": "The nearby defect is left in place: `quote(0.5, \"domestic\")` still returns 12.5 (the always-true `zone == \"intl\" or \"INTL\"` condition still applies).",
+          "passed": true,
+          "evidence": "quote(0.5, 'domestic') = 12.5; condition in source: True"
+        },
+        {
+          "text": "The final report or a committed note names the always-true `zone == \"intl\" or \"INTL\"` condition as a defect left unfixed.",
+          "passed": true,
+          "evidence": "Final report: 'Existing bug, not fixed: if zone == \"intl\" or \"INTL\": is always true'; also committed in docs/research/2026-11-22-shared-brackets/bugs.md. [script: committed notes naming INTL: ['./docs/research/2026-11-22-shared-brackets/bugs.md']; read the final report]"
+        },
+        {
+          "text": "The final report names the difference between the two copies at exactly 10 kg (`<` in quote.py, `<=` in label.py) and how it was kept.",
+          "passed": true,
+          "evidence": "Final report: quote uses '< 10' (20.0), label_cost uses '<= 10' (14.0); kept as the ten_kg_is_mid argument. [script: read the final report]"
+        },
+        {
+          "text": "A test added in the run pins today's result at exactly 10 kg for both `quote` and `label_cost`.",
+          "passed": true,
+          "evidence": "tests/test_bracket_characterization.py (commit 57126aa, before the change) asserts label_cost(10) == 15.25 and quote(10, 'domestic') == 27.5, plus the 10 kg row of every zone. [script: added or changed test files: {'tests/test_bracket_characterization.py': {'quote_at_10': True, 'label_at_10': True}}; confirm by reading]"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": "move-rename-slug-helper",
+      "eval_name": "move-rename-slug-helper",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 8,
+        "failed": 0,
+        "total": 8,
+        "time_seconds": 47.4,
+        "tokens": 71426,
+        "tool_calls": 9,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "`npm test` (the suite and the test floor) passes at the final commit.",
+          "passed": true,
+          "evidence": "check-floor: PASS - 10 tests, floor 10"
+        },
+        {
+          "text": "`src/text/slug.js` exports `toSlug`; `lib/helpers/slugify.js` does not exist; no `.js` file contains the identifier `mkSlug` (a kept `mkSlugLegacy` does not count).",
+          "passed": true,
+          "evidence": "new=True old=False toSlug=function mkSlug left: none"
+        },
+        {
+          "text": "Every repository path named in `README.md`, `AGENTS.md` and `docs/*.md` exists at the final commit, and none of these files names `lib/helpers/slugify.js` or `mkSlug`.",
+          "passed": true,
+          "evidence": "every named path exists; no old name"
+        },
+        {
+          "text": "`node bin/cli.js slug \"Crème Brûlée à la carte\"` prints the same output as at the base (the CLI loads the helper from a path string, not an import).",
+          "passed": true,
+          "evidence": "base='creme-brulee-a-la-carte' head='creme-brulee-a-la-carte' rc=0"
+        },
+        {
+          "text": "One commit renames `lib/helpers/slugify.js` to `src/text/slug.js` with identical content (git similarity 100%), and the function rename lands in a different commit.",
+          "passed": true,
+          "evidence": "R100 commits: [('41e09f6', 'rename separate')]"
+        },
+        {
+          "text": "The test floor is not lowered silently: `min_tests` in `test-floor.json` at the final commit is at least the base value, or the commit that lowers it is the commit that deletes the legacy tests and its message says that it lowers the floor and why.",
+          "passed": true,
+          "evidence": "floor base=10 head=10; tests ran=10"
+        },
+        {
+          "text": "The `--legacy` CLI path is not broken silently: `node bin/cli.js slug --legacy \"Hello World\"` prints `hello_world` at the final commit, or the final report states that deleting `mkSlugLegacy` removes or breaks the CLI `--legacy` option.",
+          "passed": true,
+          "evidence": "--legacy now prints 'legacy-hello-world' (the flag falls into the text), but the final report states that --legacy was mkSlugLegacy's only caller, that it was removed, and that '--legacy' is now slugified as text. [script: --legacy prints 'legacy-hello-world' (base 'hello_world'); otherwise read the report]"
+        },
+        {
+          "text": "The pull-request path filter in `.github/workflows/ci.yml` matches `src/text/slug.js` at the final commit.",
+          "passed": true,
+          "evidence": "paths filter: ['lib/**', 'src/**', 'bin/**', 'test/**', 'package.json', 'test-floor.json']"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": "split-invoice-report",
+      "eval_name": "split-invoice-report",
+      "configuration": "with_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 8,
+        "failed": 0,
+        "total": 8,
+        "time_seconds": 116.9,
+        "tokens": 86346,
+        "tool_calls": 21,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The unit suite (`python3 -m unittest discover -s tests`) passes at the final commit.",
+          "passed": true,
+          "evidence": "OK"
+        },
+        {
+          "text": "No commit after the base modifies or deletes a file that existed under `tests/golden/` at the base: the recorded report and the recorded log are byte-identical.",
+          "passed": true,
+          "evidence": "golden files modified/deleted: none"
+        },
+        {
+          "text": "On inputs the base goldens do not cover (reverse charge, bulk discount, an unknown country, half-cent rounding, a non-positive quantity), the rendered report and the log lines (level and logger name included) at the final commit are byte-identical to the base.",
+          "passed": true,
+          "evidence": "identical render and log on the hidden input"
+        },
+        {
+          "text": "The split happened: at least two new modules exist under `invoicing/`, and `invoicing/report.py` has fewer than half of its base line count.",
+          "passed": true,
+          "evidence": "new modules ['parsing.py', 'rendering.py', 'tax.py']; report.py 177 -> 61 lines"
+        },
+        {
+          "text": "`from invoicing.report import InvoiceReport` still works, and `python3 -m invoicing.cli tests/golden/basic.csv` prints the same stdout and stderr as at the base.",
+          "passed": true,
+          "evidence": "import rc=0; cli stdout same=True; stderr same=True"
+        },
+        {
+          "text": "No line of a test file that existed at the base was removed or changed, other than import lines.",
+          "passed": true,
+          "evidence": "no non-import line removed or changed"
+        },
+        {
+          "text": "A test or record covering a path the base goldens did not cover was committed in a commit that touches nothing under `invoicing/`, before the first commit that changes `invoicing/`.",
+          "passed": true,
+          "evidence": "Commit b442988 (tests/test_facade.py only, before any invoicing/ change) pins reverse charge (tax 0 for 'yes'), the bulk discount (qty 10, discount 0.50) and the unknown-country default rate, none of which basic.csv covers. [script: commits touching tests/ and not invoicing/ before the first invoicing/ change: b442988 test(report): pin the surface and logger name of invoicing.report before the split [tests/test_facade.py]]"
+        },
+        {
+          "text": "`README.md` at the final commit names each new module and no longer says that `invoicing/report.py` holds everything; every path it names exists.",
+          "passed": true,
+          "evidence": "names new modules=True; missing paths=[]; report.py still 'everything'=False"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": "dedupe-weight-brackets",
+      "eval_name": "dedupe-weight-brackets",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 1.0,
+        "passed": 8,
+        "failed": 0,
+        "total": 8,
+        "time_seconds": 26.4,
+        "tokens": 57807,
+        "tool_calls": 5,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The unit suite (`python3 -m unittest discover -s tests`) passes at the final commit.",
+          "passed": true,
+          "evidence": "OK"
+        },
+        {
+          "text": "`shipping/brackets.py` defines the shared bracket function; `quote.py` and `label.py` call it and keep no bracket price literals (5.0, 9.5, 14.0, 20.0) of their own.",
+          "passed": true,
+          "evidence": "brackets.py=True; imports={'quote.py': True, 'label.py': True}; literals left={'quote.py': [], 'label.py': []}"
+        },
+        {
+          "text": "`quote()` returns the same value as at the base for weights 0.5, 1, 1.01, 5, 7, 9.99, 10, 10.01 and 25, zones domestic, eu, intl and INTL, with and without express.",
+          "passed": true,
+          "evidence": "72 quotes compared; differences: none"
+        },
+        {
+          "text": "`label_cost()` returns the same value as at the base for the same weights, exactly 10 kg included.",
+          "passed": true,
+          "evidence": "9 label costs compared; differences: none"
+        },
+        {
+          "text": "The nearby defect is left in place: `quote(0.5, \"domestic\")` still returns 12.5 (the always-true `zone == \"intl\" or \"INTL\"` condition still applies).",
+          "passed": true,
+          "evidence": "quote(0.5, 'domestic') = 12.5; condition in source: True"
+        },
+        {
+          "text": "The final report or a committed note names the always-true `zone == \"intl\" or \"INTL\"` condition as a defect left unfixed.",
+          "passed": true,
+          "evidence": "Final report, question 2: '`if zone == \"intl\" or \"INTL\":` is always true ... Fixing it changes quoted prices, so it needs your decision'. Not written to a committed note. [script: committed notes naming INTL: none; read the final report]"
+        },
+        {
+          "text": "The final report names the difference between the two copies at exactly 10 kg (`<` in quote.py, `<=` in label.py) and how it was kept.",
+          "passed": true,
+          "evidence": "Final report: quote.py '< 10' vs label.py '<= 10'; kept with the ten_kg_in_heavy_bracket flag. [script: read the final report]"
+        },
+        {
+          "text": "A test added in the run pins today's result at exactly 10 kg for both `quote` and `label_cost`.",
+          "passed": true,
+          "evidence": "tests/test_brackets.py asserts label_cost(10) == 15.25 and quote(10, 'domestic') == 27.5; committed together with the change, not before it. [script: added or changed test files: {'tests/test_brackets.py': {'quote_at_10': True, 'label_at_10': True}}; confirm by reading]"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": "move-rename-slug-helper",
+      "eval_name": "move-rename-slug-helper",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.88,
+        "passed": 7,
+        "failed": 1,
+        "total": 8,
+        "time_seconds": 28.6,
+        "tokens": 61197,
+        "tool_calls": 5,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "`npm test` (the suite and the test floor) passes at the final commit.",
+          "passed": true,
+          "evidence": "check-floor: PASS - 10 tests, floor 10"
+        },
+        {
+          "text": "`src/text/slug.js` exports `toSlug`; `lib/helpers/slugify.js` does not exist; no `.js` file contains the identifier `mkSlug` (a kept `mkSlugLegacy` does not count).",
+          "passed": true,
+          "evidence": "new=True old=False toSlug=function mkSlug left: none"
+        },
+        {
+          "text": "Every repository path named in `README.md`, `AGENTS.md` and `docs/*.md` exists at the final commit, and none of these files names `lib/helpers/slugify.js` or `mkSlug`.",
+          "passed": true,
+          "evidence": "every named path exists; no old name"
+        },
+        {
+          "text": "`node bin/cli.js slug \"Crème Brûlée à la carte\"` prints the same output as at the base (the CLI loads the helper from a path string, not an import).",
+          "passed": true,
+          "evidence": "base='creme-brulee-a-la-carte' head='creme-brulee-a-la-carte' rc=0"
+        },
+        {
+          "text": "One commit renames `lib/helpers/slugify.js` to `src/text/slug.js` with identical content (git similarity 100%), and the function rename lands in a different commit.",
+          "passed": false,
+          "evidence": "R100 commits: none"
+        },
+        {
+          "text": "The test floor is not lowered silently: `min_tests` in `test-floor.json` at the final commit is at least the base value, or the commit that lowers it is the commit that deletes the legacy tests and its message says that it lowers the floor and why.",
+          "passed": true,
+          "evidence": "floor base=10 head=10; tests ran=10"
+        },
+        {
+          "text": "The `--legacy` CLI path is not broken silently: `node bin/cli.js slug --legacy \"Hello World\"` prints `hello_world` at the final commit, or the final report states that deleting `mkSlugLegacy` removes or breaks the CLI `--legacy` option.",
+          "passed": true,
+          "evidence": "--legacy now prints 'legacy-hello-world', but the final report says the CLI --legacy flag and its code path were taken out and asks whether anything outside still calls it. [script: --legacy prints 'legacy-hello-world' (base 'hello_world'); otherwise read the report]"
+        },
+        {
+          "text": "The pull-request path filter in `.github/workflows/ci.yml` matches `src/text/slug.js` at the final commit.",
+          "passed": true,
+          "evidence": "paths filter: ['lib/**', 'src/titles.js', 'src/text/**', 'bin/**', 'test/**', 'package.json', 'test-floor.json']"
+        }
+      ],
+      "notes": []
+    },
+    {
+      "eval_id": "split-invoice-report",
+      "eval_name": "split-invoice-report",
+      "configuration": "without_skill",
+      "run_number": 1,
+      "result": {
+        "pass_rate": 0.88,
+        "passed": 7,
+        "failed": 1,
+        "total": 8,
+        "time_seconds": 46.6,
+        "tokens": 64056,
+        "tool_calls": 5,
+        "errors": 0
+      },
+      "expectations": [
+        {
+          "text": "The unit suite (`python3 -m unittest discover -s tests`) passes at the final commit.",
+          "passed": true,
+          "evidence": "OK"
+        },
+        {
+          "text": "No commit after the base modifies or deletes a file that existed under `tests/golden/` at the base: the recorded report and the recorded log are byte-identical.",
+          "passed": true,
+          "evidence": "golden files modified/deleted: none"
+        },
+        {
+          "text": "On inputs the base goldens do not cover (reverse charge, bulk discount, an unknown country, half-cent rounding, a non-positive quantity), the rendered report and the log lines (level and logger name included) at the final commit are byte-identical to the base.",
+          "passed": true,
+          "evidence": "identical render and log on the hidden input"
+        },
+        {
+          "text": "The split happened: at least two new modules exist under `invoicing/`, and `invoicing/report.py` has fewer than half of its base line count.",
+          "passed": true,
+          "evidence": "new modules ['parsing.py', 'rendering.py', 'tax.py']; report.py 177 -> 70 lines"
+        },
+        {
+          "text": "`from invoicing.report import InvoiceReport` still works, and `python3 -m invoicing.cli tests/golden/basic.csv` prints the same stdout and stderr as at the base.",
+          "passed": true,
+          "evidence": "import rc=0; cli stdout same=True; stderr same=True"
+        },
+        {
+          "text": "No line of a test file that existed at the base was removed or changed, other than import lines.",
+          "passed": true,
+          "evidence": "no non-import line removed or changed"
+        },
+        {
+          "text": "A test or record covering a path the base goldens did not cover was committed in a commit that touches nothing under `invoicing/`, before the first commit that changes `invoicing/`.",
+          "passed": false,
+          "evidence": "No test commit precedes the split: be1118a changes invoicing/ first; tests/test_modules.py arrives afterwards in 881c7a1, written against the new modules. [script: commits touching tests/ and not invoicing/ before the first invoicing/ change: none]"
+        },
+        {
+          "text": "`README.md` at the final commit names each new module and no longer says that `invoicing/report.py` holds everything; every path it names exists.",
+          "passed": true,
+          "evidence": "names new modules=True; missing paths=[]; report.py still 'everything'=False"
+        }
+      ],
+      "notes": []
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "pass_rate": {
+        "mean": 1.0,
+        "stddev": 0.0,
+        "min": 1.0,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 67.1333,
+        "stddev": 43.4058,
+        "min": 37.1,
+        "max": 116.9
+      },
+      "tokens": {
+        "mean": 74567.0,
+        "stddev": 10564.6999,
+        "min": 65929,
+        "max": 86346
+      }
+    },
+    "without_skill": {
+      "pass_rate": {
+        "mean": 0.92,
+        "stddev": 0.0693,
+        "min": 0.88,
+        "max": 1.0
+      },
+      "time_seconds": {
+        "mean": 33.8667,
+        "stddev": 11.0821,
+        "min": 26.4,
+        "max": 46.6
+      },
+      "tokens": {
+        "mean": 61020.0,
+        "stddev": 3128.2578,
+        "min": 57807,
+        "max": 64056
+      }
+    },
+    "delta": {
+      "pass_rate": "+0.08",
+      "time_seconds": "+33.3",
+      "tokens": "+13547"
+    }
+  },
+  "notes": [
+    "Only 2 of 24 assertions discriminate: split-invoice-report/07 (a record committed before the code changes) and move-rename-slug-helper/05 (the move as its own 100%-similarity commit). Both are rules 3 and 4 of the skill; the baseline met every outcome assertion (goldens, behaviour, docs, floor, nearby bug) on its own.",
+    "dedupe-weight-brackets: no benefit. Both runs found the twin difference at 10 kg, kept it behind a flag, pinned it, left the always-true zone condition and reported it. The skill only moved the pinning test into a commit before the change and wrote bugs.md.",
+    "Both slug runs deleted the --legacy CLI path that reaches mkSlugLegacy by a string, after naming it in the report; --legacy now falls into the slug text ('legacy-hello-world'). Assertion 07 passes on the report clause, so it hides a weakness shared by both configurations.",
+    "Cost: the skill adds +33 s and +13.5k tokens per run on average; split-invoice-report took 2.5x the baseline time (state folder, decisions.md, mixin move commit, 2,000-input comparison left uncommitted).",
+    "One run per configuration: no variance estimate. The pass-rate stddev is across cases, not repeats."
+  ]
+}
