@@ -1,16 +1,22 @@
 import json
 import os
+import subprocess
 import unittest
 
-from helpers import HarnessTestCase, sha256_file
+from helpers import REPO_ROOT, HarnessTestCase, load_tool, sha256_file, skill_text
 
-SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round"]
+SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round", "cdv-notion"]
+NOTION_CLIENT = "skills/cdv-notion/scripts/notion"
+USER_EXTRA = {
+    "skills/cdv-notion/SKILL.md": skill_text("cdv-notion"),
+    NOTION_CLIENT: ("#!/usr/bin/env python3\nprint('notion')\n", True),
+}
 
 
 class SyncUserTest(HarnessTestCase):
     def setUp(self):
         super().setUp()
-        self.core = self.make_core()
+        self.core = self.make_core(extra=USER_EXTRA)
         self.skills = self.home / ".claude" / "skills"
 
     def sync_user(self, tag="v0.1.0", *extra):
@@ -29,7 +35,9 @@ class SyncUserTest(HarnessTestCase):
         self.assertEqual(lock["schema"], 1)
         self.assertEqual(lock["ref"], "v0.1.0")
         self.assertEqual(lock["paths"], sorted(f".claude/skills/{n}" for n in SKILLS))
-        self.assertEqual(sorted(lock["files"]), sorted(f".claude/skills/{n}/SKILL.md" for n in SKILLS))
+        self.assertEqual(
+            sorted(lock["files"]), sorted([f".claude/skills/{n}/SKILL.md" for n in SKILLS] + [f".claude/{NOTION_CLIENT}"])
+        )
         for path, digest in lock["files"].items():
             self.assertEqual(sha256_file(self.home / path), digest)
         self.assertEqual(lock["commit"], self.git(self.core, "rev-parse", "v0.1.0^{commit}").stdout.strip())
@@ -40,6 +48,15 @@ class SyncUserTest(HarnessTestCase):
         )
         self.sync_user("v0.2.0")
         self.assertTrue(os.access(self.skills / "cdv-grilling/scripts/go.sh", os.X_OK))
+
+    def test_notion_client_is_installed_executable(self):
+        result = self.sync_user()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        client = self.home / ".claude" / NOTION_CLIENT
+        self.assertTrue(client.is_file())
+        self.assertTrue(os.access(client, os.X_OK))
+        lock = json.loads((self.home / ".claude/harness-user.lock").read_text())
+        self.assertIn(".claude/skills/cdv-notion", lock["paths"])
 
     def test_refuses_when_a_symlink_exists_and_touches_nothing(self):
         elsewhere = self.tmp / "elsewhere"
@@ -123,6 +140,16 @@ class SyncUserTest(HarnessTestCase):
         result = self.harness("sync", "--user", "v0.1.0", "--from", str(self.core), cwd=workdir)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(list(workdir.iterdir()), [])
+
+
+class UserSkillsListTest(unittest.TestCase):
+    def test_user_skills_name_cdv_notion_and_its_client_is_executable(self):
+        self.assertIn("cdv-notion", load_tool().USER_SKILLS)
+        listed = subprocess.run(
+            ["git", "ls-files", "-s", NOTION_CLIENT], cwd=REPO_ROOT, capture_output=True, text=True, check=True
+        ).stdout.split()
+        self.assertEqual(listed[:1], ["100755"])
+        self.assertTrue(os.access(REPO_ROOT / NOTION_CLIENT, os.X_OK))
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ import tempfile
 import urllib.parse
 from pathlib import Path
 
-USER_SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round"]
+USER_SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round", "cdv-notion"]
 THIRD_PARTY_FILE = "third-party.json"
 THIRD_PARTY_RAW = "https://raw.githubusercontent.com"
 LOCK_RELATIVE = ".claude/harness.lock"

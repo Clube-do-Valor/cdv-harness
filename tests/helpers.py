@@ -162,11 +162,11 @@ class HarnessTestCase(unittest.TestCase):
         if tag:
             self.git(core, "tag", "-a", tag, "-m", tag, env=env)
 
-    def make_core(self, name="core", v1_tag="v0.1.0", date=OLD_DATE, with_remote=False):
+    def make_core(self, name="core", v1_tag="v0.1.0", date=OLD_DATE, with_remote=False, extra=None):
         core = self.tmp / name
         core.mkdir()
         self.git(core, "init", "-q", "-b", "main")
-        self.commit_core(core, core_v1(), message="feat: first version", tag=v1_tag, date=date)
+        self.commit_core(core, {**core_v1(), **(extra or {})}, message="feat: first version", tag=v1_tag, date=date)
         if with_remote:
             remote = self.tmp / f"{name}-remote.git"
             self.git(self.tmp, "init", "-q", "--bare", str(remote))

@@ -42,7 +42,7 @@ Every core skill reads the profile in its step 0 and stops when it is missing, t
 2. Run `bin/harness sync <tag> --from <checkout of this repository> --repo <consumer>` (without `--from`, it clones `harness_source`). It copies the skills, rules, gate, hooks and references, merges the deny list and the core hook entries (`hooks.PreToolUse`; the repository's own hooks stay), writes the house block between `<!-- cdv-harness:house vX.Y.Z -->` markers, removes what an older tag shipped and this one does not, writes the lock and stages everything, the profile included, with `git add -f` (a repository may ignore `.claude/`; `profile.local.yaml` is never staged). `--pr` also commits, pushes `chore/harness-sync-<tag>` and opens the PR through the profile's `pr_cli` (`gh` or the bundled Bitbucket client).
 3. Add the gate to the repository's CI on pull requests: `sh .claude/harness/bin/verify.sh`. It needs no network: it recomputes the hash of the vendored files and compares it with the lock. Exit 0 matches, 1 lists the changed, created and deleted files, 2 means the lock is missing or invalid.
 
-`bin/harness sync --user <tag>` installs `cdv-grilling`, `cdv-grill-me` and `cdv-research-round` as copies into `~/.claude/skills/`, with `~/.claude/harness-user.lock`, for work outside any repository. It refuses to replace a skill it did not install.
+`bin/harness sync --user <tag>` installs `cdv-grilling`, `cdv-grill-me`, `cdv-research-round` and `cdv-notion` (with its `scripts/notion` client) as copies into `~/.claude/skills/`, with `~/.claude/harness-user.lock`, for work outside any repository. It refuses to replace a skill it did not install.
 
 ## Upstream first
 
