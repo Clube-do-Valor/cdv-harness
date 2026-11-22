@@ -39,6 +39,8 @@ Uma linha final com 3 a 5 termos em `code`, minúsculos, separados por espaço: 
 
 ## Esqueleto (Notion-flavored Markdown)
 
+A sintaxe é a que a API aceita em `markdown_version: "v2"`, descrita em `.claude/skills/cdv-notion/references/notion-markdown.md` (no núcleo, `skills/cdv-notion/references/notion-markdown.md`): callout em `<callout icon="…" color="…">` com o texto na linha seguinte, tabela com cabeçalho em `<table header-row="true">` com linhas `<tr><td>…</td></tr>`, seção recolhível em `<toggle>` com o título na linha seguinte. Salve o esqueleto preenchido num arquivo e escreva com o cliente do `cdv-notion`: `notion update <card> --prepend-file nota.md` num card sem nota, `notion update <card> --edit '<trecho atual>' '<trecho novo>'` numa nota existente, `notion update <card> --replace-file nota.md` quando o corpo inteiro é substituído.
+
 ```markdown
 <callout icon="⚡" color="blue_bg">
 <b>TL;DR:</b> <Problema em termos operacionais.> <O que passa a acontecer, com o termo-chave em <b>negrito</b>.> <Impacto visível.>

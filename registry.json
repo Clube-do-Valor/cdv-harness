@@ -23,7 +23,7 @@
       "owner": "augusto-henriques",
       "description": "Read-only root-cause investigation for backend bugs (integrations and sync jobs especially), from a Laravel log, a Sentry issue, or a human report, ending in an evidence-backed report. Triggers on \"investigue esse erro\", \"olha esse log\", \"esse cliente reportou\", \"esse 404 da integração\", \"esse erro do workflow\", or a pasted stack trace. When the user signals fix intent (\"vamos consertar\", \"plano de fix\"), sizes the fix and asks: a small fix (≤ ~3 files, no migration, no new screen) can be done here as \"fix direto\" (fix + test + express finalize); anything larger than small hands off to `cdv-kickoff`. Never produces a multi-phase plan. Do NOT use for feature implementation, refactors, frontend-only bugs, or generic Laravel questions.",
       "path": "skills/cdv-debug",
-      "contentHash": "051fdb5c1e80d2728ce722146180579b6d37e6d9c17d6ac53d544b54dd4734ff"
+      "contentHash": "a119d7b5c6f23d17e4f1f7f792561e5cb23d44ef83c6362303afd75fdb6c888c"
     },
     {
       "name": "cdv-factory-finalize",
@@ -90,12 +90,20 @@
       "contentHash": "9c9ae876a9f39118111aa42537fd2cb7664849b42aaecff72e2a15a54dc19cc6"
     },
     {
+      "name": "cdv-notion",
+      "version": "0.1.0",
+      "owner": "augusto-henriques",
+      "description": "Read, query, create, edit and comment on Notion pages and data sources through the public REST API with the bundled `notion` client (one API token on the machine, no Notion MCP needed) — fetch a card by url, id or ticket key with its properties and body, query a data source with a readable condition and counts, search, change properties in the short format, edit the body in Notion-flavored Markdown, comment, upload and download files, find people. Triggers on any Notion request: \"lê o card\", \"busca no Notion\", \"atualiza o status do card\", \"move o card\", \"escreve no corpo do card\", \"comenta no card\", \"quantos cards\", \"lista as tasks do projeto\", \"fetch this Notion page\", a pasted notion.so or app.notion.com link, or a ticket key. The core skills that touch the card run their Notion steps through this client. Do NOT use to decide what a delivery note or a bug analysis says (cdv-notion-ticket and cdv-debug own the content), or for another ticket system.",
+      "path": "skills/cdv-notion",
+      "contentHash": "4ea3087f4bccd53f193ec0d81dbb5d4dd7dbbb0ae59410f58fca582fea168766"
+    },
+    {
       "name": "cdv-notion-ticket",
       "version": "0.1.0",
       "owner": "augusto-henriques",
-      "description": "Write the business-facing delivery note on a feature's Notion card — short pt-BR delivery-note layout (TL;DR callout, Antes/Agora table, como usar, próximos passos with the PR link) grounded in the branch's real diff, written into the card through the Notion MCP after the user confirms the draft (inside a cdv-kickoff run, without the question); once the PR exists the card follows the layout of the project's three most recent cards, links the PR both ways and moves to the PR-open status. Sits beside cdv-finalize — that one produces the technical PR description; this one produces the business delivery description (Notion). Triggers on \"gera o ticket da entrega\", \"descrição pra o card do Notion\", \"nota de entrega\", \"delivery note\", \"o que escrevo no ticket dessa feature\". Do NOT use for the PR description (cdv-finalize), bug-analysis Notion blocks (cdv-debug Step 8 owns the Análise técnica template), or planning artifacts.",
+      "description": "Write the business-facing delivery note on a feature's Notion card — short pt-BR delivery-note layout (TL;DR callout, Antes/Agora table, como usar, próximos passos with the PR link) grounded in the branch's real diff, written into the card with the cdv-notion client after the user confirms the draft (inside a cdv-kickoff run, without the question); once the PR exists the card follows the layout of the project's three most recent cards, links the PR both ways and moves to the PR-open status. Sits beside cdv-finalize — that one produces the technical PR description; this one produces the business delivery description (Notion). Triggers on \"gera o ticket da entrega\", \"descrição pra o card do Notion\", \"nota de entrega\", \"delivery note\", \"o que escrevo no ticket dessa feature\". Do NOT use for the PR description (cdv-finalize), bug-analysis Notion blocks (cdv-debug Step 8 owns the Análise técnica template), or planning artifacts.",
       "path": "skills/cdv-notion-ticket",
-      "contentHash": "0fefaeda434c8074deab1de99e6e4ee3cee37e986c45d09e83a276f52537bef2"
+      "contentHash": "32e3b2231ff42ad52cfabea685583778f330ca59a51c35d916ff6cf9ca2219db"
     },
     {
       "name": "cdv-open-pr",
@@ -103,7 +111,7 @@
       "owner": "augusto-henriques",
       "description": "Open or update the pull request of a branch through the host's API (`profile.pr_cli`, the bundled `bb` client for Bitbucket or `gh` for GitHub) — conventional title, the finalize description plus the `🏷️ Ticket` section with the ticket hyperlinked, the default reviewers, close-source-branch. Called by `cdv-finalize` Step 9 right after the push; triggers on its own on \"abre o PR\", \"open the PR\", \"abre os PRs dos workers\", \"atualiza a descrição do PR\", \"comenta no PR\". Claude in Chrome only as the fallback when the developer has no token and does not want to create one now; do NOT use to merge, approve or decline.",
       "path": "skills/cdv-open-pr",
-      "contentHash": "67afd0eb8d70c936c068e34c8c0683a17446adc69c801844928ec39dd7cf3b47"
+      "contentHash": "248beba2e89973c9afd81042a26623219290c78139e2214d9f8ad2e76599e61a"
     },
     {
       "name": "cdv-pr-review",

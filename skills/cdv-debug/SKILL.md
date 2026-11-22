@@ -129,7 +129,7 @@ Keep tables tight.
 
 Only triggered when `profile.ticket_system` is `notion` and the user wants the analysis on a ticket card. Otherwise stop after Step 7.
 
-Follow [references/notion-ticket-template.md](references/notion-ticket-template.md) for the exact "Análise técnica" structure and render the block as paste-ready text in the chat (or as ephemeral `analise-<slug>.md` at the repo root when the user prefers a file). When the Notion MCP is connected and the user confirms the draft, the block is appended below the card's original description through the MCP; otherwise the user pastes it into the card. Do not restate the card's title, status or properties in the block.
+Follow [references/notion-ticket-template.md](references/notion-ticket-template.md) for the exact "Análise técnica" structure and render the block as paste-ready text in the chat (or as ephemeral `analise-<slug>.md` at the repo root when the user prefers a file). When the `cdv-notion` client has a token (`.claude/skills/cdv-notion/scripts/notion auth status` exits `0`) and the user confirms the draft, the block is appended below the card's original description with `notion update <card> --append-file analise-<slug>.md` (or the anchored `--edit` the template describes); otherwise the user pastes it into the card. Do not restate the card's title, status or properties in the block.
 
 ### Step 9 — Two lanes when fix intent appears: fix direto or `cdv-kickoff`
 
@@ -201,7 +201,7 @@ Solution: **invoke `cdv-kickoff` via the `Skill` tool** with the Shared Understa
 
 ## Tools assumed available
 
-`Read`, `Bash` (REPL + git), `Grep`/`Glob`. Sentry MCP is optional — fall back to pasted stack traces when not connected. The Notion MCP is optional too: without it the Análise técnica block leaves as paste-ready text (Step 8).
+`Read`, `Bash` (REPL + git), `Grep`/`Glob`. Sentry MCP is optional — fall back to pasted stack traces when not connected. The `cdv-notion` client is optional too: without a Notion token the Análise técnica block leaves as paste-ready text (Step 8).
 
 ## Bundled scripts
 

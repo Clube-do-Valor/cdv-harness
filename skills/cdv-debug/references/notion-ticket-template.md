@@ -1,6 +1,6 @@
 # Notion Ticket — "Análise técnica" Template
 
-Used in Step 8 when the user wants the analysis on a Notion card. The block is rendered paste-ready; when the Notion MCP is connected and the user confirms the draft, it is appended to the card through the MCP, otherwise the user appends it manually.
+Used in Step 8 when the user wants the analysis on a Notion card. The block is rendered paste-ready; when the `cdv-notion` client has a token and the user confirms the draft, it is appended to the card with that client (`.claude/skills/cdv-notion/scripts/notion`, written `notion` below), otherwise the user appends it manually. The syntax is the Notion-flavored Markdown of `.claude/skills/cdv-notion/references/notion-markdown.md` (in the core, `skills/cdv-notion/references/notion-markdown.md`).
 
 ## Operating rules
 
@@ -112,20 +112,26 @@ Casos análogos detectados na auditoria (quando aplicável):
 
 ## Anchoring the append
 
-The existing description of a ticket usually ends with a last section (`## <last heading>`) followed by the reporter's text. Build the `old_str` and `new_str` like:
+`notion fetch <card>` first. The existing description of a ticket usually ends with a last section (`## <last heading>`) followed by the reporter's text, so the block goes at the end:
 
 ```
-old_str: "## <last heading>\n<reporter's exact text on last line>"
-new_str: "## <last heading>\n<reporter's exact text on last line>\n## Análise técnica\n**\\[<Module>\\] <Concise title>**\n\n---\n\n... full block ..."
+notion update <card> --append-file analise-<slug>.md
 ```
 
-If the reporter's text repeats earlier in the description (e.g., copied between two sections), include the last section's `##` header in the anchor to disambiguate.
+When the description has something after the reporter's text that must stay last, anchor the block instead: copy the last heading and the reporter's exact last line from the fetched body, and replace them with themselves plus the block:
 
-## Markdown gotchas in Notion enhanced markdown
+```
+notion update <card> --edit "$(cat anchor.md)" "$(cat anchor.md analise-<slug>.md)"
+```
+
+`anchor.md` holds `## <last heading>` and the reporter's exact last line; it must match one place in the body. If the reporter's text repeats earlier in the description (e.g., copied between two sections), keep the last section's `##` header in the anchor to disambiguate. An anchor that matches nothing exits `1` and changes nothing: fetch again and copy the text as it is now.
+
+## Markdown gotchas (Notion-flavored Markdown)
 
 - Escape square brackets in titles: `**\[Module\] ...**`, not `**[Module] ...**`.
 - Pipes inside metadata line escape with `\|`: `Tipo: Bug \| Prioridade: ...`.
-- Tables use `<table header-row="true">` with `<tr>/<td>` tags, not pipe-table markdown.
+- Tables use `<table header-row="true">` with `<tr><td>…</td></tr>` rows, never mixed with pipe-table markdown in the same table.
+- A collapsible section is `<toggle>` with its title on the next line, a blank line, the content, then `</toggle>` (for a long audit list under Diagnóstico, for instance).
 - Horizontal rules are `---` on their own line, with blank lines around.
 - Code-style references for emails/ids: backticks (`` `user@example.com` ``).
 - Never use multiline YAML operators in any value (Notion's parser drops them).

@@ -28,3 +28,4 @@ skills/tlc-spec-lean/*	(?i)\bfelipe\b	upstream third-party skill (public, CC-BY-
 CATALOG.md	(?i)\bplanner\b	description of the third-party tlc-spec-lean skill
 registry.json	(?i)\bplanner\b	description of the third-party tlc-spec-lean skill
 commit d159af0	.	already public in the history of main: a squash merge made through the GitHub web interface recorded the account e-mail; history is not rewritten
+skills/cdv-notion/*	collection://[<'"{]	the reference form of a data source, written as a placeholder or a code constant; an id after it is still a finding

@@ -1,0 +1,28 @@
+# What the API cannot do, and what to do instead
+
+The public REST API covers almost everything the Notion MCP did, but not all of it. When a request needs one of these, say so and do the alternative; never pretend it happened. Sources: the official reference at https://developers.notion.com (comments, search, users, request limits), as read on 2026-11-22.
+
+| The API cannot | Do instead |
+|---|---|
+| Read resolved comments: `GET /v1/comments` returns only open discussions | Say that resolved threads are not visible to the integration; ask the user to paste what matters from them, or reopen the thread in Notion |
+| Resolve a discussion, or reopen one | Ask the user to resolve it in Notion; a reply (`notion comments reply`) can say it is settled |
+| Start a discussion anchored to a selected text | Comment on the page (`notion comments add`) quoting the passage, or reply to an existing thread |
+| Search page bodies: `POST /v1/search` matches titles only | `notion search` also looks in each connected data source's title and text properties; for the body, narrow with `notion query`, then `notion fetch` the candidates and read them |
+| Edit or delete another author's comment: a token edits only its own comments | Reply in the same discussion with the correction (`notion comments reply <discussion>`) |
+| Keep the person as the author: page authorship and every edit show the integration | Fill `Requester` / `Assignee`-style properties explicitly, and sign comments (`me` in the settings); the history stays the integration's |
+| List guests in `GET /v1/users` | `notion users find` also knows everyone seen in person properties of rows already read; pass `user://<uuid>` when you have it |
+| Run SQL, joins or aggregates over data sources | `notion query --where … --count` / `--group-by`; a join is two queries and a match on the relation ids in the shell |
+| Filter on formulas or rollups through `--where` | `notion api POST /v1/data_sources/<id>/query --data '<filter json>'` with the formula/rollup filter |
+| Duplicate a page | `notion create` with the fetched properties and body, or a template through `notion api` |
+| Restore page history or see past versions | Ask the user to use the page history in Notion |
+| Create folders, or AI search | Not available to integrations |
+
+## Limits a command can meet
+
+- **Rate:** a fixed 60-second window per integration (about 3 requests a second on most plans, 10 on Business and Enterprise) plus a workspace budget shared by every integration. The client waits out each 429 (`Retry-After`, at most 5 times); a shared token means teammates share the window, so prefer one `--count` to many fetches.
+- **Writes in doubt:** a 502, 503, 504 or a timeout on a write may have been applied. The client never resends a create blindly; for an update, fetch the page and check before running it again.
+- **Sizes:** 2,000 characters per rich text piece (the client splits titles and text), 100 items per people, relation or multi-select write, 100 edits per `--edit` call, about 5,000 blocks per body write and about 20,000 per read (a longer page reads back with `<unknown>` markers and `truncated`).
+- **Nesting:** filter groups two levels deep.
+- **Query results:** 10,000 rows per query on Notion's side; the client stops at 2,000 unless `--max-rows` raises it.
+- **Files:** one upload takes up to 20 MB and must be attached within an hour; signed download urls expire after about an hour (fetch the page again for fresh ones).
+- **Access:** the integration sees only the pages and data sources connected to it (inherited by their children). A 404 or 403 on a page that exists means it is not connected: the message names the id; a person with access adds the integration through the page menu → Connections.
