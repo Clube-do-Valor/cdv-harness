@@ -281,6 +281,191 @@ class RatchetTest(RepoCase):
         self.assertIn("printed no number", silent.stderr)
 
 
+class RecordsGuardTest(RepoCase):
+    """A file under a frozen location changes only with a declaration added by the same commit."""
+
+    def setUp(self):
+        super().setUp()
+        (self.repo / "records").mkdir()
+        (self.repo / "records" / "routes.json").write_text('{"v": 1}\n')
+        (self.repo / "records" / "registry.json").write_text('{"v": 1}\n')
+        self.start = commit(self.repo, "records")
+        self.folder.mkdir(parents=True)
+        self.write_records(frozen=["records/"], excludes=["records/registry.json"])
+        commit(self.repo, "freeze the records")
+
+    def write_records(self, **fields):
+        path = self.folder / "records.json"
+        data = json.loads(path.read_text()) if path.is_file() else {}
+        data.update(fields)
+        path.write_text(json.dumps(data, indent=2))
+
+    def declare(self, path, reason="decision 4: route retired", **extra):
+        data = json.loads((self.folder / "records.json").read_text())
+        data.setdefault("declared", []).append({"path": path, "reason": reason, **extra})
+        (self.folder / "records.json").write_text(json.dumps(data, indent=2))
+
+    def edit(self, name="routes.json", text='{"v": 2}\n'):
+        (self.repo / "records" / name).write_text(text)
+
+    def guard(self, *args, base=None):
+        return run("records_guard.py", "--folder", str(self.folder), "--base", base or self.base, *args, cwd=self.repo)
+
+    def test_a_record_changed_in_a_commit_with_no_declaration_is_refused(self):
+        self.edit()
+        commit(self.repo, "fix the record instead of the code")
+        result = self.guard()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("UNDECLARED modified records/routes.json", result.stdout)
+        self.assertIn("IN THE COMMIT THAT MAKES THEM", result.stdout)
+        verdict(result, "records_guard", "check", "FAIL")
+
+    def test_a_deletion_and_a_rename_are_changes_too(self):
+        git(self.repo, "mv", "records/routes.json", "records/paths.json")
+        commit(self.repo, "rename a record")
+        result = self.guard()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("UNDECLARED deleted  records/routes.json", result.stdout)
+        self.assertNotIn("paths.json", result.stdout, "the new name is an addition, which is allowed")
+
+    def test_a_declaration_in_a_later_commit_covers_nothing_earlier(self):
+        self.edit()
+        commit(self.repo, "edit the record")
+        self.declare("records/routes.json")
+        commit(self.repo, "declare it afterwards")
+        result = self.guard()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("UNDECLARED modified records/routes.json", result.stdout)
+        self.assertIn("STALE declaration of records/routes.json", result.stdout, "and the late declaration covers nothing")
+
+    def test_a_change_declared_in_its_own_commit_passes(self):
+        self.edit()
+        self.declare("records/routes.json")
+        commit(self.repo, "retire the route, declared")
+        result = self.guard()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("declared  any records/routes.json", result.stdout)
+        verdict(result, "records_guard", "check", "PASS")
+        self.edit(text='{"v": 3}\n')
+        commit(self.repo, "edit it again")
+        self.assertEqual(self.guard().returncode, 1, "the declaration covered its own commit only")
+
+    def test_a_declared_deletion_passes_and_adding_a_record_is_always_allowed(self):
+        (self.repo / "records" / "new.json").write_text("{}\n")
+        commit(self.repo, "a new record")
+        self.assertEqual(self.guard().returncode, 0)
+        (self.repo / "records" / "new.json").write_text('{"changed": true}\n')
+        commit(self.repo, "change the new record")
+        self.assertEqual(self.guard().returncode, 1, "from the commit that adds it, the record is protected")
+        git(self.repo, "reset", "-q", "--hard", "HEAD~1")
+        git(self.repo, "rm", "-q", "records/new.json")
+        self.declare("records/new.json", change="deleted")
+        commit(self.repo, "drop a record, declared")
+        self.assertEqual(self.guard().returncode, 0)
+
+    def test_unfreezing_in_the_commit_that_edits_does_not_unfreeze(self):
+        self.write_records(frozen=[])
+        self.edit()
+        commit(self.repo, "empty the list and edit the record in one commit")
+        result = self.guard()
+        self.assertEqual(result.returncode, 1, "the union of every version of the list freezes for good")
+        self.assertIn("UNDECLARED modified records/routes.json", result.stdout)
+
+    def test_an_exclusion_counts_only_when_every_version_has_it(self):
+        self.edit("registry.json")
+        commit(self.repo, "the registry is excluded: free to edit")
+        self.assertEqual(self.guard().returncode, 0)
+        self.write_records(excludes=[])
+        commit(self.repo, "drop the exclusion")
+        self.assertEqual(self.guard().returncode, 1, "the registry is frozen at once, for the whole range")
+
+    def test_a_declaration_that_covers_nothing_is_stale_until_allowed(self):
+        self.declare("records/routes.json")
+        commit(self.repo, "declare what nobody changed")
+        stale = self.guard()
+        self.assertEqual(stale.returncode, 1)
+        self.assertIn("STALE declaration of records/routes.json", stale.stdout)
+        self.assertEqual(self.guard("--allow-stale").returncode, 0)
+
+    def test_a_declaration_must_name_files_and_a_big_one_must_count(self):
+        self.declare("records/*", change="modified")
+        commit(self.repo, "a declaration over the whole location")
+        broad = self.guard()
+        self.assertEqual(broad.returncode, 2)
+        self.assertIn("TOO BROAD", broad.stderr)
+        verdict(broad, "records_guard", "check", "FAIL")
+        git(self.repo, "reset", "-q", "--hard", "HEAD~1")
+        for n in range(12):
+            (self.repo / "records" / "sub").mkdir(exist_ok=True)
+            (self.repo / "records" / "sub" / f"f{n:02d}.json").write_text("{}\n")
+        commit(self.repo, "twelve records")
+        for n in range(12):
+            (self.repo / "records" / "sub" / f"f{n:02d}.json").write_text('{"n": 1}\n')
+        self.declare("records/sub/*", change="modified")
+        commit(self.repo, "change twelve, no count")
+        self.assertIn("TOO BROAD", self.guard().stdout)
+        git(self.repo, "reset", "-q", "--hard", "HEAD~1")
+        for n in range(12):
+            (self.repo / "records" / "sub" / f"f{n:02d}.json").write_text('{"n": 1}\n')
+        self.declare("records/sub/*", change="modified", count=12)
+        commit(self.repo, "change twelve, counted")
+        self.assertEqual(self.guard().returncode, 0)
+
+    def test_the_working_tree_is_judged_with_worktree(self):
+        self.edit()
+        self.assertEqual(self.guard().returncode, 0, "uncommitted: not in the range")
+        result = self.guard("--worktree")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("[the working tree]", result.stdout)
+        self.declare("records/routes.json")
+        self.assertEqual(self.guard("--worktree").returncode, 0, "an uncommitted declaration covers the uncommitted change")
+
+    def test_the_base_comes_from_state_when_none_is_given(self):
+        run("refactor_state.py", "--folder", str(self.folder), "init", "--base", self.start, cwd=self.repo)
+        self.edit()
+        commit(self.repo, "edit")
+        result = run("records_guard.py", "--folder", str(self.folder), cwd=self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"{self.start} -> HEAD", result.stdout)
+
+    def test_exit_codes_and_the_verdict_line(self):
+        self.assertEqual(self.guard().returncode, 0)
+        verdict(self.guard(), "records_guard", "check", "PASS")
+        unknown = self.guard(base="0000000000000000000000000000000000000000")
+        self.assertEqual(unknown.returncode, 2)
+        verdict(unknown, "records_guard", "check", "FAIL")
+        nobase = run("records_guard.py", "--folder", str(self.folder), cwd=self.repo)
+        self.assertEqual(nobase.returncode, 2, "no --base and no state.json")
+        verdict(nobase, "records_guard", "check", "FAIL")
+        missing = run("records_guard.py", "--folder", str(self.repo / "docs" / "nowhere"), "--base", self.base, cwd=self.repo)
+        self.assertEqual(missing.returncode, 2, "no records.json")
+        self.assertEqual(run("records_guard.py", cwd=self.repo).returncode, 2, "--folder is required")
+        with tempfile.TemporaryDirectory() as outside:
+            elsewhere = run("records_guard.py", "--folder", "x", "--base", "y", cwd=outside)
+            self.assertEqual(elsewhere.returncode, 3)
+            verdict(elsewhere, "records_guard", "check", "FAIL")
+
+    def test_nothing_frozen_or_an_unreadable_version_is_partial_never_a_pass(self):
+        self.write_records(frozen=[])
+        commit(self.repo, "nothing is frozen any more")
+        # the union still holds the earlier list: freeze again from a clean history
+        git(self.repo, "reset", "-q", "--hard", self.start)
+        self.folder.mkdir(parents=True, exist_ok=True)
+        (self.folder / "records.json").write_text(json.dumps({"frozen": []}))
+        commit(self.repo, "an empty list")
+        empty = self.guard()
+        self.assertEqual(empty.returncode, 4)
+        verdict(empty, "records_guard", "check", "PARTIAL")
+        (self.folder / "records.json").write_text("{not json")
+        commit(self.repo, "a broken version")
+        (self.folder / "records.json").write_text(json.dumps({"frozen": ["records/"]}))
+        commit(self.repo, "repaired")
+        partial = self.guard()
+        self.assertEqual(partial.returncode, 4, partial.stdout)
+        self.assertIn("could not be read", partial.stdout)
+        verdict(partial, "records_guard", "check", "PARTIAL")
+
+
 class SkillTextTest(unittest.TestCase):
     def test_the_skill_names_its_scripts_and_its_references_exist(self):
         text = (SKILL / "SKILL.md").read_text()
