@@ -1,0 +1,511 @@
+diff --git a/README.md b/README.md
+index c1898e1..7ff5c24 100644
+--- a/README.md
++++ b/README.md
+@@ -6,10 +6,13 @@ Turns a CSV of invoice lines into a plain-text report.
+ 
+ Layout:
+ 
+-- `invoicing/report.py` - everything: parsing the CSV, taxes and discounts, rendering the text.
++- `invoicing/parsing.py` - CSV lines to `InvoiceLine`s (skips and logs malformed lines).
++- `invoicing/tax.py` - `InvoiceLine`, tax rates, bulk discount, per-customer and grand totals.
++- `invoicing/rendering.py` - the plain-text layout.
++- `invoicing/report.py` - `InvoiceReport`, a thin facade over the three; `from invoicing.report import InvoiceReport` is the stable entry point.
+ - `invoicing/cli.py` - the command line.
+ - `tests/golden/` - recorded output (`basic.txt`) and recorded log (`basic.log`) for `basic.csv`.
+ 
+ Run the tests with `python3 -m unittest discover -s tests`.
+ 
+-The log lines are read by the month-end check, which filters on the logger name `invoicing.report`.
++The log lines are read by the month-end check, which filters on the logger name `invoicing.report`. `parsing.py` pins that name explicitly; do not change it to `__name__`.
+diff --git a/invoicing/parsing.py b/invoicing/parsing.py
+new file mode 100644
+index 0000000..3154c17
+--- /dev/null
++++ b/invoicing/parsing.py
+@@ -0,0 +1,64 @@
++"""Parsing of the CSV input into invoice lines.
++
++Input columns: customer,item,qty,unit_price,country,reverse_charge
++"""
++import logging
++from decimal import Decimal
++
++from invoicing.tax import TAX_RATES, InvoiceLine
++
++# The month-end check filters the log on the logger name "invoicing.report", so
++# the name is pinned here and must not follow this module's __name__.
++log = logging.getLogger("invoicing.report")
++
++
++def parse_line(number, raw):
++    """Parse one raw line into (line, skipped).
++
++    line is None for blank, comment and header lines
++    (skipped False) and for malformed lines (skipped True).
++    """
++    raw = raw.strip()
++    if not raw or raw.startswith("#"):
++        return None, False
++    if raw.lower().startswith("customer,"):
++        return None, False
++    parts = [part.strip() for part in raw.split(",")]
++    if len(parts) != 6:
++        log.warning("skipping malformed line %d: expected 6 fields, got %d", number, len(parts))
++        return None, True
++    customer, item, qty, unit_price, country, reverse_charge = parts
++    try:
++        qty = int(qty)
++        unit_price = Decimal(unit_price)
++    except (ValueError, ArithmeticError):
++        log.warning("skipping malformed line %d: bad number", number)
++        return None, True
++    if qty <= 0:
++        log.warning("skipping line %d: quantity must be positive", number)
++        return None, True
++    country = country.upper()
++    if country not in TAX_RATES:
++        log.info("line %d: unknown country %s, default rate applies", number, country)
++    line = InvoiceLine(
++        customer=customer,
++        item=item,
++        qty=qty,
++        unit_price=unit_price,
++        country=country,
++        reverse_charge=reverse_charge.lower() in ("1", "yes", "true", "y"),
++    )
++    return line, False
++
++
++def parse_lines(raw_lines):
++    """Parse raw CSV lines; return (lines, skipped_count)."""
++    lines = []
++    skipped = 0
++    for number, raw in enumerate(raw_lines, start=1):
++        line, was_skipped = parse_line(number, raw)
++        if line is not None:
++            lines.append(line)
++        if was_skipped:
++            skipped += 1
++    return lines, skipped
+diff --git a/invoicing/rendering.py b/invoicing/rendering.py
+new file mode 100644
+index 0000000..8b013e1
+--- /dev/null
++++ b/invoicing/rendering.py
+@@ -0,0 +1,46 @@
++"""Plain-text rendering of the report."""
++from invoicing.tax import customer_totals, grand_totals, group_by_customer, round_half_up
++
++REPORT_WIDTH = 48
++
++
++def money(value):
++    return f"{round_half_up(value):,.2f}"
++
++
++def rule(char="-"):
++    return char * REPORT_WIDTH
++
++
++def row(label, value):
++    gap = REPORT_WIDTH - len(label) - len(value)
++    return label + " " * max(gap, 1) + value
++
++
++def render_customer(customer, lines):
++    out = [customer]
++    for line in lines:
++        label = f"  {line.qty} x {line.item}"
++        if line.reverse_charge:
++            label += " (RC)"
++        out.append(row(label, money(line.net)))
++    totals = customer_totals(lines)
++    if totals["discount"]:
++        out.append(row("  bulk discount", "-" + money(totals["discount"])))
++    out.append(row("  tax", money(totals["tax"])))
++    out.append(row("  total", money(totals["total"])))
++    return out
++
++
++def render_report(title, lines, skipped):
++    out = [rule("="), title.center(REPORT_WIDTH).rstrip(), rule("=")]
++    for customer, customer_lines in group_by_customer(lines).items():
++        out.extend(render_customer(customer, customer_lines))
++        out.append(rule())
++    totals = grand_totals(lines)
++    out.append(row("NET", money(totals["net"])))
++    out.append(row("TAX", money(totals["tax"])))
++    out.append(row("TOTAL", money(totals["total"])))
++    if skipped:
++        out.append(f"({skipped} line(s) skipped)")
++    return "\n".join(out) + "\n"
+diff --git a/invoicing/report.py b/invoicing/report.py
+index d43ca95..68a1213 100644
+--- a/invoicing/report.py
++++ b/invoicing/report.py
+@@ -1,73 +1,45 @@
+-"""Build a plain-text invoice report from CSV lines.
++"""Invoice report facade.
+ 
+-Input columns: customer,item,qty,unit_price,country,reverse_charge
++The work lives in three modules: `invoicing.parsing` (CSV to lines),
++`invoicing.tax` (rates, discounts, totals) and `invoicing.rendering` (text).
++`InvoiceReport` keeps the original public API on top of them.
+ """
+-import logging
+-from collections import OrderedDict
+-from decimal import Decimal, ROUND_HALF_UP
+-
+-log = logging.getLogger(__name__)
+-
+-TAX_RATES = {
+-    "DE": Decimal("0.19"),
+-    "FR": Decimal("0.20"),
+-    "NL": Decimal("0.21"),
+-    "PT": Decimal("0.23"),
+-    "ES": Decimal("0.21"),
+-}
+-DEFAULT_TAX_RATE = Decimal("0.20")
+-BULK_QTY = 10
+-BULK_DISCOUNT = Decimal("0.05")
+-REPORT_WIDTH = 48
+-
+-
+-def _round_half_up(value):
+-    """Round a Decimal to cents, halves away from zero."""
+-    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+-
+-
+-def _money(value):
+-    return f"{_round_half_up(value):,.2f}"
+-
+-
+-class InvoiceLine:
+-    def __init__(self, customer, item, qty, unit_price, country, reverse_charge):
+-        self.customer = customer
+-        self.item = item
+-        self.qty = qty
+-        self.unit_price = unit_price
+-        self.country = country
+-        self.reverse_charge = reverse_charge
+-
+-    @property
+-    def gross(self):
+-        return self.unit_price * self.qty
+-
+-    @property
+-    def discount(self):
+-        if self.qty >= BULK_QTY:
+-            return self.gross * BULK_DISCOUNT
+-        return Decimal("0")
+-
+-    @property
+-    def net(self):
+-        return self.gross - self.discount
++from invoicing import rendering, tax
++from invoicing.parsing import parse_lines
++from invoicing.rendering import REPORT_WIDTH
++from invoicing.rendering import money as _money
++from invoicing.tax import (
++    BULK_DISCOUNT,
++    BULK_QTY,
++    DEFAULT_TAX_RATE,
++    TAX_RATES,
++    InvoiceLine,
++)
++from invoicing.tax import round_half_up as _round_half_up
++
++__all__ = [
++    "InvoiceReport",
++    "InvoiceLine",
++    "TAX_RATES",
++    "DEFAULT_TAX_RATE",
++    "BULK_QTY",
++    "BULK_DISCOUNT",
++    "REPORT_WIDTH",
++]
+ 
+ 
+ class InvoiceReport:
+-    """Parses invoice lines, computes taxes and renders the report."""
++    """Holds parsed invoice lines and delegates tax maths and rendering."""
+ 
+     def __init__(self, title="Invoice report"):
+         self.title = title
+         self.lines = []
+         self.skipped = 0
+ 
+-    # ---------------------------------------------------------------- parsing
+     @classmethod
+     def from_lines(cls, raw_lines, title="Invoice report"):
+         report = cls(title=title)
+-        for number, raw in enumerate(raw_lines, start=1):
+-            report._parse_line(number, raw)
++        report.lines, report.skipped = parse_lines(raw_lines)
+         return report
+ 
+     @classmethod
+@@ -75,103 +47,24 @@ class InvoiceReport:
+         with open(path, encoding="utf-8") as handle:
+             return cls.from_lines(handle.read().splitlines(), title=title)
+ 
+-    def _parse_line(self, number, raw):
+-        raw = raw.strip()
+-        if not raw or raw.startswith("#"):
+-            return
+-        if raw.lower().startswith("customer,"):
+-            return
+-        parts = [part.strip() for part in raw.split(",")]
+-        if len(parts) != 6:
+-            log.warning("skipping malformed line %d: expected 6 fields, got %d", number, len(parts))
+-            self.skipped += 1
+-            return
+-        customer, item, qty, unit_price, country, reverse_charge = parts
+-        try:
+-            qty = int(qty)
+-            unit_price = Decimal(unit_price)
+-        except (ValueError, ArithmeticError):
+-            log.warning("skipping malformed line %d: bad number", number)
+-            self.skipped += 1
+-            return
+-        if qty <= 0:
+-            log.warning("skipping line %d: quantity must be positive", number)
+-            self.skipped += 1
+-            return
+-        country = country.upper()
+-        if country not in TAX_RATES:
+-            log.info("line %d: unknown country %s, default rate applies", number, country)
+-        self.lines.append(
+-            InvoiceLine(
+-                customer=customer,
+-                item=item,
+-                qty=qty,
+-                unit_price=unit_price,
+-                country=country,
+-                reverse_charge=reverse_charge.lower() in ("1", "yes", "true", "y"),
+-            )
+-        )
+-
+-    # -------------------------------------------------------------------- tax
+     @staticmethod
+     def tax_rate(country):
+-        return TAX_RATES.get(country, DEFAULT_TAX_RATE)
++        return tax.tax_rate(country)
+ 
+     def tax_for(self, line):
+-        if line.reverse_charge:
+-            return Decimal("0")
+-        return line.net * self.tax_rate(line.country)
++        return tax.tax_for(line)
+ 
+     def customers(self):
+-        grouped = OrderedDict()
+-        for line in self.lines:
+-            grouped.setdefault(line.customer, []).append(line)
+-        return grouped
++        return tax.group_by_customer(self.lines)
+ 
+     def customer_totals(self, lines):
+-        net = sum((line.net for line in lines), Decimal("0"))
+-        discount = sum((line.discount for line in lines), Decimal("0"))
+-        tax = sum((self.tax_for(line) for line in lines), Decimal("0"))
+-        return {"net": net, "discount": discount, "tax": tax, "total": net + tax}
++        return tax.customer_totals(lines)
+ 
+     def grand_totals(self):
+-        totals = {"net": Decimal("0"), "discount": Decimal("0"), "tax": Decimal("0"), "total": Decimal("0")}
+-        for lines in self.customers().values():
+-            for key, value in self.customer_totals(lines).items():
+-                totals[key] += value
+-        return totals
+-
+-    # -------------------------------------------------------------- rendering
+-    def _rule(self, char="-"):
+-        return char * REPORT_WIDTH
+-
+-    def _row(self, label, value):
+-        gap = REPORT_WIDTH - len(label) - len(value)
+-        return label + " " * max(gap, 1) + value
++        return tax.grand_totals(self.lines)
+ 
+     def render_customer(self, customer, lines):
+-        out = [customer]
+-        for line in lines:
+-            label = f"  {line.qty} x {line.item}"
+-            if line.reverse_charge:
+-                label += " (RC)"
+-            out.append(self._row(label, _money(line.net)))
+-        totals = self.customer_totals(lines)
+-        if totals["discount"]:
+-            out.append(self._row("  bulk discount", "-" + _money(totals["discount"])))
+-        out.append(self._row("  tax", _money(totals["tax"])))
+-        out.append(self._row("  total", _money(totals["total"])))
+-        return out
++        return rendering.render_customer(customer, lines)
+ 
+     def render(self):
+-        out = [self._rule("="), self.title.center(REPORT_WIDTH).rstrip(), self._rule("=")]
+-        for customer, lines in self.customers().items():
+-            out.extend(self.render_customer(customer, lines))
+-            out.append(self._rule())
+-        totals = self.grand_totals()
+-        out.append(self._row("NET", _money(totals["net"])))
+-        out.append(self._row("TAX", _money(totals["tax"])))
+-        out.append(self._row("TOTAL", _money(totals["total"])))
+-        if self.skipped:
+-            out.append(f"({self.skipped} line(s) skipped)")
+-        return "\n".join(out) + "\n"
++        return rendering.render_report(self.title, self.lines, self.skipped)
+diff --git a/invoicing/tax.py b/invoicing/tax.py
+new file mode 100644
+index 0000000..2b71d61
+--- /dev/null
++++ b/invoicing/tax.py
+@@ -0,0 +1,75 @@
++"""Tax and totals: the invoice line, rates, discounts and per-customer/grand totals."""
++from collections import OrderedDict
++from decimal import Decimal, ROUND_HALF_UP
++
++TAX_RATES = {
++    "DE": Decimal("0.19"),
++    "FR": Decimal("0.20"),
++    "NL": Decimal("0.21"),
++    "PT": Decimal("0.23"),
++    "ES": Decimal("0.21"),
++}
++DEFAULT_TAX_RATE = Decimal("0.20")
++BULK_QTY = 10
++BULK_DISCOUNT = Decimal("0.05")
++
++
++def round_half_up(value):
++    """Round a Decimal to cents, halves away from zero."""
++    return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
++
++
++class InvoiceLine:
++    def __init__(self, customer, item, qty, unit_price, country, reverse_charge):
++        self.customer = customer
++        self.item = item
++        self.qty = qty
++        self.unit_price = unit_price
++        self.country = country
++        self.reverse_charge = reverse_charge
++
++    @property
++    def gross(self):
++        return self.unit_price * self.qty
++
++    @property
++    def discount(self):
++        if self.qty >= BULK_QTY:
++            return self.gross * BULK_DISCOUNT
++        return Decimal("0")
++
++    @property
++    def net(self):
++        return self.gross - self.discount
++
++
++def tax_rate(country):
++    return TAX_RATES.get(country, DEFAULT_TAX_RATE)
++
++
++def tax_for(line):
++    if line.reverse_charge:
++        return Decimal("0")
++    return line.net * tax_rate(line.country)
++
++
++def group_by_customer(lines):
++    grouped = OrderedDict()
++    for line in lines:
++        grouped.setdefault(line.customer, []).append(line)
++    return grouped
++
++
++def customer_totals(lines):
++    net = sum((line.net for line in lines), Decimal("0"))
++    discount = sum((line.discount for line in lines), Decimal("0"))
++    tax = sum((tax_for(line) for line in lines), Decimal("0"))
++    return {"net": net, "discount": discount, "tax": tax, "total": net + tax}
++
++
++def grand_totals(lines):
++    totals = {"net": Decimal("0"), "discount": Decimal("0"), "tax": Decimal("0"), "total": Decimal("0")}
++    for customer_lines in group_by_customer(lines).values():
++        for key, value in customer_totals(customer_lines).items():
++            totals[key] += value
++    return totals
+diff --git a/tests/test_modules.py b/tests/test_modules.py
+new file mode 100644
+index 0000000..ae27c37
+--- /dev/null
++++ b/tests/test_modules.py
+@@ -0,0 +1,65 @@
++"""Each module of the split is usable on its own."""
++import logging
++import unittest
++from decimal import Decimal
++
++from invoicing.parsing import parse_line, parse_lines
++from invoicing.rendering import money, render_report
++from invoicing.report import InvoiceReport
++from invoicing.tax import InvoiceLine, customer_totals, grand_totals, tax_for
++
++
++def make_line(qty=1, price="100", country="DE", reverse_charge=False, customer="A"):
++    return InvoiceLine(customer, "widget", qty, Decimal(price), country, reverse_charge)
++
++
++class ParsingTest(unittest.TestCase):
++    def test_valid_line(self):
++        line, skipped = parse_line(1, "Acme,widget,2,10.50,de,yes")
++        self.assertFalse(skipped)
++        self.assertEqual((line.customer, line.qty, line.country, line.reverse_charge), ("Acme", 2, "DE", True))
++
++    def test_ignored_lines_are_not_skipped(self):
++        for raw in ("", "# note", "customer,item,qty,unit_price,country,reverse_charge"):
++            self.assertEqual(parse_line(1, raw), (None, False))
++
++    def test_malformed_lines_are_skipped_and_logged_under_report_logger(self):
++        for raw in ("a,b", "a,b,x,1,DE,no", "a,b,0,1,DE,no", "a,b,-1,1,DE,no"):
++            with self.assertLogs("invoicing.report", level="WARNING"):
++                self.assertEqual(parse_line(1, raw), (None, True))
++
++    def test_parse_lines_counts_skipped(self):
++        lines, skipped = parse_lines(["A,w,1,5,DE,no", "bad", "B,w,1,5,FR,no"])
++        self.assertEqual((len(lines), skipped), (2, 1))
++
++
++class TaxTest(unittest.TestCase):
++    def test_bulk_discount_threshold(self):
++        self.assertEqual(make_line(qty=9).discount, Decimal("0"))
++        self.assertEqual(make_line(qty=10).discount, Decimal("50.00"))
++
++    def test_reverse_charge_has_no_tax(self):
++        self.assertEqual(tax_for(make_line(reverse_charge=True)), Decimal("0"))
++        self.assertEqual(tax_for(make_line()), Decimal("19.00"))
++
++    def test_unknown_country_uses_default_rate(self):
++        self.assertEqual(tax_for(make_line(country="XX")), Decimal("20.00"))
++
++    def test_totals(self):
++        lines = [make_line(customer="A"), make_line(customer="B", country="FR")]
++        self.assertEqual(customer_totals(lines[:1])["total"], Decimal("119.00"))
++        self.assertEqual(grand_totals(lines)["total"], Decimal("239.00"))
++
++
++class RenderingTest(unittest.TestCase):
++    def test_money_rounds_half_up_with_separator(self):
++        self.assertEqual(money(Decimal("1234.565")), "1,234.57")
++
++    def test_render_matches_facade(self):
++        report = InvoiceReport.from_lines(["A,w,1,5,DE,no", "bad"])
++        self.assertEqual(render_report(report.title, report.lines, report.skipped), report.render())
++        self.assertIn("(1 line(s) skipped)", report.render())
++
++
++if __name__ == "__main__":
++    unittest.main()

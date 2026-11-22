@@ -1,0 +1,11 @@
+schema_version: "1.1"
+name: move-rename-slug-helper
+context:
+  scaffold_script: place-files.sh
+expected_outcome: |
+  The file moves byte for byte in one commit and the function is renamed in another. Every
+  document, the agents' notes and the CI path filter name the new home. The CLI resolves the
+  helper by a path string and a function-name string, so both are updated; the `--legacy` option
+  reaches `mkSlugLegacy` by name, so the "dead" claim is wrong: the run keeps it or flags the
+  break. If the legacy tests go, the floor in test-floor.json is lowered in that same commit with
+  the reason, never quietly.

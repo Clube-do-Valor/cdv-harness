@@ -1,0 +1,50 @@
+--- 45072bc refactor: rename mkSlug to toSlug
+
+Every caller, the CLI function-name string, the tests and the docs follow.
+
+
+ AGENTS.md            |  2 +-
+ README.md            |  2 +-
+ bin/cli.js           |  2 +-
+ docs/architecture.md |  2 +-
+ src/text/slug.js     |  4 ++--
+ src/titles.js        |  4 ++--
+ test/slug.test.js    | 12 ++++++------
+ 7 files changed, 14 insertions(+), 14 deletions(-)
+--- 41e09f6 refactor: move the slug helper from lib/helpers/slugify.js to src/text/slug.js
+
+The file moves byte for byte; only the paths that reach it change (titles, the
+CLI table, the test, README, architecture notes, AGENTS.md). No shim is left at
+the old path. The CI path filter now watches src/** so a change to the helper
+still triggers the workflow.
+
+
+ .github/workflows/ci.yml                   | 2 +-
+ AGENTS.md                                  | 2 +-
+ README.md                                  | 2 +-
+ bin/cli.js                                 | 2 +-
+ docs/architecture.md                       | 2 +-
+ lib/helpers/slugify.js => src/text/slug.js | 0
+ src/titles.js                              | 2 +-
+ test/{slugify.test.js => slug.test.js}     | 2 +-
+ 8 files changed, 7 insertions(+), 7 deletions(-)
+--- d277e41 refactor: delete mkSlugLegacy, the pre-migration slug format, and the CLI --legacy flag
+
+Nothing but its own tests and the --legacy flag of the CLI called it since the
+URL migration. test/cli.test.js keeps the suite at the test floor.
+
+
+ README.md              |  2 +-
+ bin/cli.js             | 10 ++++------
+ lib/helpers/slugify.js |  7 +------
+ test/legacy.test.js    |  8 --------
+ 4 files changed, 6 insertions(+), 21 deletions(-)
+--- 7c12499 test(cli): record the slug, truncate and unknown-command behaviour of the CLI
+
+The CLI had no test and resolves its helpers by file path and function name
+strings, which a grep for the helper does not follow. The record comes before
+the move and the rename that pass through it.
+
+
+ test/cli.test.js | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)

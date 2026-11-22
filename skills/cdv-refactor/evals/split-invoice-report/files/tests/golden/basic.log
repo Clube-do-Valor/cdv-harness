@@ -1,0 +1,2 @@
+WARNING:invoicing.report:skipping malformed line 5: bad number
+WARNING:invoicing.report:skipping malformed line 7: expected 6 fields, got 1

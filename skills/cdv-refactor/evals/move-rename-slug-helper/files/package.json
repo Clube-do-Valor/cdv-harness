@@ -1,0 +1,11 @@
+{
+  "name": "slugkit",
+  "version": "1.4.0",
+  "private": true,
+  "description": "Slugs and titles for the article pages",
+  "main": "src/titles.js",
+  "bin": { "slugkit": "bin/cli.js" },
+  "scripts": {
+    "test": "node scripts/check-floor.js"
+  }
+}

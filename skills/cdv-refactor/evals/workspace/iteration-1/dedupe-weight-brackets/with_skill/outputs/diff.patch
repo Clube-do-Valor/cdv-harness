@@ -1,0 +1,155 @@
+diff --git a/docs/research/2026-11-22-shared-brackets/bugs.md b/docs/research/2026-11-22-shared-brackets/bugs.md
+new file mode 100644
+index 0000000..9d2a1b2
+--- /dev/null
++++ b/docs/research/2026-11-22-shared-brackets/bugs.md
+@@ -0,0 +1,8 @@
++# Found while sharing the weight brackets (not fixed: a refactor never changes behaviour)
++
++1. `shipping/quote.py`: `if zone == "intl" or "INTL":` is always true (a non-empty string), so the
++   international surcharge (7.5) is added to every zone, `domestic` and `eu` included. Pinned as is by
++   `tests/test_bracket_characterization.py`. Probably meant `zone in ("intl", "INTL")`.
++2. The 10 kg edge differs between the two copies of the bracket table: `quote` treats exactly 10 kg
++   as heavy (`< 10` -> 14.0, else 20.0), `label_cost` treats it as the 14.0 bracket (`<= 10`). Kept
++   as is: the shared function takes the edge as an argument. Which one is right is a business question.
+diff --git a/shipping/brackets.py b/shipping/brackets.py
+new file mode 100644
+index 0000000..b5874db
+--- /dev/null
++++ b/shipping/brackets.py
+@@ -0,0 +1,16 @@
++"""The weight-bracket price table shared by the customer quote and the carrier label."""
++
++
++def bracket_price(weight_kg, *, ten_kg_is_mid):
++    """Base price for a weight, before zone, handling or express adjustments.
++
++    The two callers disagree on exactly 10 kg and that is kept as it was:
++    `ten_kg_is_mid=True` prices 10 kg in the 14.0 bracket, `False` in the 20.0 one.
++    """
++    if weight_kg <= 1:
++        return 5.0
++    if weight_kg <= 5:
++        return 9.5
++    if weight_kg < 10 or (ten_kg_is_mid and weight_kg == 10):
++        return 14.0
++    return 20.0
+diff --git a/shipping/label.py b/shipping/label.py
+index 045577f..75bbd8a 100644
+--- a/shipping/label.py
++++ b/shipping/label.py
+@@ -1,5 +1,7 @@
+ """Cost of printing and buying the carrier label, charged to us by the carrier."""
+ 
++from shipping.brackets import bracket_price
++
+ HANDLING_FEE = 1.25
+ 
+ 
+@@ -7,14 +9,6 @@ def label_cost(weight_kg):
+     if weight_kg <= 0:
+         raise ValueError("weight must be positive")
+ 
+-    # weight bracket
+-    if weight_kg <= 1:
+-        price = 5.0
+-    elif weight_kg <= 5:
+-        price = 9.5
+-    elif weight_kg <= 10:
+-        price = 14.0
+-    else:
+-        price = 20.0
++    price = bracket_price(weight_kg, ten_kg_is_mid=True)
+ 
+     return round(price + HANDLING_FEE, 2)
+diff --git a/shipping/quote.py b/shipping/quote.py
+index 60e9c9a..ca7549a 100644
+--- a/shipping/quote.py
++++ b/shipping/quote.py
+@@ -1,5 +1,7 @@
+ """Price quoted to the customer at checkout."""
+ 
++from shipping.brackets import bracket_price
++
+ EXPRESS_FACTOR = 1.2
+ INTL_SURCHARGE = 7.5
+ EU_SURCHARGE = 3.0
+@@ -9,15 +11,7 @@ def quote(weight_kg, zone, express=False):
+     if weight_kg <= 0:
+         raise ValueError("weight must be positive")
+ 
+-    # weight bracket
+-    if weight_kg <= 1:
+-        price = 5.0
+-    elif weight_kg <= 5:
+-        price = 9.5
+-    elif weight_kg < 10:
+-        price = 14.0
+-    else:
+-        price = 20.0
++    price = bracket_price(weight_kg, ten_kg_is_mid=False)
+ 
+     # zone surcharge
+     if zone == "eu":
+diff --git a/tests/test_bracket_characterization.py b/tests/test_bracket_characterization.py
+new file mode 100644
+index 0000000..183e9c8
+--- /dev/null
++++ b/tests/test_bracket_characterization.py
+@@ -0,0 +1,56 @@
++"""Records what quote() and label_cost() return today at every weight bracket edge.
++
++Recorded before the bracket table was shared; it must pass unchanged afterwards.
++Values are pinned as they are, including the behaviour listed in
++docs/research/2026-11-22-shared-brackets/bugs.md.
++"""
++import unittest
++
++from shipping.label import label_cost
++from shipping.quote import quote
++
++WEIGHTS = [0.01, 0.99, 1, 1.01, 4.99, 5, 5.01, 9.99, 10, 10.01, 50]
++ZONES = ["domestic", "eu", "intl", "INTL", "other"]
++
++LABEL = {
++    0.01: 6.25, 0.99: 6.25, 1: 6.25, 1.01: 10.75, 4.99: 10.75, 5: 10.75,
++    5.01: 15.25, 9.99: 15.25, 10: 15.25, 10.01: 21.25, 50: 21.25,
++}
++
++# quote: bracket price + 7.5 (the surcharge applies to every zone, see bugs.md) + 3.0 for eu.
++BRACKET_QUOTE = {
++    0.01: 5.0, 0.99: 5.0, 1: 5.0, 1.01: 9.5, 4.99: 9.5, 5: 9.5,
++    5.01: 14.0, 9.99: 14.0, 10: 20.0, 10.01: 20.0, 50: 20.0,
++}
++
++
++class BracketCharacterizationTest(unittest.TestCase):
++    def test_label_cost_at_every_edge(self):
++        for weight, expected in LABEL.items():
++            with self.subTest(weight=weight):
++                self.assertEqual(label_cost(weight), expected)
++
++    def test_quote_at_every_edge_and_zone(self):
++        for weight, bracket in BRACKET_QUOTE.items():
++            for zone in ZONES:
++                for express in (False, True):
++                    price = bracket + 7.5 + (3.0 if zone == "eu" else 0.0)
++                    if express:
++                        price *= 1.2
++                    with self.subTest(weight=weight, zone=zone, express=express):
++                        self.assertEqual(quote(weight, zone, express), round(price, 2))
++
++    def test_ten_kilos_is_a_different_bracket_in_quote_and_label(self):
++        self.assertEqual(label_cost(10), 15.25)   # 14.0 + 1.25: label treats 10 as mid
++        self.assertEqual(quote(10, "domestic"), 27.5)  # 20.0 + 7.5: quote treats 10 as heavy
++
++    def test_rejects_non_positive(self):
++        for weight in (0, -1):
++            with self.assertRaises(ValueError):
++                label_cost(weight)
++            with self.assertRaises(ValueError):
++                quote(weight, "eu")
++
++
++if __name__ == "__main__":
++    unittest.main()

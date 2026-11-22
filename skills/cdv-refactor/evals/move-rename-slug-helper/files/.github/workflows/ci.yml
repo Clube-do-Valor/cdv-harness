@@ -1,0 +1,16 @@
+name: ci
+on:
+  pull_request:
+    paths:
+      - 'lib/**'
+      - 'src/titles.js'
+      - 'bin/**'
+      - 'test/**'
+      - 'package.json'
+      - 'test-floor.json'
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: npm test

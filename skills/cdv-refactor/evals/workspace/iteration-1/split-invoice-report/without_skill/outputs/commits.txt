@@ -1,0 +1,19 @@
+--- 881c7a1 test(invoicing): cover the parsing, tax and rendering modules on their own; update README
+
+
+
+ README.md             |  7 ++++--
+ tests/test_modules.py | 65 +++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 70 insertions(+), 2 deletions(-)
+--- be1118a refactor(invoicing): split InvoiceReport into parsing, tax and rendering modules
+
+InvoiceReport stays in invoicing.report as a facade with the same public API
+and re-exports. Parsing keeps logging under the invoicing.report logger name
+that the month-end check filters on.
+
+
+ invoicing/parsing.py   |  64 ++++++++++++++++++
+ invoicing/rendering.py |  46 +++++++++++++
+ invoicing/report.py    | 177 ++++++++++---------------------------------------
+ invoicing/tax.py       |  75 +++++++++++++++++++++
+ 4 files changed, 220 insertions(+), 142 deletions(-)

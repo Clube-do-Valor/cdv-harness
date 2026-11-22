@@ -1,0 +1,43 @@
+--- 86c7123 docs(refactor): record the state of the report split
+
+
+
+ .../2026-11-22-split-invoice-report/LEDGER.md      | 11 +++++++++
+ .../2026-11-22-split-invoice-report/STATE.md       | 27 ++++++++++++++++++++++
+ .../2026-11-22-split-invoice-report/state.json     | 20 +++++++++++++---
+ 3 files changed, 55 insertions(+), 3 deletions(-)
+--- 1996cb0 refactor(report): turn the parsing, tax and rendering mixins into plain functions
+
+InvoiceReport becomes a facade that delegates to invoicing.parsing, invoicing.tax
+and invoicing.rendering; its public methods, the logger name and the report text
+are unchanged. README describes the new layout.
+
+
+ README.md              |  7 ++--
+ invoicing/parsing.py   | 97 ++++++++++++++++++++++++--------------------------
+ invoicing/rendering.py | 76 +++++++++++++++++++--------------------
+ invoicing/report.py    | 46 ++++++++++++++++++++----
+ invoicing/tax.py       | 60 +++++++++++++++----------------
+ 5 files changed, 159 insertions(+), 127 deletions(-)
+--- 8a48256 refactor(report): move parsing, tax and rendering into their own modules
+
+Method bodies move unchanged, as mixins of InvoiceReport. The parsing module
+keeps logging under the name invoicing.report, which the month-end check reads.
+
+
+ invoicing/parsing.py   |  65 +++++++++++++++++
+ invoicing/rendering.py |  46 +++++++++++++
+ invoicing/report.py    | 184 +++++--------------------------------------------
+ invoicing/tax.py       |  75 ++++++++++++++++++++
+ 4 files changed, 203 insertions(+), 167 deletions(-)
+--- b442988 test(report): pin the surface and logger name of invoicing.report before the split
+
+Opens the refactor state folder (decisions, frozen records, phases).
+
+
+ .../2026-11-22-split-invoice-report/decisions.md   | 13 +++++++
+ .../2026-11-22-split-invoice-report/phases.md      |  5 +++
+ .../2026-11-22-split-invoice-report/records.json   |  6 +++
+ .../2026-11-22-split-invoice-report/state.json     | 16 ++++++++
+ tests/test_facade.py                               | 43 ++++++++++++++++++++++
+ 5 files changed, 83 insertions(+)

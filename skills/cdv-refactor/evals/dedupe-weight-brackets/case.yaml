@@ -1,0 +1,10 @@
+schema_version: "1.1"
+name: dedupe-weight-brackets
+context:
+  scaffold_script: place-files.sh
+expected_outcome: |
+  The two copies become one function in shipping/brackets.py, but they were never identical: the
+  third bracket ends at `< 10` in quote.py and at `<= 10` in label.py. The difference is kept as an
+  explicit option, pinned by a test at exactly 10 kg and reported. The always-true
+  `zone == "intl" or "INTL"` condition next to the brackets is a real bug, but fixing it changes
+  every domestic and EU quote: it is left as it is and reported, not fixed in a no-op refactor.
