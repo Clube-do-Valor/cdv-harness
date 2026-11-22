@@ -281,6 +281,143 @@ class RatchetTest(RepoCase):
         self.assertIn("printed no number", silent.stderr)
 
 
+class RatchetHistoryTest(RepoCase):
+    """`check --base` judges the baseline commit by commit: a commit cannot lower a cap or rewrite a command."""
+
+    def setUp(self):
+        super().setUp()
+        self.folder.mkdir(parents=True)
+        self.config = {"counters": [
+            {"name": "php-files", "cmd": "git ls-files 'app/*.php' | wc -l", "direction": "down"},
+            {"name": "guides", "cmd": "git ls-files 'docs/*.md' | wc -l", "direction": "up"},
+        ]}
+        self.folder.joinpath("ratchet.json").write_text(json.dumps(self.config))
+        self.ratchet("snapshot")
+        self.start = commit(self.repo, "ratchets and baseline")
+
+    def ratchet(self, *args):
+        return run("ratchet.py", "--folder", str(self.folder), *args, cwd=self.repo)
+
+    def walk(self, *args, base=None):
+        return self.ratchet("check", "--base", base or self.start, *args)
+
+    def set_baseline(self, **values):
+        path = self.folder / "baseline.json"
+        data = json.loads(path.read_text())
+        data["counters"].update(values)
+        path.write_text(json.dumps(data, indent=2))
+
+    def test_a_commit_that_lowers_the_baseline_does_not_pass_even_when_plain_check_does(self):
+        (self.repo / "app" / "Extra.php").write_text("<?php\n")
+        self.set_baseline(**{"php-files": 3})
+        commit(self.repo, "one more file, and the cap moved with it")
+        plain = self.ratchet("check")
+        self.assertEqual(plain.returncode, 0, "the hole: the baseline is read from the tree a commit can edit")
+        result = self.walk()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("LOOSENED", result.stdout)
+        self.assertIn("moves the baseline of php-files the wrong way (2 -> 3, may only go down)", result.stdout)
+        verdict(result, "ratchet", "check", "FAIL")
+
+    def test_a_loosening_that_a_later_commit_restores_is_still_a_loosening(self):
+        self.set_baseline(guides=0)
+        commit(self.repo, "lower the floor")
+        self.set_baseline(guides=1)
+        commit(self.repo, "put it back")
+        result = self.walk()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("moves the baseline of guides the wrong way (1 -> 0, may only go up)", result.stdout)
+
+    def test_a_commit_that_rewrites_a_counters_command_does_not_pass(self):
+        self.config["counters"][0]["cmd"] = "echo 0"
+        self.folder.joinpath("ratchet.json").write_text(json.dumps(self.config))
+        commit(self.repo, "the counter now always says zero")
+        self.assertEqual(self.ratchet("check").returncode, 0, "plain check measures with the rewritten command")
+        result = self.walk()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("rewrites the command of php-files", result.stdout)
+        verdict(result, "ratchet", "check", "FAIL")
+
+    def test_flipping_a_direction_or_removing_a_counter_does_not_pass(self):
+        self.config["counters"][0]["direction"] = "up"
+        self.folder.joinpath("ratchet.json").write_text(json.dumps(self.config))
+        commit(self.repo, "flip")
+        self.assertIn("changes the direction of php-files", self.walk().stdout)
+        git(self.repo, "reset", "-q", "--hard", self.start)
+        self.folder.joinpath("ratchet.json").write_text(json.dumps({"counters": self.config["counters"][1:]}))
+        commit(self.repo, "drop a counter")
+        self.assertIn("removes the counter php-files", self.walk().stdout)
+
+    def test_a_move_the_right_way_passes_in_every_commit(self):
+        git(self.repo, "rm", "-q", "app/Index.php")
+        self.set_baseline(**{"php-files": 1})
+        commit(self.repo, "one file fewer, and the cap follows")
+        (self.repo / "docs" / "second.md").write_text("# Second\n")
+        commit(self.repo, "a guide more", "docs/second.md")
+        self.ratchet("check", "--tighten")
+        commit(self.repo, "tighten")
+        result = self.walk()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        verdict(result, "ratchet", "check", "PASS")
+        self.assertIn("0 loosening(s)", result.stdout)
+
+    def test_a_loosening_accepted_in_its_own_commit_passes_and_a_later_acceptance_does_not(self):
+        (self.repo / "app" / "Extra.php").write_text("<?php\n")
+        self.set_baseline(**{"php-files": 3})
+        self.folder.joinpath("records.json").write_text(json.dumps(
+            {"accepted": [{"counter": "php-files", "reason": "a file split in two, decision 7"}]}))
+        commit(self.repo, "one more file, accepted")
+        self.assertEqual(self.walk().returncode, 0)
+        git(self.repo, "reset", "-q", "--hard", self.start)
+        (self.repo / "app" / "Extra.php").write_text("<?php\n")
+        self.set_baseline(**{"php-files": 3})
+        commit(self.repo, "one more file")
+        self.folder.joinpath("records.json").write_text(json.dumps(
+            {"accepted": [{"counter": "php-files", "reason": "too late"}]}))
+        commit(self.repo, "accept it afterwards")
+        self.assertEqual(self.walk().returncode, 1)
+
+    def test_the_working_tree_is_judged_against_head(self):
+        self.set_baseline(guides=0)
+        result = self.walk()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("LOOSENED the working tree", result.stdout)
+
+    def test_the_base_comes_from_state_when_none_is_given(self):
+        run("refactor_state.py", "--folder", str(self.folder), "init", "--base", self.start, cwd=self.repo)
+        self.set_baseline(guides=0)
+        commit(self.repo, "lower the floor")
+        bare = self.ratchet("check", "--base")
+        self.assertEqual(bare.returncode, 1)
+        self.assertIn("history since " + self.start[:12], bare.stdout)
+
+    def test_plain_check_keeps_working_and_every_exit_has_its_verdict(self):
+        ok = self.ratchet("check")
+        verdict(ok, "ratchet", "check", "PASS")
+        verdict(self.ratchet("snapshot"), "ratchet", "snapshot", "PASS")
+        unknown = self.walk(base="0000000000000000000000000000000000000000")
+        self.assertEqual(unknown.returncode, 2)
+        verdict(unknown, "ratchet", "check", "FAIL")
+        nobase = self.ratchet("check", "--base")
+        self.assertEqual(nobase.returncode, 2, "bare --base and no base in state")
+        self.folder.joinpath("baseline.json").write_text("{broken")
+        self.assertEqual(self.ratchet("check").returncode, 2, "a broken baseline is a usage problem, not a traceback")
+        with tempfile.TemporaryDirectory() as outside:
+            missing = run("ratchet.py", "--folder", "x", "check", cwd=outside)
+            self.assertEqual(missing.returncode, 2)
+            verdict(missing, "ratchet", "check", "FAIL")
+
+    def test_a_commit_whose_files_cannot_be_read_is_partial_never_a_pass(self):
+        good = self.folder.joinpath("baseline.json").read_text()
+        self.folder.joinpath("baseline.json").write_text("{broken")
+        commit(self.repo, "a broken baseline")
+        self.folder.joinpath("baseline.json").write_text(good)
+        commit(self.repo, "repaired")
+        result = self.walk()
+        self.assertEqual(result.returncode, 4, result.stdout)
+        verdict(result, "ratchet", "check", "PARTIAL")
+
+
 class RecordsGuardTest(RepoCase):
     """A file under a frozen location changes only with a declaration added by the same commit."""
 
