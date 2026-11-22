@@ -13,7 +13,7 @@ description: >
   behaviour on purpose: a refactor that also changes behaviour is two pieces of work, and the
   behaviour change goes through cdv-kickoff.
 metadata:
-  version: 0.1.0
+  version: 0.2.0
   owner: augusto-henriques
 ---
 
@@ -32,13 +32,21 @@ this different from a feature, and the rest of this skill follows from them:
    and read the answer from files.
 
 The scripts live in `.claude/skills/cdv-refactor/scripts/` and run with `python3` from the
-repository root:
+repository root. Every script ends with one verdict line on stdout, `<tool> <mode>: PASS|FAIL|PARTIAL — <what was judged>`,
+and exits `0` (PASS), `1` (FAIL: the thing guarded moved), `2` (usage: a bad argument, a missing
+configuration), `3` (environment: git failed, a step was refused) or `4` (PARTIAL: nothing failed, but
+part of what was asked was not judged - an empty frozen list, an unreadable version, no history for a
+list that needs it). **Partial is never a pass**: the night run and any script around these judge by that
+line. A guard that is given no `--base` reads it from `state.json`: the start of the running phase, else
+the base `init` recorded.
 
 | Script | Does | Exit |
 | --- | --- | --- |
-| `refactor_state.py --folder <state folder> init\|phase\|slice\|where\|render` | keeps `state.json`, the one record of phases and slices, and renders `STATE.md` and `LEDGER.md` from it and from git | `0`, `2` unknown id or bad argument, `3` refused |
-| `docs_follow_code.py --base <rev> [--docs <path> ...] [--name <symbol> ...]` | lists every mention, in the documents, of a file the range deleted or renamed and of each named symbol | `0` none, `1` stale mentions |
-| `ratchet.py --folder <state folder> snapshot\|check [--tighten]` | counters that may only move one way (`ratchet.json` says which, `baseline.json` holds them) | `0`, `1` a counter moved the wrong way, `2` no configuration |
+| `refactor_state.py --folder <state folder> init\|phase\|slice\|where\|render` | keeps `state.json`, the one record of phases and slices (with `base`, and the start commit of each phase), and renders `STATE.md` and `LEDGER.md` from it and from git | `0`, `2` unknown id or bad argument, `3` refused |
+| `docs_follow_code.py [--base <rev>] [--folder <state folder>] [--docs <path> ...] [--name <symbol> ...]` | lists every mention, in the documents, of a file the range deleted or renamed and of each named symbol | `0` none, `1` stale mentions, `2`, `3`, `4` no document searched |
+| `ratchet.py --folder <state folder> snapshot\|check [--tighten] [--base [<rev>]]` | counters that may only move one way (`ratchet.json` says which, `baseline.json` holds them); with `--base`, the history of both files is judged commit by commit: a baseline moved the wrong way, a counter's command or direction rewritten, or a counter removed fails unless the same commit accepts it in `records.json` | `0`, `1` a counter moved the wrong way or a commit loosened one, `2` no configuration, `3`, `4` a commit could not be read |
+| `records_guard.py --folder <state folder> [--base <rev>] [--worktree]` | a file under a frozen location of `records.json` that changes without a declaration added by the same commit; judged commit by commit over `<base>..HEAD`, the frozen list read from every version in the range | `0`, `1` an undeclared change or a stale declaration, `2`, `3`, `4` nothing frozen or a version unreadable |
+| `instruction_paths.py [--folder <state folder>] [--instructions <path\|glob> ...] [--resolve-from <dir> ...] [--base [<rev>]]` | every path an instruction file names exists; its allow list only shrinks, judged from git | `0`, `1` a new dangling path, a stale entry or a list that grew, `2`, `3`, `4` no file read, or an allow list with no base |
 
 ## Step 0 - Load the profile and the extension
 
@@ -132,6 +140,12 @@ repository's commands, so they come first:
   run often; where the whole takes long, name the targeted form a builder runs per commit.
 - Existing debt becomes ratchets, not noise: a baseline of today's errors and violations that may
   only shrink. Write them into `ratchet.json` and take `ratchet.py snapshot`.
+- Declare what is frozen in `records.json` of the state folder: the locations of the records (and
+  the guards themselves) under `frozen`, with their `excludes`. From then on a record changes only
+  by a declaration in the commit that changes it, and `records_guard.py` says so.
+- Name the instruction files and where their paths resolve in `instruction-paths.json` (or by
+  arguments); `instruction_paths.py --write-allowlist` lists today's dangling references once, in a
+  commit of its own, and the list only shrinks from there.
 - Fitness rules for the structure the refactor is heading to, as tests with allow-lists that only
   shrink: who may import whom, what may live where, how large a file or a method may be.
 
@@ -169,13 +183,16 @@ For each slice, in a checkout of its own:
 2. **Record** what is missing, on the code as it is; commits that add tests and records only.
 3. **Move**, then **change form**, in separate commits; the repository's targeted checks pass on
    every commit.
-4. **Prove**: every record that existed before is unchanged and passes; the slice's planted
-   changes go red and are removed.
-5. **Documents follow code**: `docs_follow_code.py --base <start of the slice>` exits `0`, and
-   every guide that describes what moved now describes where it is.
+4. **Prove**: every record that existed before is unchanged and passes - `records_guard.py
+   --folder <state folder>` exits `0`, and a change that had to happen is declared, with its reason,
+   in the commit that makes it; the slice's planted changes go red and are removed.
+5. **Documents follow code**: `docs_follow_code.py --base <start of the slice>` exits `0`,
+   `instruction_paths.py --folder <state folder> --base` exits `0`, and every guide that describes
+   what moved now describes where it is.
 6. The orchestrator integrates: the slice's targeted checks and its own comparison of old against
    new, run by someone other than the builder; then `refactor_state.py slice landed <id> --range
-   <a>..<b>` and `ratchet.py check --tighten`.
+   <a>..<b>` and `ratchet.py --folder <state folder> check --base --tighten`: the counters are judged
+   against the history of the phase, so a cap that a commit moved is seen, then tightened.
 
 A builder that meets something unclear stops and asks; it does not decide a difference between two
 copies, a defect, or a name that might be stored. [references/error-classes.md](references/error-classes.md)

@@ -40,10 +40,12 @@ code and records each on the code as it is, before any other edit.>
 
 ## Done when
 
-- Every record that existed at the start is unchanged and passes.
+- Every record that existed at the start is unchanged and passes: `records_guard.py --folder <state folder>` exits 0.
 - <the targeted checks of this slice, as commands>
 - <the cases of old against new that belong to this slice come out empty>
 - `docs_follow_code.py --base <start>` exits 0.
+- `instruction_paths.py --folder <state folder> --base` exits 0.
+- `ratchet.py --folder <state folder> check --base` exits 0.
 - <N> planted changes go red and are removed: <one line each>.
 - <a size or a list that must fall, with today's number: recount>
 

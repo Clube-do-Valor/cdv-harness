@@ -744,9 +744,15 @@ class InstructionPathsTest(RepoCase):
 class SkillTextTest(unittest.TestCase):
     def test_the_skill_names_its_scripts_and_its_references_exist(self):
         text = (SKILL / "SKILL.md").read_text()
-        for script in ("refactor_state.py", "docs_follow_code.py", "ratchet.py"):
+        for script in ("refactor_state.py", "docs_follow_code.py", "ratchet.py", "records_guard.py", "instruction_paths.py"):
             self.assertIn(script, text)
             self.assertTrue((SCRIPTS / script).is_file())
+        self.assertIn("PASS|FAIL|PARTIAL", text)
+        self.assertIn("`4` (PARTIAL", text)
+        self.assertIn("records.json", (SKILL / "references/templates/state-folder.md").read_text())
+        for tool in ("records_guard.py", "instruction_paths.py"):
+            self.assertIn(tool, (SKILL / "references/templates/task-file.md").read_text())
+            self.assertIn(tool, (SKILL / "references/error-classes.md").read_text())
         for reference in ("references/method.md", "references/error-classes.md", "references/templates/task-file.md",
                           "references/templates/state-folder.md", "references/templates/verifier-brief.md"):
             self.assertIn(reference, text)

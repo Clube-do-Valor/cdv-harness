@@ -60,7 +60,7 @@ all of them. A guard that is a command is run; a guard that is a habit is checke
 
 | Mistake | Guard |
 | --- | --- |
-| A guard that judges only the first and last commit of a range | Judge every commit; a cap never lives in the file it caps |
+| A guard that judges only the first and last commit of a range | Judge every commit; a cap never lives in the file it caps: `records_guard.py` and `ratchet.py check --base` read the range commit by commit, and `instruction_paths.py` reads its allow list from git |
 | A process killed by a pattern that matched the caller's own shell | Kill by pid, read from a pid file |
 | Scratch checkouts removed by a filter that matched other sessions' checkouts | Remove by exact path |
 | Two heavy runs at once on a shared machine | One queue; the whole gate alone |
