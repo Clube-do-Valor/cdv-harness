@@ -107,5 +107,121 @@ class ContractTextTest(SentenceCase):
         self.assertNoSentence(text, r"property names of a real workspace", where="cdv-notion/SKILL.md")
 
 
+def core_text_files():
+    """Every tracked text file of the core but the changelog and the tests."""
+    names = subprocess.run(["git", "ls-files"], cwd=REPO_ROOT, capture_output=True, text=True, check=True).stdout.split()
+    for name in names:
+        path = REPO_ROOT / name
+        if name == "CHANGELOG.md" or name.startswith("tests/") or not path.is_file() or path.suffix in (".png", ".jpg", ".pyc"):
+            continue
+        try:
+            yield name, path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+
+
+class TicketSkillTest(SentenceCase):
+    def setUp(self):
+        self.text = skill("cdv-notion-ticket")
+
+    def sentence(self, *patterns):
+        return self.assertSentence(self.text, *patterns, where="cdv-notion-ticket/SKILL.md")
+
+    def test_ticket_skill_states_the_five_moments_and_points_to_the_contract(self):
+        self.assertIn("[references/card-contract.md](references/card-contract.md)", self.text)
+        self.sentence(r"names of the workspace", r"names map", r"card-contract\.json")
+        moments = re.findall(r"^### (\d)\. (.+) - (.+)$", self.text, re.M)
+        self.assertEqual([(n, role) for n, _, role in moments], [
+            ("1", "not started"), ("2", "in progress"), ("3", "pull request open"),
+            ("4", "merged or deployed"), ("5", "done")])
+        self.assertEqual([title for _, title, _ in moments], [
+            "Request arrives", "Plan approved, or work starts on a track with no plan", "Pull request open",
+            "Merged or deployed", "Validated by who asked"])
+
+    def test_ticket_skill_drops_the_recent_cards_layout_and_the_delivery_note(self):
+        for pattern in (r"recent cards?", r"callout", r"\bAntes\b", r"Como usar", r"pr[óo]ximos passos",
+                        r"next[- ]steps", r"tag line", r"linha de tags", r"delivery note"):
+            self.assertNotRegex(self.text, re.compile(pattern, re.I))
+        self.assertFalse((SKILLS / "cdv-notion-ticket" / "references" / "ticket-format.md").exists())
+        for name, text in core_text_files():
+            self.assertFalse("ticket-format.md" in text, f"{name} still names ticket-format.md")
+
+    def test_ticket_skill_keeps_someone_elses_text_under_pedido(self):
+        self.sentence(r"body someone else wrote", r"`## Pedido`", r"without changing a word",
+                      r"only under `## Entrega` and `## Fechamento`")
+
+    def test_plan_approved_writes_entrega_and_the_plan_page(self):
+        self.sentence(r"plan is approved", r"write `## Entrega` from the plan", r"objective", r"1 to 5 criteria",
+                      r"stays out", r"repositories", r"plan page", r"`\*\*Plano:\*\*`|\*\*Plano:\*\*|Plano:",
+                      r"in progress status", r"assignee", r"type", r"current sprint")
+        self.sentence(r"`notion create --parent <card key> --set 'title=Plano técnico: <card title>'",
+                      r"criteria as bullets whose number is bold", r"every `\$` outside code escaped")
+        self.sentence(r"track with no plan", r"no child page", r"no `\*\*Plano:\*\*` line|no `Plano:` line")
+
+    def test_a_changed_plan_rewrites_the_plan_page_and_entrega_as_current_state(self):
+        self.sentence(r"plan changes during the build", r"rewrite the plan page and `## Entrega`",
+                      r"current state", r"no history", r"`cdv-notion-project`", r"belongs to a project")
+
+    def test_pr_open_adds_the_prs_line_property_summary_and_status(self):
+        self.sentence(r"pull request is opened", r"`\*\*PRs:\*\*`|PRs:", r"`<repository> #<n>`",
+                      r"fill the pull request property when it is empty",
+                      r"first sentence of the pull request's TL;DR", r"summary property unchanged",
+                      r"pull request open status")
+
+    def test_the_status_waits_for_a_pr_of_another_repository(self):
+        self.sentence(r"pull request of another repository", r"not reached the same event",
+                      r"leave the status as it is", r"say which pull request it waits for")
+
+    def test_merged_or_deployed_writes_fechamento_and_sets_the_status(self):
+        self.sentence(r"merged or deployed", r"write `## Fechamento` with 1 to 3 items", r"`Fora do código:`",
+                      r"status of that event")
+
+    def test_done_only_when_the_developer_says_who_asked_validated(self):
+        self.sentence(r"done status only when the developer says who asked validated")
+
+    def test_a_production_step_is_one_comment_not_a_body_line(self):
+        self.sentence(r"manual production step", r"one comment on the card", r"what ran, when, by whom, the result",
+                      r"`notion comments add", r"never as a change to the body")
+
+    def test_merged_requests_keep_the_lowest_key_and_archive_the_others(self):
+        self.sentence(r"several request cards are served by one delivery", r"lowest key",
+                      r"propose a title that names the delivery", r"under `## Pedido` headed by its key",
+                      r"requester property", r"archived status", r"`Pedido atendido em <key of the kept card>\.`",
+                      r"trash none", r"`scripts/card_contract\.py accept-request <kept card>`")
+
+    def test_requester_is_who_asked_and_the_tag_only_for_others_or_bugs(self):
+        self.sentence(r"creates a card", r"requester is who asked",
+                      r"developer only when the work started with them",
+                      r"request tag is set only when someone else asked or the type is the bug type")
+
+    def test_closing_offers_a_draft_to_who_asked_never_sent(self):
+        self.sentence(r"request came from someone else is closed", r"draft of a message", r"summary sentence",
+                      r"card's link", r"never send it", r"Slack draft", r"connector", r"otherwise the text in the chat")
+
+    def test_without_a_profile_the_skill_works_from_the_contract(self):
+        self.sentence(r"no harness profile", r"user-level install", r"still writes and checks a card",
+                      r"contract and the names map", r"skips only the steps that read a profile key")
+        self.assertNoSentence(self.text, r"profile\.yaml` is missing", r"stop", where="cdv-notion-ticket/SKILL.md")
+
+
+class HelpdeskTest(SentenceCase):
+    def setUp(self):
+        self.text = skill("cdv-notion-ticket")
+
+    def test_picking_up_a_form_ticket_changes_properties_only(self):
+        self.assertSentence(self.text, r"form ticket is picked up", r"change only properties",
+                            r"type, requester, assignee, sprint", r"fixed process title",
+                            r"duplicate in a comment on both cards", r"never touch the body")
+
+    def test_closing_a_form_ticket_with_a_pr(self):
+        self.assertSentence(self.text, r"form ticket is closed with a pull request", r"fill the summary property",
+                            r"`skeleton form-closing`", r"1 to 3 items", r"`PR: #<n>` linked to the pull request",
+                            r"fill the pull request property")
+
+    def test_closing_a_form_ticket_without_code(self):
+        self.assertSentence(self.text, r"form ticket is closed with no code change", r"fill the summary property",
+                            r"no `## Fechamento` is owed")
+
+
 if __name__ == "__main__":
     unittest.main()

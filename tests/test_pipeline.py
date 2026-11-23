@@ -234,17 +234,6 @@ class DeliveryProseTest(unittest.TestCase):
             r"report the status (it|the pipeline) ended on",
         )
 
-    def test_ticket_follows_the_three_recent_cards_links_both_ways_and_sets_pr_open(self):
-        self.assertSentence(
-            "cdv-notion-ticket",
-            r"`profile\.ticket_system` is not `none`",
-            r"pull request exists",
-            r"create or update the card",
-            r"layout of the three most recent cards of the same project",
-            r"link the pull request both ways",
-            r"`profile\.ticket_status_pr_open`",
-        )
-
     def test_rollout_sets_merged_or_deployed_and_asks_one_step_per_question(self):
         self.assertSentence(
             "cdv-rollout", r"\bmerged\b", r"`profile\.ticket_status_merged`", r"\bdeployed\b", r"`profile\.ticket_status_deployed`"

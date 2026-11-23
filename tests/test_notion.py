@@ -2499,7 +2499,6 @@ CORE_FILES = {
     "cdv-notion-ticket": REPO_ROOT / "skills" / "cdv-notion-ticket" / "SKILL.md",
     "cdv-open-pr": REPO_ROOT / "skills" / "cdv-open-pr" / "SKILL.md",
     "cdv-debug": REPO_ROOT / "skills" / "cdv-debug" / "SKILL.md",
-    "ticket-format.md": REPO_ROOT / "skills" / "cdv-notion-ticket" / "references" / "ticket-format.md",
     "notion-ticket-template.md": REPO_ROOT / "skills" / "cdv-debug" / "references" / "notion-ticket-template.md",
 }
 
@@ -2510,7 +2509,7 @@ MCP_TOOL_WORDS = [r"notion-fetch", r"notion-search", r"notion-update-page", r"no
 
 class CoreSkillsTest(unittest.TestCase):
     def test_core_skills_name_no_mcp_tool_and_name_the_client(self):
-        self.assertEqual(len(CORE_FILES), 5)
+        self.assertEqual(len(CORE_FILES), 4)
         for name, path in CORE_FILES.items():
             with self.subTest(file=name):
                 body = path.read_text(encoding="utf-8")
@@ -2534,7 +2533,7 @@ class CoreSkillsTest(unittest.TestCase):
 
     def test_ticket_references_use_the_skill_markdown(self):
         reference = (SKILL_DIR / "references" / "notion-markdown.md").read_text(encoding="utf-8")
-        for name in ("ticket-format.md", "notion-ticket-template.md"):
+        for name in ("notion-ticket-template.md",):
             with self.subTest(file=name):
                 body = CORE_FILES[name].read_text(encoding="utf-8")
                 self.assertIn("cdv-notion/references/notion-markdown.md", body)
@@ -2543,8 +2542,6 @@ class CoreSkillsTest(unittest.TestCase):
                 self.assertIn("<tr><td>", body)
                 for form in ("<table header-row=\"true\">", "<tr><td>", "<toggle>"):
                     self.assertIn(form, reference)
-        ticket = CORE_FILES["ticket-format.md"].read_text(encoding="utf-8")
-        self.assertRegex(ticket, r"<callout icon=\"[^\"]+\" color=\"blue_bg\">\n")
         self.assertIn("<callout icon=", reference)
         template = CORE_FILES["notion-ticket-template.md"].read_text(encoding="utf-8")
         self.assertIn("<toggle>", template)

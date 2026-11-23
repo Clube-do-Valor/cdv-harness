@@ -99,11 +99,11 @@
     },
     {
       "name": "cdv-notion-ticket",
-      "version": "0.1.0",
+      "version": "0.2.0",
       "owner": "augusto-henriques",
-      "description": "Write the business-facing delivery note on a feature's Notion card — short pt-BR delivery-note layout (TL;DR callout, Antes/Agora table, como usar, próximos passos with the PR link) grounded in the branch's real diff, written into the card with the cdv-notion client after the user confirms the draft (inside a cdv-kickoff run, without the question); once the PR exists the card follows the layout of the project's three most recent cards, links the PR both ways and moves to the PR-open status. Sits beside cdv-finalize — that one produces the technical PR description; this one produces the business delivery description (Notion). Triggers on \"gera o ticket da entrega\", \"descrição pra o card do Notion\", \"nota de entrega\", \"delivery note\", \"o que escrevo no ticket dessa feature\". Do NOT use for the PR description (cdv-finalize), bug-analysis Notion blocks (cdv-debug Step 8 owns the Análise técnica template), or planning artifacts.",
+      "description": "Own a Notion task card and a helpdesk form ticket from the request to the closing, in the card contract (references/card-contract.md): write the card at each moment of its event - request arrives, plan approved (the delivery zone and the plan as a child page), pull request open (the PRs line, the pull request property, the one-sentence summary), merged or deployed (the closing), validated by who asked - set the status of that moment, triage and close a form ticket, merge request cards that one delivery serves, and hold every write to card_contract.py check. Works through the cdv-notion client, in a repository or at user level. Called by cdv-kickoff, cdv-open-pr, cdv-debug, cdv-rollout and cdv-prod at their events; triggers on \"atualiza o card\", \"fecha o chamado\", \"escreve o card dessa entrega\", \"o que escrevo no ticket\", \"junta esses cards\". Do NOT use for the pull request description (cdv-finalize), a project page (cdv-notion-project), or the investigation report of a bug (cdv-debug keeps it in the chat).",
       "path": "skills/cdv-notion-ticket",
-      "contentHash": "cac932529df3e24f10ce6495c9cd5bdf2d0fb033283cbd4a465d09e5d50e8ca6"
+      "contentHash": "9b75d48feee0ab636758830c88fa800009b0e156c3b17e5a258a19cc5ccf7cd3"
     },
     {
       "name": "cdv-open-pr",
