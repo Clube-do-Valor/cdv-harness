@@ -248,6 +248,9 @@ sys.path.insert(0, {tests!r})
 import card_fixtures as _cf
 
 _real = _cf.real_client()
+if {home!r}:
+    from pathlib import Path as _Path
+    _real.home = lambda: _Path({home!r})
 globals().update({{k: getattr(_real, k) for k in dir(_real) if not k.startswith("__")}})
 
 
@@ -260,10 +263,11 @@ if __name__ == "__main__":
 '''
 
 
-def write_fake_client(path, state_path):
+def write_fake_client(path, state_path, home=None):
+    """A fake client at `path`. With `home`, its settings and cache live there whatever $HOME is."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(WRAPPER.format(tests=str(TESTS), state=str(state_path)), encoding="utf-8")
+    path.write_text(WRAPPER.format(tests=str(TESTS), state=str(state_path), home=str(home or "")), encoding="utf-8")
     path.chmod(0o755)
     return path
 

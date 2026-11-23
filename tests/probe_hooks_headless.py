@@ -17,6 +17,11 @@ command in the session's current directory, so a hook wired by a relative path i
 and the call runs (Verifier finding 3). A twin also requires that `cd` call to have printed a
 directory ending in `/sub`.
 
+  card-check     the session runs `notion update <key>` through a fake cdv-notion client (the real
+                 client over a fake Notion kept in a file, its settings and cache under the probe's
+                 own home) on a card outside the contract -> the PostToolUse hook's finding reaches
+                 the model after the call
+
 A case passes when the session's tool call has the probed shape, its tool result is an error that
 carries the hook's own message, and the command's own output is absent. Exit 0 every selected case
 passed, 1 one failed, 2 the CLI is missing. `-k <case>` selects one case; `--model` picks the
@@ -46,8 +51,9 @@ from test_core_release import core_files  # noqa: E402
 PROD_HOST = "prod.example.invalid"
 HOOKS = ["require-model", "prod-ssh", "suite-lock"]
 SUBDIR = "sub"
-CASES = HOOKS + [f"{h}-subdir" for h in HOOKS]
+CASES = HOOKS + [f"{h}-subdir" for h in HOOKS] + ["card-check"]
 PROJECT_DIR = '"$CLAUDE_PROJECT_DIR"/'
+CLIENT = ".claude/skills/cdv-notion/scripts/notion"
 
 
 def git(cwd, *args):
@@ -97,15 +103,63 @@ def build(root, analysis_cmd, test_cmd, relative=False):
             for hook in entry["hooks"]:
                 hook["command"] = hook["command"].replace(PROJECT_DIR, "")
         settings_path.write_text(json.dumps(settings, indent=2) + "\n")
-    commands = [h["command"] for e in settings["hooks"]["PreToolUse"] for h in e["hooks"]]
-    print(f"probe: consumer synced at {repo}; PreToolUse hooks: {', '.join(commands)}")
+    for event, entries in settings["hooks"].items():
+        commands = [h["command"] for e in entries for h in e["hooks"]]
+        print(f"probe: consumer synced at {repo}; {event} hooks: {', '.join(commands)}")
     return repo
 
 
-def session(claude, repo, prompt, model):
+def fake_card(root, repo):
+    """Put a fake cdv-notion client in the consumer (the real client over a fake Notion kept in a
+    file, its settings and cache under the probe's own home) holding one card outside the contract.
+    Returns the card's key."""
+    import card_fixtures as cf  # noqa: E402 - loads the client tests only for this case
+
+    home = root / "home"
+    credentials = home / ".config" / "notion" / "credentials"
+    credentials.parent.mkdir(parents=True)
+    credentials.write_text(cf.TOKEN + "\n")
+    credentials.chmod(0o600)
+    config = home / ".config" / "cdv-notion" / "config.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({"me": cf.ME, "card": {"since": cf.SINCE}}))
+    fake = cf.CardNotion()
+    page, body = cf.task(1, "Um texto solto, sem as zonas do card.\n")
+    fake.add(page, body)
+    state = root / "notion-state.json"
+    cf.save_state(fake, state)
+    cf.write_fake_client(repo / CLIENT, state, home=home)
+    return cf.key(1)
+
+
+def judge_card(events):
+    """The card-check finding reached the model after the client's call. The host adds a PostToolUse
+    hook's exit-2 stderr beside the tool result, not inside the stream's tool_result block, so the
+    proof is the hook's own response (PostToolUse, exit 2, the finding on stderr, from
+    --include-hook-events) and the model's reply quoting a `card-check:` line it was shown."""
+    mode = next((e.get("permissionMode") for e in events if e.get("type") == "system" and e.get("subtype") == "init"), None)
+    if mode != "bypassPermissions":
+        return False, f"the session's permission mode is {mode!r}, not bypassPermissions"
+    calls = {b["id"] for b in blocks_of(events, "tool_use")
+             if b.get("name") == "Bash" and CLIENT in str((b.get("input") or {}).get("command", ""))}
+    if not calls:
+        return False, f"the session made no call of {CLIENT} (tool calls: {[b.get('name') for b in blocks_of(events, 'tool_use')]})"
+    responses = [e for e in events if e.get("type") == "system" and e.get("subtype") == "hook_response"
+                 and e.get("hook_event") == "PostToolUse" and "card-check:" in str(e.get("stderr"))]
+    if not responses:
+        return False, "card-check gave no PostToolUse response with a finding"
+    if responses[0].get("exit_code") != 2 or "request-zone:" not in str(responses[0].get("stderr")):
+        return False, f"card-check answered exit {responses[0].get('exit_code')}: {str(responses[0].get('stderr'))[:200]}"
+    replies = " ".join(str(b.get("text", "")) for b in blocks_of(events, "text"))
+    if "card-check:" not in replies:
+        return False, f"the hook exited 2 with the finding, but the model did not quote it: {replies[:200]!r}"
+    return True, "the model quoted: " + " ".join(replies.split())[:240]
+
+
+def session(claude, repo, prompt, model, *flags):
     proc = subprocess.run(
         [claude, "-p", prompt, "--model", model, "--permission-mode", "bypassPermissions",
-         "--output-format", "stream-json", "--verbose", "--max-turns", "4"],
+         "--output-format", "stream-json", "--verbose", "--max-turns", "4", *flags],
         cwd=str(repo), capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL,
     )
     events = []
@@ -164,6 +218,13 @@ def judge(events, tool, shape, marker, absent, subdir=False):
 
 
 def probe(case, claude, repo, model, analysis_cmd, test_cmd):
+    if case == "card-check":
+        key = fake_card(repo.parent, repo)
+        command = f"{CLIENT} update {key} --set 'Status=In progress'"
+        prompt = (f"run this exact Bash command once, unchanged, and nothing else: {command}\n"
+                  "When it returns, reply with every line starting with 'card-check:' that you were shown after "
+                  "the command (by the tool result or by a hook), quoted exactly, or the word NONE.")
+        return judge_card(session(claude, repo, prompt, model, "--include-hook-events")[1])
     hook, subdir = case.removesuffix("-subdir"), case.endswith("-subdir")
     first = (f"First run this exact Bash command, unchanged, as its own call: cd {SUBDIR} && pwd\n"
              "Then, in a separate call, " if subdir else "")
@@ -212,7 +273,8 @@ def main(argv=None):
         for case in CASES if args.case == "all" else [args.case]:
             ok, detail = probe(case, claude, repo, args.model, analysis_cmd, test_cmd)
             failed += not ok
-            print(f"{case}: {'blocked' if ok else 'NOT BLOCKED'} - {detail}")
+            word = ("checked", "NOT CHECKED") if case == "card-check" else ("blocked", "NOT BLOCKED")
+            print(f"{case}: {word[0] if ok else word[1]} - {detail}")
     finally:
         if args.keep:
             print(f"probe: kept {root}")

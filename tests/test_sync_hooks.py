@@ -242,5 +242,129 @@ class SyncHooksTest(HarnessTestCase):
                 self.assertEqual(proc.returncode, 127, proc.stdout + proc.stderr)
 
 
+CARD_CHECK = f"{PROJECT_DIR_PREFIX}card-check"
+POST_MATCHER = "^(Bash|mcp__.+__notion-(update-page|create-pages))$"
+POST_EVENTS = ["PostToolUse", "PostToolUseFailure"]
+
+
+class SyncHookEventsTest(HarnessTestCase):
+    """Entries under PreToolUse, PostToolUse and PostToolUseFailure, and the lock of door 5."""
+
+    def add_doc(self, core, tag, doc, remove=()):
+        files = hook_files()
+        for relative in remove:
+            files.pop(relative, None)
+        files["settings/hooks-core.json"] = json.dumps(doc, indent=2) + "\n"
+        self.commit_core(core, files, message="feat: core hooks", tag=tag)
+
+    def settings(self, repo):
+        return json.loads((repo / ".claude/settings.json").read_text())
+
+    def consumer_with_own_hooks(self):
+        repo = self.make_consumer()
+        (repo / ".claude/settings.json").write_text(
+            json.dumps({"hooks": {"PreToolUse": [OWN_BASH_HOOK], "PostToolUse": [OWN_POST_HOOK]}}, indent=2) + "\n"
+        )
+        return repo
+
+    def test_core_hooks_file_wires_card_check_under_both_events(self):
+        doc = real_hooks_core()
+        entry = {"type": "command", "command": CARD_CHECK, "timeout": 30}
+        self.assertEqual(doc["PostToolUse"], [{"matcher": POST_MATCHER, "hooks": [entry]}])
+        self.assertEqual(doc["PostToolUseFailure"], [{"matcher": "Bash", "hooks": [entry]}])
+        self.assertEqual(sorted(doc), sorted(["PreToolUse", *POST_EVENTS]))
+        listed = subprocess.run(["git", "ls-files", "-s", "hooks/card-check"], cwd=REPO_ROOT, capture_output=True,
+                                text=True, check=True).stdout.split()
+        self.assertEqual(listed[:1], ["100755"])
+        from helpers import load_tool
+        self.assertEqual(load_tool().USER_HOOK_PREFIX, '"${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/harness/hooks/')
+
+    def test_each_event_merges_into_the_same_event_and_keeps_the_consumers_hooks(self):
+        core = self.make_core()
+        self.add_doc(core, "v0.2.0", real_hooks_core())
+        self.commit_core(core, {"notes.txt": "later\n"}, message="fix: later", tag="v0.2.1")
+        repo = self.consumer_with_own_hooks()
+        self.assertEqual(self.sync(repo, core, "v0.2.0").returncode, 0)
+        hooks = self.settings(repo)["hooks"]
+        doc = real_hooks_core()
+        self.assertEqual(hooks["PreToolUse"], [OWN_BASH_HOOK, *doc["PreToolUse"]])
+        self.assertEqual(hooks["PostToolUse"], [OWN_POST_HOOK, *doc["PostToolUse"]])
+        self.assertEqual(hooks["PostToolUseFailure"], doc["PostToolUseFailure"])
+        self.assertTrue(is_executable(repo / ".claude/harness/hooks/card-check"))
+        self.commit_all(repo)
+        self.assertIn("already at v0.2.0", self.sync(repo, core, "v0.2.0").stdout)
+        self.sync(repo, core, "v0.2.1")
+        self.assertEqual(self.settings(repo)["hooks"], hooks)
+
+    def test_a_post_event_entry_the_core_drops_is_removed(self):
+        core = self.make_core()
+        self.add_doc(core, "v0.2.0", real_hooks_core())
+        smaller = dict(real_hooks_core())
+        del smaller["PostToolUseFailure"]
+        self.add_doc(core, "v0.3.0", smaller)
+        repo = self.consumer_with_own_hooks()
+        self.sync(repo, core, "v0.2.0")
+        self.commit_all(repo)
+        self.sync(repo, core, "v0.3.0")
+        hooks = self.settings(repo)["hooks"]
+        self.assertNotIn("PostToolUseFailure", hooks)
+        self.assertEqual(hooks["PostToolUse"], [OWN_POST_HOOK, *smaller["PostToolUse"]])
+        self.assertEqual(self.read_lock(repo)["hooks_by_event"], {"PostToolUse": smaller["PostToolUse"], "PostToolUseFailure": []})
+
+    def test_an_entry_outside_the_shape_under_a_new_event_exits_1_and_writes_nothing(self):
+        bad_entries = {
+            "relative command": {"PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "hooks/card-check"}]}]},
+            "timeout as text": {"PostToolUseFailure": [{"matcher": "Bash", "hooks": [{"type": "command", "command": CARD_CHECK, "timeout": "30"}]}]},
+            "unknown event": {"PostToolUsage": [{"matcher": "Bash", "hooks": [{"type": "command", "command": CARD_CHECK}]}]},
+        }
+        for number, (case, doc) in enumerate(bad_entries.items()):
+            with self.subTest(case=case):
+                core = self.make_core(name=f"core-{number}")
+                self.add_doc(core, "v0.2.0", doc)
+                repo = self.make_consumer(name=f"consumer-{number}")
+                result = self.sync(repo, core, "v0.2.0", check=False)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("hooks-core.json", result.stderr)
+                self.assertFalse((repo / ".claude/skills").exists())
+                self.assertFalse((repo / ".claude/settings.json").exists())
+
+    def test_sync_over_a_v0_3_0_lock_keeps_three_pre_entries_and_adds_the_new_events(self):
+        core = self.make_core()
+        self.add_doc(core, "v0.3.0", {"PreToolUse": real_hooks_core()["PreToolUse"]})
+        self.add_doc(core, "v0.4.0", real_hooks_core())
+        repo = self.make_consumer()
+        self.sync(repo, core, "v0.3.0")
+        lock_path = repo / ".claude/harness.lock"
+        old = "".join(line for line in lock_path.read_text().splitlines(True) if '"hooks_by_event"' not in line)
+        lock_path.write_text(old)  # the lock as v0.3.0 wrote it: `hooks` only
+        self.assertNotIn("hooks_by_event", self.read_lock(repo))
+        self.commit_all(repo)
+        self.assertEqual(self.sync(repo, core, "v0.4.0").returncode, 0)
+        hooks = self.settings(repo)["hooks"]
+        doc = real_hooks_core()
+        self.assertEqual(len(hooks["PreToolUse"]), 3)
+        for entry in doc["PreToolUse"]:
+            self.assertEqual(hooks["PreToolUse"].count(entry), 1)
+        for event in POST_EVENTS:
+            self.assertEqual(hooks[event], doc[event])
+        lock = self.read_lock(repo)
+        self.assertEqual(lock["schema"], 1)
+        self.assertEqual(lock["hooks"], doc["PreToolUse"])
+        self.assertEqual(lock["hooks_by_event"], {event: doc[event] for event in POST_EVENTS})
+
+    def test_lock_records_post_events_under_hooks_by_event(self):
+        core = self.make_core()
+        self.add_doc(core, "v0.2.0", real_hooks_core())
+        repo = self.make_consumer()
+        self.sync(repo, core, "v0.2.0")
+        lock = self.read_lock(repo)
+        doc = real_hooks_core()
+        self.assertEqual(lock["schema"], 1)
+        self.assertEqual(lock["hooks"], doc["PreToolUse"])
+        self.assertEqual(lock["hooks_by_event"], {event: doc[event] for event in POST_EVENTS})
+        verified = self.verify(repo)
+        self.assertEqual(verified.returncode, 0, verified.stdout + verified.stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

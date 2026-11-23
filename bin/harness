@@ -6,6 +6,7 @@ Standard library only, Python 3.10+. Run `harness <subcommand> --help` for the o
 
 import argparse
 import contextlib
+import copy
 import datetime
 import fnmatch
 import hashlib
@@ -21,12 +22,14 @@ import tempfile
 import urllib.parse
 from pathlib import Path
 
-USER_SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round", "cdv-notion"]
+USER_SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round", "cdv-notion", "cdv-notion-ticket",
+               "cdv-notion-project"]
+# Core hooks that also run at user level, in any folder (door 9): they need no repository profile.
+USER_HOOKS = ["card-check"]
 THIRD_PARTY_FILE = "third-party.json"
 THIRD_PARTY_RAW = "https://raw.githubusercontent.com"
 LOCK_RELATIVE = ".claude/harness.lock"
 PROFILE_RELATIVE = ".claude/harness/profile.yaml"
-USER_LOCK_RELATIVE = ".claude/harness-user.lock"
 HOUSE_END = "<!-- /cdv-harness:house -->"
 HOUSE_BLOCK_RE = re.compile(
     r"^<!-- cdv-harness:house \S+ -->[ \t]*\r?\n(?P<body>.*?)^<!-- /cdv-harness:house -->[ \t]*(?:\r?\n|\Z)",
@@ -401,7 +404,7 @@ def read_lock(path):
     return data
 
 
-def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files, hooks=None):
+def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files, hooks=None, hooks_by_event=None):
     def js(value):
         return json.dumps(value, ensure_ascii=False)
 
@@ -424,6 +427,8 @@ def lock_text(source, ref, commit, tree_sha, house_sha, paths, deny, files, hook
     out += array("deny", list(deny))
     if hooks is not None:
         out += array("hooks", list(hooks))
+    if hooks_by_event is not None:
+        out.append(f'  "hooks_by_event": {js(hooks_by_event)},')
     ordered = sorted(files, key=path_key)
     if ordered:
         out.append('  "files": {')
@@ -601,57 +606,104 @@ HOOK_COMMAND_PREFIX = '"$CLAUDE_PROJECT_DIR"/.claude/harness/hooks/'
 HOOK_COMMAND_RE = re.compile(re.escape(HOOK_COMMAND_PREFIX) + r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
+# The hook events a core entry may sit under. The lock keeps PreToolUse under `hooks`, as v0.3.0
+# wrote it, and the others under `hooks_by_event` (door 5).
+HOOK_EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure")
+POST_EVENTS = HOOK_EVENTS[1:]
+# At user level a hook is reached through the config dir the session runs with (door 3).
+USER_HOOK_PREFIX = '"${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/harness/hooks/'
+
+
 def read_core_hooks(blob):
-    """The `PreToolUse` entries of settings/hooks-core.json. Every command must be exactly
-    `"$CLAUDE_PROJECT_DIR"/.claude/harness/hooks/<name>`: a vendored hook, reached from any directory."""
+    """{event: entries} of settings/hooks-core.json, every event of HOOK_EVENTS present. Every
+    command must be exactly `"$CLAUDE_PROJECT_DIR"/.claude/harness/hooks/<name>`: a vendored hook,
+    reached from any directory; a `timeout` is a positive number of seconds."""
+    found = {event: [] for event in HOOK_EVENTS}
     if blob is None:
-        return []
+        return found
     try:
         doc = json.loads(blob)
-        entries = doc["PreToolUse"]
-        if not isinstance(entries, list):
-            raise ValueError("PreToolUse must be a list")
-        for entry in entries:
-            if not isinstance(entry, dict) or not isinstance(entry.get("matcher"), str):
-                raise ValueError("each entry needs a string matcher")
-            commands = entry.get("hooks")
-            if not isinstance(commands, list) or not commands:
-                raise ValueError("each entry needs a non-empty hooks list")
-            for hook in commands:
-                if not isinstance(hook, dict) or hook.get("type") != "command":
-                    raise ValueError("each hook must be of type command")
-                command = hook.get("command")
-                if not isinstance(command, str) or not HOOK_COMMAND_RE.fullmatch(command):
-                    raise ValueError(f"each command must be {HOOK_COMMAND_PREFIX}<name>, got {command!r}")
+        if not isinstance(doc, dict):
+            raise ValueError("the file must hold an object of events")
+        for event, entries in doc.items():
+            if event not in HOOK_EVENTS:
+                raise ValueError(f"unknown event {event!r} (known: {', '.join(HOOK_EVENTS)})")
+            if not isinstance(entries, list):
+                raise ValueError(f"{event} must be a list")
+            for entry in entries:
+                if not isinstance(entry, dict) or not isinstance(entry.get("matcher"), str):
+                    raise ValueError("each entry needs a string matcher")
+                commands = entry.get("hooks")
+                if not isinstance(commands, list) or not commands:
+                    raise ValueError("each entry needs a non-empty hooks list")
+                for hook in commands:
+                    if not isinstance(hook, dict) or hook.get("type") != "command":
+                        raise ValueError("each hook must be of type command")
+                    command = hook.get("command")
+                    if not isinstance(command, str) or not HOOK_COMMAND_RE.fullmatch(command):
+                        raise ValueError(f"each command must be {HOOK_COMMAND_PREFIX}<name>, got {command!r}")
+                    timeout = hook.get("timeout")
+                    if timeout is not None and (isinstance(timeout, bool) or not isinstance(timeout, int) or timeout <= 0):
+                        raise ValueError(f"a timeout must be a positive number of seconds, got {timeout!r}")
+            found[event] = entries
     except (ValueError, KeyError, TypeError) as exc:
         raise HarnessError(f"{HOOKS_CORE} is invalid: {exc}")
-    return entries
+    return found
 
 
-def merge_settings(settings_text, core_deny, previous_deny, core_hooks=(), previous_hooks=()):
-    """Merge the core deny list into permissions.deny and the core hook entries into
-    hooks.PreToolUse. What the previous sync wrote and the core dropped is removed; every other
-    entry of the repository stays as it is."""
-    text = merge_deny(settings_text, core_deny, previous_deny)
-    data = json.loads(text)
-    core_hooks, previous_hooks = list(core_hooks), list(previous_hooks)
+def previous_hooks_of(lock):
+    """{event: entries} a previous sync recorded: `hooks` (PreToolUse) and `hooks_by_event`."""
+    previous = {"PreToolUse": list(lock.get("hooks") or [])}
+    by_event = lock.get("hooks_by_event")
+    if isinstance(by_event, dict):
+        for event, entries in by_event.items():
+            if isinstance(entries, list):
+                previous[event] = entries
+    return previous
+
+
+def merge_hooks(data, core_hooks, previous_hooks, where):
+    """Merge the core entries of each event into data["hooks"][event]: what the previous sync wrote
+    and the core dropped is removed, a core entry is added once, every other entry stays. An event
+    list this leaves empty is dropped, and so is an empty `hooks`."""
+    events = [e for e in HOOK_EVENTS if core_hooks.get(e) or previous_hooks.get(e)]
+    events += [e for e in previous_hooks if e not in events and previous_hooks.get(e)]
+    if not events:
+        return
     hooks = data.get("hooks")
-    if hooks is None and not core_hooks:
-        return text
     if hooks is None:
         hooks = {}
         data["hooks"] = hooks
     if not isinstance(hooks, dict):
-        raise HarnessError(".claude/settings.json: hooks must be an object")
-    pre = hooks.get("PreToolUse", [])
-    if not isinstance(pre, list):
-        raise HarnessError(".claude/settings.json: hooks.PreToolUse must be a list")
-    dropped = [entry for entry in previous_hooks if entry not in core_hooks]
-    merged = [entry for entry in pre if entry not in dropped]
-    for entry in core_hooks:
-        if entry not in merged:
-            merged.append(entry)
-    hooks["PreToolUse"] = merged
+        raise HarnessError(f"{where}: hooks must be an object")
+    for event in events:
+        core, previous = list(core_hooks.get(event) or []), list(previous_hooks.get(event) or [])
+        current = hooks.get(event, [])
+        if not isinstance(current, list):
+            raise HarnessError(f"{where}: hooks.{event} must be a list")
+        dropped = [entry for entry in previous if entry not in core]
+        merged = [entry for entry in current if entry not in dropped]
+        for entry in core:
+            if entry not in merged:
+                merged.append(entry)
+        if merged:
+            hooks[event] = merged
+        else:
+            hooks.pop(event, None)
+    if not hooks:
+        data.pop("hooks")
+
+
+def merge_settings(settings_text, core_deny, previous_deny, core_hooks=None, previous_hooks=None):
+    """Merge the core deny list into permissions.deny and the core hook entries of each event into
+    the same event under `hooks`. What the previous sync wrote and the core dropped is removed;
+    every other entry of the repository stays as it is."""
+    text = merge_deny(settings_text, core_deny, previous_deny)
+    data = json.loads(text)
+    before = json.dumps(data, sort_keys=True)
+    merge_hooks(data, core_hooks or {}, previous_hooks or {}, ".claude/settings.json")
+    if json.dumps(data, sort_keys=True) == before:
+        return text
     return json.dumps(data, indent=2, ensure_ascii=False) + "\n"
 
 
@@ -792,7 +844,7 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
     previous = read_lock(lock_path) or {}
     previous_files = {p: s for p, s in (previous.get("files") or {}).items() if safe_lock_path(p)}
     previous_deny = previous.get("deny") or []
-    previous_hooks = previous.get("hooks") or []
+    previous_hooks = previous_hooks_of(previous)
 
     instructions_path = repo / instructions_rel
     settings_rel = ".claude/settings.json"
@@ -822,7 +874,8 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
         lock_paths_for(vendored),
         core_deny,
         file_shas,
-        core_hooks,
+        core_hooks["PreToolUse"],
+        {event: core_hooks[event] for event in POST_EVENTS},
     )
 
     removals = sorted((p for p in previous_files if p not in vendored), key=path_key)
@@ -892,11 +945,66 @@ def apply_sync(repo, profile, tree, tag, source_label, pr):
 # ---------------------------------------------------------------------------------------
 
 
-def sync_user(tag, from_=None, source=None):
-    home = Path(os.environ.get("HOME") or Path.home())
-    lock_path = home / USER_LOCK_RELATIVE
+def user_config_dir(config_dir=None):
+    """`--config-dir`, else $CLAUDE_CONFIG_DIR, else ~/.claude: where the session reads its settings."""
+    if config_dir:
+        return Path(config_dir).expanduser()
+    if os.environ.get("CLAUDE_CONFIG_DIR"):
+        return Path(os.environ["CLAUDE_CONFIG_DIR"]).expanduser()
+    return Path(os.environ.get("HOME") or Path.home()) / ".claude"
+
+
+def user_relative(path):
+    """A path the user lock recorded, relative to the config dir. A lock written before v0.4 recorded
+    `.claude/skills/<name>` relative to $HOME, when the config dir was always ~/.claude."""
+    return path[len(".claude/"):] if path.startswith(".claude/") else path
+
+
+def safe_user_path(relative):
+    """A recorded user path this tool may remove: a skill directory or the hooks directory, inside
+    the config dir."""
+    normal = os.path.normpath(relative)
+    parts = Path(normal).parts
+    return ".." not in parts and (normal == "harness/hooks" or (len(parts) == 2 and parts[0] == "skills"))
+
+
+def user_hook_entries(tree, core_hooks):
+    """{event: entries} of the core hooks that run at user level, rewritten to the config dir form,
+    and the hook names they need. An entry with any command outside USER_HOOKS stays out."""
+    entries, names = {}, set()
+    for event in HOOK_EVENTS:
+        for entry in core_hooks.get(event) or []:
+            commands = [h["command"][len(HOOK_COMMAND_PREFIX):] for h in entry["hooks"]]
+            if not all(name in USER_HOOKS and tree.has(f"hooks/{name}") for name in commands):
+                continue
+            rewritten = copy.deepcopy(entry)
+            for hook in rewritten["hooks"]:
+                hook["command"] = USER_HOOK_PREFIX + hook["command"][len(HOOK_COMMAND_PREFIX):]
+            entries.setdefault(event, []).append(rewritten)
+            names.update(commands)
+    return entries, sorted(names)
+
+
+def read_user_settings(path):
+    """The user's settings.json as an object (None when it does not exist); not JSON is an error."""
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise HarnessError(f"{path} is not valid JSON ({exc}); nothing was changed")
+    if not isinstance(data, dict):
+        raise HarnessError(f"{path} must hold a JSON object; nothing was changed")
+    return data
+
+
+def sync_user(tag, from_=None, source=None, config_dir=None):
+    config = user_config_dir(config_dir)
+    lock_path = config / "harness-user.lock"
     previous = read_lock(lock_path) or {}
-    recorded = set(previous.get("paths") or [])
+    recorded = {user_relative(p) for p in previous.get("paths") or []}
+    settings_path = config / "settings.json"
+    settings = read_user_settings(settings_path)
     with contextlib.ExitStack() as stack:
         if from_:
             core = Path(from_).resolve()
@@ -928,10 +1036,16 @@ def sync_user(tag, from_=None, source=None):
                 if tree.entries[path][0] == "120000":
                     raise HarnessError(f"{path} is a symlink in the core; symlinks cannot be installed")
             wanted[name] = members
+        core_hooks = read_core_hooks(tree.read(HOOKS_CORE) if tree.has(HOOKS_CORE) else None)
+        hook_entries, hook_names = user_hook_entries(tree, core_hooks)
+        hook_files = [f"hooks/{name}" for name in hook_names]
+        if hook_files and tree.has("hooks/harness_hook.py"):
+            hook_files.append("hooks/harness_hook.py")
         refused = []
-        for name in user_skills:
-            dest = home / ".claude" / "skills" / name
-            relative = f".claude/skills/{name}"
+        targets = [(f"skills/{name}", config / "skills" / name) for name in user_skills]
+        if hook_files:
+            targets.append(("harness/hooks", config / "harness" / "hooks"))
+        for relative, dest in targets:
             if dest.is_symlink() or (dest.exists() and relative not in recorded):
                 refused.append(str(dest))
         if refused:
@@ -939,24 +1053,40 @@ def sync_user(tag, from_=None, source=None):
                 "refusing to replace what this tool did not install (nothing was changed): "
                 + ", ".join(refused)
             )
-        blobs = tree.read_many([p for members in wanted.values() for p in members])
+        blobs = tree.read_many([p for members in wanted.values() for p in members] + hook_files)
         for relative in sorted(recorded):
-            target = home / relative
-            if safe_lock_path(relative) and target.is_dir() and not target.is_symlink():
+            target = config / relative
+            if safe_user_path(relative) and target.is_dir() and not target.is_symlink():
                 shutil.rmtree(target)
+                if relative == "harness/hooks":
+                    prune_empty_dirs(config, target.parent)
         files = {}
         for name, members in wanted.items():
             for path in members:
-                dest_rel = f".claude/{path}"
                 data = blobs[path]
-                write_file(home / dest_rel, data, tree.entries[path][0] == "100755")
-                files[dest_rel] = sha256_bytes(data)
-        paths = [f".claude/skills/{name}" for name in user_skills]
+                write_file(config / path, data, tree.entries[path][0] == "100755")
+                files[path] = sha256_bytes(data)
+        for path in hook_files:
+            data = blobs[path]
+            write_file(config / "harness" / path, data, tree.entries[path][0] == "100755")
+            files[f"harness/{path}"] = sha256_bytes(data)
+        previous_entries = previous_hooks_of(previous)
+        if settings is not None or any(hook_entries.values()):
+            data = settings if settings is not None else {}
+            before = json.dumps(data, sort_keys=True)
+            merge_hooks(data, hook_entries, previous_entries, str(settings_path))
+            if settings is None or json.dumps(data, sort_keys=True) != before:
+                write_file(settings_path, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+        paths = [f"skills/{name}" for name in user_skills] + (["harness/hooks"] if hook_files else [])
         write_file(
             lock_path,
-            lock_text(source_label, tag, tree.commit, tree_hash(files), "", paths, [], files).encode("utf-8"),
+            lock_text(source_label, tag, tree.commit, tree_hash(files), "", paths, [], files,
+                      hook_entries.get("PreToolUse", []),
+                      {event: hook_entries.get(event, []) for event in POST_EVENTS}).encode("utf-8"),
         )
-    info(f"installed {len(user_skills)} skills from {tag} into {home / '.claude' / 'skills'}")
+    info(f"installed {len(user_skills)} skills from {tag} into {config / 'skills'}")
+    if hook_files:
+        info(f"installed the hooks {', '.join(hook_names)} into {config / 'harness' / 'hooks'}, wired in {settings_path}")
     return 0
 
 
@@ -964,7 +1094,9 @@ def cmd_sync(args):
     if args.user:
         if args.pr:
             raise HarnessError("--pr does not apply to --user", 2)
-        return sync_user(args.tag, args.from_, args.source)
+        return sync_user(args.tag, args.from_, args.source, args.config_dir)
+    if args.config_dir:
+        raise HarnessError("--config-dir applies only to --user", 2)
     return sync_repo(Path(args.repo or os.getcwd()), args.tag, args.from_, args.pr)
 
 
@@ -1885,8 +2017,11 @@ def build_parser():
     p.add_argument("--from", dest="from_", help="core checkout to read the tag from (default: clone profile.harness_source)")
     p.add_argument("--repo", help="consumer repository root (default: current directory)")
     p.add_argument("--pr", action="store_true", help="work on chore/harness-sync-<tag>, commit, push and open a PR")
-    p.add_argument("--user", action="store_true", help="install the user-level skills under $HOME/.claude/skills")
+    p.add_argument("--user", action="store_true",
+                   help="install the user-level skills and hooks into the Claude config dir")
     p.add_argument("--source", help="with --user and no --from: git URL of the core")
+    p.add_argument("--config-dir", dest="config_dir",
+                   help="with --user: the Claude config dir (default: $CLAUDE_CONFIG_DIR, else ~/.claude)")
     p.set_defaults(func=cmd_sync)
 
     p = sub.add_parser("verify", help="check the vendored core against the lock")

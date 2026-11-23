@@ -113,7 +113,10 @@ class HarnessTestCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.home = self.tmp / "home"
         self.home.mkdir()
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("GIT_", "HARNESS_"))}
+        # CLAUDE_CONFIG_DIR is scrubbed too: `sync --user` writes there, and a test must never reach
+        # the config dir of the session that runs it.
+        self.env = {k: v for k, v in os.environ.items()
+                    if not k.startswith(("GIT_", "HARNESS_")) and k != "CLAUDE_CONFIG_DIR"}
         self.env.update(
             {
                 "HOME": str(self.home),

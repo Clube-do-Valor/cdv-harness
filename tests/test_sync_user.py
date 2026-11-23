@@ -5,11 +5,13 @@ import unittest
 
 from helpers import REPO_ROOT, HarnessTestCase, load_tool, sha256_file, skill_text
 
-SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round", "cdv-notion"]
+SKILLS = ["cdv-grilling", "cdv-grill-me", "cdv-research-round", "cdv-notion", "cdv-notion-ticket", "cdv-notion-project"]
 NOTION_CLIENT = "skills/cdv-notion/scripts/notion"
 USER_EXTRA = {
     "skills/cdv-notion/SKILL.md": skill_text("cdv-notion"),
     NOTION_CLIENT: ("#!/usr/bin/env python3\nprint('notion')\n", True),
+    "skills/cdv-notion-ticket/SKILL.md": skill_text("cdv-notion-ticket"),
+    "skills/cdv-notion-project/SKILL.md": skill_text("cdv-notion-project"),
 }
 
 
@@ -34,12 +36,12 @@ class SyncUserTest(HarnessTestCase):
         lock = json.loads((self.home / ".claude/harness-user.lock").read_text())
         self.assertEqual(lock["schema"], 1)
         self.assertEqual(lock["ref"], "v0.1.0")
-        self.assertEqual(lock["paths"], sorted(f".claude/skills/{n}" for n in SKILLS))
+        self.assertEqual(lock["paths"], sorted(f"skills/{n}" for n in SKILLS))
         self.assertEqual(
-            sorted(lock["files"]), sorted([f".claude/skills/{n}/SKILL.md" for n in SKILLS] + [f".claude/{NOTION_CLIENT}"])
+            sorted(lock["files"]), sorted([f"skills/{n}/SKILL.md" for n in SKILLS] + [NOTION_CLIENT])
         )
         for path, digest in lock["files"].items():
-            self.assertEqual(sha256_file(self.home / path), digest)
+            self.assertEqual(sha256_file(self.home / ".claude" / path), digest)
         self.assertEqual(lock["commit"], self.git(self.core, "rev-parse", "v0.1.0^{commit}").stdout.strip())
 
     def test_executable_bit_is_preserved(self):
@@ -56,7 +58,7 @@ class SyncUserTest(HarnessTestCase):
         self.assertTrue(client.is_file())
         self.assertTrue(os.access(client, os.X_OK))
         lock = json.loads((self.home / ".claude/harness-user.lock").read_text())
-        self.assertIn(".claude/skills/cdv-notion", lock["paths"])
+        self.assertIn("skills/cdv-notion", lock["paths"])
 
     def test_refuses_when_a_symlink_exists_and_touches_nothing(self):
         elsewhere = self.tmp / "elsewhere"
@@ -140,6 +142,128 @@ class SyncUserTest(HarnessTestCase):
         result = self.harness("sync", "--user", "v0.1.0", "--from", str(self.core), cwd=workdir)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(list(workdir.iterdir()), [])
+
+
+USER_PREFIX = '"${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/harness/hooks/'
+OTHER_TOOL = {"matcher": "*", "hooks": [{"type": "command", "command": "other-tool hook post"}]}
+
+
+def core_hook_files():
+    files = {}
+    for path in sorted((REPO_ROOT / "hooks").iterdir()):
+        if path.is_file() and not path.name.endswith(".pyc"):
+            files[f"hooks/{path.name}"] = (path.read_text(), bool(path.stat().st_mode & 0o111))
+    files["settings/hooks-core.json"] = (REPO_ROOT / "settings" / "hooks-core.json").read_text()
+    return files
+
+
+def user_entries():
+    """The core's card-check entries as the user level writes them (door 3)."""
+    doc = json.loads((REPO_ROOT / "settings" / "hooks-core.json").read_text())
+    out = {}
+    for event in ("PostToolUse", "PostToolUseFailure"):
+        entries = json.loads(json.dumps(doc[event]))
+        for entry in entries:
+            for hook in entry["hooks"]:
+                hook["command"] = USER_PREFIX + hook["command"].rsplit("/", 1)[1]
+        out[event] = entries
+    return out
+
+
+class UserHookTest(HarnessTestCase):
+    def setUp(self):
+        super().setUp()
+        self.core = self.make_core(extra={**USER_EXTRA, **core_hook_files()})
+        self.config = self.home / ".claude"
+
+    def sync_user(self, tag="v0.1.0", *extra, env=None):
+        return self.harness("sync", "--user", tag, "--from", str(self.core), *extra, env=env)
+
+    def write_settings(self, value):
+        self.config.mkdir(parents=True, exist_ok=True)
+        (self.config / "settings.json").write_text(value if isinstance(value, str) else json.dumps(value, indent=4))
+
+    def settings(self):
+        return json.loads((self.config / "settings.json").read_text())
+
+    def test_user_sync_installs_the_card_skills_and_the_hook(self):
+        result = self.sync_user()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("cdv-notion", "cdv-notion-ticket", "cdv-notion-project"):
+            self.assertTrue((self.config / "skills" / name / "SKILL.md").is_file(), name)
+        hooks = self.config / "harness" / "hooks"
+        self.assertEqual(sorted(p.name for p in hooks.iterdir()), ["card-check", "harness_hook.py"])
+        self.assertTrue(os.access(hooks / "card-check", os.X_OK))
+        expected = user_entries()
+        self.assertEqual(self.settings(), {"hooks": expected})
+        self.assertEqual(expected["PostToolUse"][0]["matcher"], "^(Bash|mcp__.+__notion-(update-page|create-pages))$")
+        self.assertEqual(expected["PostToolUse"][0]["hooks"][0],
+                         {"type": "command", "command": USER_PREFIX + "card-check", "timeout": 30})
+        lock = json.loads((self.config / "harness-user.lock").read_text())
+        self.assertEqual(lock["hooks"], [])
+        self.assertEqual(lock["hooks_by_event"], expected)
+        self.assertIn("harness/hooks", lock["paths"])
+        self.assertIn("harness/hooks/card-check", lock["files"])
+
+    def test_user_settings_keep_other_keys_and_entries(self):
+        original = {"permissions": {"allow": ["Bash(ls:*)"], "deny": ["Read(.env)"]}, "model": "opus",
+                    "hooks": {"PostToolUse": [OTHER_TOOL], "PreToolUse": [OTHER_TOOL]}}
+        self.write_settings(original)
+        self.assertEqual(self.sync_user().returncode, 0)
+        self.assertEqual(self.sync_user().returncode, 0)
+        data = self.settings()
+        self.assertEqual(data["permissions"], original["permissions"])
+        self.assertEqual(data["model"], "opus")
+        self.assertEqual(data["hooks"]["PreToolUse"], [OTHER_TOOL])
+        expected = user_entries()
+        self.assertEqual(data["hooks"]["PostToolUse"], [OTHER_TOOL, *expected["PostToolUse"]])
+        self.assertEqual(data["hooks"]["PostToolUseFailure"], expected["PostToolUseFailure"])
+
+    def test_user_settings_are_created_when_missing(self):
+        self.assertFalse((self.config / "settings.json").exists())
+        self.assertEqual(self.sync_user().returncode, 0)
+        self.assertEqual(self.settings(), {"hooks": user_entries()})
+
+    def test_invalid_user_settings_exit_1_and_nothing_is_written(self):
+        self.write_settings("{ not json")
+        result = self.sync_user()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(self.config / "settings.json"), result.stderr)
+        self.assertEqual((self.config / "settings.json").read_text(), "{ not json")
+        self.assertEqual(sorted(p.name for p in self.config.iterdir()), ["settings.json"])
+
+    def test_config_dir_from_the_flag_the_variable_or_home(self):
+        flag, variable = self.tmp / "x", self.tmp / "y"
+        self.assertEqual(self.sync_user("v0.1.0", "--config-dir", str(flag)).returncode, 0)
+        self.assertTrue((flag / "harness" / "hooks" / "card-check").is_file())
+        self.assertTrue((flag / "skills" / "cdv-notion-ticket" / "SKILL.md").is_file())
+        self.assertEqual(json.loads((flag / "settings.json").read_text()), {"hooks": user_entries()})
+        self.assertFalse(self.config.exists())
+        env = dict(self.env, CLAUDE_CONFIG_DIR=str(variable))
+        self.assertEqual(self.sync_user(env=env).returncode, 0)
+        self.assertTrue((variable / "harness-user.lock").is_file())
+        self.assertTrue((variable / "harness" / "hooks" / "card-check").is_file())
+        self.assertFalse(self.config.exists())
+        self.assertEqual(self.sync_user().returncode, 0)
+        self.assertTrue((self.config / "harness" / "hooks" / "card-check").is_file())
+        self.assertTrue((self.config / "settings.json").is_file())
+
+    def test_a_dropped_hook_is_removed_and_nothing_else_changes(self):
+        original = {"permissions": {"allow": ["Bash(ls:*)"]}, "hooks": {"PostToolUse": [OTHER_TOOL]}, "env": {"A": "1"}}
+        self.write_settings(original)
+        self.assertEqual(self.sync_user().returncode, 0)
+        doc = json.loads((REPO_ROOT / "settings" / "hooks-core.json").read_text())
+        smaller = {"PreToolUse": doc["PreToolUse"]}
+        self.commit_core(self.core, {"settings/hooks-core.json": json.dumps(smaller, indent=2) + "\n"},
+                         remove=["hooks/card-check"], message="feat: drop the card hook", tag="v0.2.0")
+        result = self.sync_user("v0.2.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.settings(), original)
+        self.assertFalse((self.config / "harness").exists())
+        lock = json.loads((self.config / "harness-user.lock").read_text())
+        self.assertEqual(lock["hooks_by_event"], {"PostToolUse": [], "PostToolUseFailure": []})
+        self.assertNotIn("harness/hooks", lock["paths"])
+        self.assertTrue((self.config / "skills" / "cdv-notion-ticket").is_dir())
 
 
 class UserSkillsListTest(unittest.TestCase):
