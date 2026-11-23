@@ -179,6 +179,8 @@ WORD_TAGS = {"a", "mention", "date"}
 TARGET_ATTRIBUTES = {"url", "href", "source", "src"}
 DATE_ATTRIBUTES = {"start", "end", "start-time", "end-time", "time-zone"}
 CAPTION_ATTRIBUTES = {"alt", "caption"}
+# The name a mention shows, up to its closing tag; a mention inside it means the first one never closes.
+MENTION_NAME = re.compile(r"(?:\\.|(?!\\|</?mention[\s/>]).)*</mention\s*>", re.I)
 # The marks of bold, strikethrough and italics: where each one opens and where it closes.
 EMPHASIS = [tuple(map(re.compile, (f"{opens}|{closes}", opens, closes))) for opens, closes in (
     (r"\*\*(?=\S)", r"\*\*"), (r"(?<!\w)__(?=\S)", r"__(?!\w)"), (r"~~(?=\S)", r"~~"),
@@ -222,6 +224,18 @@ def tag_words(match):
     return space + "".join(sorted(said)) + space
 
 
+def mention_end(match, line):
+    """Where the tag `match` ends on the line; of a mention that holds a target, where its closing tag
+    does: the name it shows follows the page or the person it points at, so it is no word of the request."""
+    end = match.end()
+    if match.group("name").lower() != "mention" or match.group("tag").endswith("/>"):
+        return end
+    if not any(key.lower() in TARGET_ATTRIBUTES and "".join(value) for key, *value in ATTRIBUTE.findall(match.group("attributes"))):
+        return end
+    shown = MENTION_NAME.match(line, end)
+    return shown.end() if shown else end
+
+
 def without_pairs(text, mark, opens, closes):
     """The text without the marks of one kind that pair up around some text; a mark alone is text."""
     out, last, opened = [], 0, None
@@ -237,16 +251,17 @@ def without_pairs(text, mark, opens, closes):
 def request_words(line):
     """The words of one line of the request with only their formatting dropped (bold, italics, colour,
     inline code marks, escapes): the target of every link and mention, the days and hours of a date and
-    the text of inline code stay, and of a picture or a file its caption and its unsigned address. `plain`, which labels and titles are compared with, drops every tag."""
+    the text of inline code stay, and of a picture or a file its caption and its unsigned address; of a
+    mention the name shown does not. `plain`, which labels and titles are compared with, drops every tag."""
     kept, out, last, brackets = [], [], 0, []
 
     def hold(text):
         kept.append(text)
         return f"\x00{len(kept) - 1}\x00"
 
-    for match in REQUEST_TOKEN.finditer(line):
+    while match := REQUEST_TOKEN.search(line, last):  # from the end of the last one: a mention's name is not read
         out.append(line[last : match.start()])
-        last = match.end()
+        last = mention_end(match, line) if match.group("tag") else match.end()
         if match.group("escaped"):
             out.append(hold(match.group("escaped")))
         elif match.group("ticks"):

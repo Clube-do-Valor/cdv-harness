@@ -558,6 +558,55 @@ class RequestPinTest(CardCase):
             self.cc.digest(mark * 40000)
         self.assertLess(time.monotonic() - started, 60)
 
+    def test_a_renamed_mention_in_the_request_is_the_same_request(self):
+        one, two = "a" * 32, "b" * 32
+        page = f'<mention url="https://app.notion.com/p/{one}">Plano</mention>'
+        person = f'<mention url="user://{one}">Ana Lima</mention>'
+        self.assertRequest([
+            ("a page renamed", f"Veja {page} hoje", f"Veja {page} hoje".replace("Plano", "Plano de faturas")),
+            ("a person renamed", f"Com {person}, hoje", f"Com {person}, hoje".replace("Ana Lima", "Ana Costa")),
+            ("no name shown", page, page.replace("Plano", "")),
+            ("a mention that closes itself", page, f'<mention url="https://app.notion.com/p/{one}" />'),
+            ("single quotes", page.replace('"', "'"), page.replace("Plano", "Outro")),
+            ("two on one line", f"{page} e {person}", f"{page} e {person}".replace("Plano", "Outro").replace("Ana", "Bia")),
+            ("inside bold", f"**veja {page}**", f"<b>veja {page}</b>".replace("Plano", "Outro")),
+            ("in a list item", f"- {page}: ver", f"- {page}: ver".replace("Plano", "Outro")),
+            ("in a table cell", f"<tr><td>{page}</td></tr>", f"<tr><td>{page}</td></tr>".replace("Plano", "Outro")),
+            ("a name with a bracket", page, page.replace("Plano", "Plano [1")),
+            ("a name with a backquote", f"{page} e `x`", f"{page} e `x`".replace("Plano", "O ` Plano")),
+            ("a name with a star and one after", f"{page} 5 * 3 *fim", f"{page} 5 * 3 *fim".replace("Plano", "*Plano")),
+            ("a name with an escaped tag", page, page.replace("Plano", "Plano \\</mention> \\<mention>")),
+            ("a name with a tag", page, page.replace("Plano", "<b>Plano</b><br />novo")),
+        ], [])
+        self.assertRequest([
+            ("a page, another target", page, page.replace(one, two)),
+            ("a person, another target", person, person.replace(one, two)),
+            ("another target and the same name", f"{page} e {person}", f"{page} e {person}".replace(f"user://{one}", f"user://{two}")),
+            ("the words around it", f"Veja {page} hoje", f"Veja {page} amanhã"),
+            ("the words between two", f"{page} e {person}", f"{page} ou {person}"),
+            ("the words after one that closes itself", f'<mention url="user://{one}" /> pediu {page}',
+             f'<mention url="user://{one}" /> cancelou {page}'),
+            ("the words after one with no end", f'<mention url="user://{one}"> pediu {page}',
+             f'<mention url="user://{one}"> cancelou {page}'),
+            ("the target after one with no end", f'<mention url="user://{one}"> pediu {page}',
+             f'<mention url="user://{one}"> pediu {page}'.replace(f"/p/{one}", f"/p/{two}")),
+            ("the words up to a loose end", f'<mention url="user://{one}" /> pediu</mention> hoje',
+             f'<mention url="user://{one}" /> cancelou</mention> hoje'),
+            ("the words of a link up to a loose end", f'<a href="https://example.com/{one}">plano</a></mention>',
+             f'<a href="https://example.com/{one}">texto</a></mention>'),
+            ("a mention with no target","<mention>Ana</mention>", "<mention>Bia</mention>"),
+            ("a mention with an empty target", '<mention url="">Ana</mention>', '<mention url="">Bia</mention>'),
+            ("a mention as text in inline code", f"`{page}`", f"`{page}`".replace("Plano", "Outro")),
+            ("a mention as text in a fence", f"```\n{page}\n```", f"```\n{page}\n```".replace("Plano", "Outro")),
+            ("the words of a markdown link", f"[o plano](https://app.notion.com/p/{one})", f"[o texto](https://app.notion.com/p/{one})"),
+            ("the words of a link tag", f'<a href="https://example.com/{one}">plano</a>', f'<a href="https://example.com/{one}">texto</a>'),
+            ("the hour of a date", '<date start="2026-11-22" start-time="09:00" />', '<date start="2026-11-22" start-time="18:00" />'),
+        ], ["request-changed"])
+        # A long line of mentions that never close is read in one pass
+        started = time.monotonic()
+        self.cc.digest(f'<mention url="user://{one}">a ' * 20000)
+        self.assertLess(time.monotonic() - started, 60)
+
     def test_a_picture_or_file_read_again_with_another_signature_is_the_same_request(self):
         signed = "https://files.example.com/space/tela.png?X-Sig=111&X-Date=1"
         again = "https://files.example.com/space/tela.png?X-Sig=222&amp;X-Date=2"
