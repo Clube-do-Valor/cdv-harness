@@ -337,15 +337,33 @@ class TaskRulesTest(CardCase):
         self.assertEqual(sorted(self.rules(with_request)), ["delivery-zone", "done-when", "objective"])
 
     def test_a_status_written_in_the_body_is_a_finding(self):
-        for number, line in enumerate(("**Status:** em rollout", "Status: Done"), start=1):
+        under_entrega = REQUEST + entrega().replace("**Onde:**", "**Status:** em rollout\n\n**Onde:**") + "\n" + fechamento()
+        under_closing = full_task() + "\nStatus: Done\n"
+        for number, (body, line) in enumerate(((under_entrega, "**Status:** em rollout"), (under_closing, "Status: Done")),
+                                              start=1):
             with self.subTest(line=line):
-                page = self.add(cf.task(number, full_task() + "\n" + line + "\n"))
+                page = self.add(cf.task(number, body))
                 code, out, _ = self.check(page)
                 self.assertEqual(code, 1)
                 self.assertTrue(out.startswith("status-in-body: "), out)
                 self.assertIn(line.replace("**", ""), out)
         prose = self.add(cf.task(5, REQUEST.replace("planilha.", "planilha; o status do pedido aparece na tela.") + entrega()))
         self.assertEqual(self.rules(prose), [])
+
+    def test_a_status_line_in_the_request_zone_is_the_words_of_who_asked(self):
+        said = "Status: o sistema caiu de novo hoje."
+        request = self.add(cf.task(1, "## Pedido\n\n" + said + "\n\n" + entrega()))
+        self.assertEqual(self.rules(request), [])
+        form_body = "## Resultado Obtido Vs Esperado\n\n" + said + "\n\n## Prazo\n\nSexta.\n"
+        form = self.add(cf.task(2, form_body, email="c@example.com"))
+        self.assertEqual(self.rules(form), [])
+        closed = self.add(cf.task(3, form_body + "\n" + fechamento(2) + "\nPR: #12\nStatus: Done\n", status="Done",
+                                  email="c@example.com", pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(closed), ["status-in-body"])
+        toggle = self.add(cf.project(4, cf.project_body(current=CURRENT, request="Pedido de quem pediu.\n" + said)))
+        self.assertEqual(self.rules(toggle), [])
+        current = self.add(cf.project(5, cf.project_body(current=CURRENT.replace("Na pesquisa.", "Status: Done"))))
+        self.assertEqual(self.rules(current), ["status-in-body"])
 
 
 SCOPE_OK = "- **12/11** · Entrou: a tela de regras. Decidido com quem pediu. CES de 7 para 9.\n"

@@ -242,8 +242,9 @@ def top_items(lines):
     return sum(1 for line in lines if LIST_ITEM.match(line))
 
 
-def request_zone(lines):
-    """The text from `## Pedido` to `## Entrega` (or to `## Fechamento`, or the end), or None."""
+def request_span(lines):
+    """(first, end) line indexes of the request zone: from `## Pedido` to `## Entrega` (or to
+    `## Fechamento`, or the end), the heading included; None when there is no `## Pedido`."""
     start = h2_index(lines, "Pedido")
     if start is None:
         return None
@@ -252,7 +253,13 @@ def request_zone(lines):
         index = h2_index(lines, title)
         if index is not None and index > start:
             end = min(end, index)
-    return "\n".join(lines[start + 1 : end])
+    return start, end
+
+
+def request_zone(lines):
+    """The text from `## Pedido` to `## Entrega` (or to `## Fechamento`, or the end), or None."""
+    span = request_span(lines)
+    return None if span is None else "\n".join(lines[span[0] + 1 : span[1]])
 
 
 TOGGLE_OPEN = re.compile(r"^<toggle(?:\s[^>]*)?>$")
@@ -260,6 +267,12 @@ TOGGLE_OPEN = re.compile(r"^<toggle(?:\s[^>]*)?>$")
 
 def toggles(lines):
     """[(title, child lines)] of the toggles at the top of the body."""
+    return [(title, children) for title, children, _, _ in toggle_spans(lines)]
+
+
+def toggle_spans(lines):
+    """[(title, child lines, first, end)] of the toggles at the top of the body, with the line
+    indexes the toggle runs over (its closing tag included)."""
     found, index = [], 0
     while index < len(lines):
         if not TOGGLE_OPEN.match(lines[index].strip()):
@@ -280,7 +293,7 @@ def toggles(lines):
             elif title is not None:
                 children.append(line)
             cursor += 1
-        found.append((plain(re.sub(r"<[^>]+>", "", title or "")), children))
+        found.append((plain(re.sub(r"<[^>]+>", "", title or "")), children, index, cursor + 1))
         index = cursor + 1
     return found
 
@@ -559,11 +572,27 @@ class Findings:
         self.items.append({"rule": rule, "message": message.rstrip("."), "fix": fix})
 
 
+def request_lines(card):
+    """The line indexes that hold the words of who asked, which no rule rewrites: the request zone of
+    a task, the request toggle of a project, and on a form ticket the form's own sections (every
+    line above `## Fechamento`, the whole body when there is none)."""
+    if card.kind == "form":
+        closing = h2_index(card.lines, "Fechamento")
+        return range(len(card.lines) if closing is None else closing)
+    if card.kind == "project":
+        wanted = fold(card.names["projects"]["toggles"]["request"])
+        spans = [range(first, end) for title, _, first, end in toggle_spans(card.lines) if fold(title) == wanted]
+        return spans[0] if spans else range(0)
+    span = request_span(card.lines)
+    return range(*span) if span else range(0)
+
+
 def status_rule(card, found):
     name = card.names["tasks"]["properties"]["status"]
     wanted = fold(name) + ":"
-    for line in card.lines:
-        if not line.strip() or heading(line):
+    theirs = request_lines(card)
+    for index, line in enumerate(card.lines):
+        if not line.strip() or heading(line) or index in theirs:
             continue
         if fold(line).startswith(wanted):
             found.add("status-in-body", f"the body states the status in the line '{quote(plain(line))}'",

@@ -56,7 +56,9 @@ change gets the summary property only.
 - `## Fechamento` holds 1 to 3 list items.
 - The summary property holds one sentence of at most 200 characters on one line: what changed for
   who asked. It is the first sentence of the pull request's TL;DR, copied unchanged.
-- No status in the body: a line that starts with the status property's name and a colon is a finding.
+- No status in the body: a line that starts with the status property's name and a colon is a finding,
+  except inside the words of who asked (the request zone of a task, the request toggle of a project,
+  a form ticket's own sections above `## Fechamento`), which no rule asks to rewrite.
 
 ## The five moments of a task
 
