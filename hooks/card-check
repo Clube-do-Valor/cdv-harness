@@ -6,10 +6,11 @@ It fires after every `Bash` call and every connector page write. When the call w
 command that names the cdv-notion client and whose output holds the client's own write lines
 (`updated <url>`, `created <url> <key>`), whatever the shell shape; with no such line, the client's
 `update <ref>` in the command as far as it parses (a failed call checks the pages its output shows
-as written, and on exit 4, done in part, also the page of the command); or the connector's
-`notion-update-page` or `notion-create-pages` under any server prefix - it runs
-`card_contract.py check <ref>` (with `--body-replaced` after a whole-body replace) and, on findings,
-exits 2 with them on stderr, which the host shows the model beside the tool result. A client
+as written, and on exit 4, done in part, also the page of the command; a write the client reports as
+in doubt is checked like one that landed, on the page its message names, and a write refused or
+never sent is not); or the connector's `notion-update-page` or `notion-create-pages` under any server
+prefix - it runs `card_contract.py check <ref>` (with `--body-replaced` after a whole-body replace)
+and, on findings, exits 2 with them on stderr, which the host shows the model beside the tool result. A client
 `fetch`, when it is the command's one client call with nothing piped, redirected or run after it,
 pins the request zone from its own output, with no call to Notion; an output that may be cut (the
 client's truncation marker, a request zone that does not reach its end marker) pins nothing.
@@ -103,6 +104,11 @@ NAMES_CLIENT = re.compile(r"(?:^|[\s/'\"=;&|(`])notion(?=$|[\s'\";&|)`])")
 WRITE_LINE = re.compile(r"^\s*(updated|created) (https?://\S+)")
 # A done-in-part update names its page: `done in part on <url>: written: ...`.
 PARTIAL_ON = re.compile(r"done in part on (https?://\S+?):(?:\s|$)")
+# A write in doubt (sent, with no answer the client can trust), alone or after a write that landed:
+# `In doubt: <what> (<cause>): ...`. The cause names the page by the API path the request went to. A
+# refused (`Not written:`) or unsent (`Not sent:`) write names that path too, and is not one.
+IN_DOUBT = re.compile(r"(?m)^\s*(?:done in part\b.*?\. )?In doubt: .*$")
+PAGE_PATH = re.compile(r"/v1/pages/(" + UUID.pattern + ")")
 SHELLS = {"bash", "sh", "zsh", "dash"}
 # Words before the program that only change how it runs.
 WRAPPERS = {"do", "then", "else", "time", "exec", "command", "nohup", "!"}
@@ -193,28 +199,35 @@ def written_lines(output):
     return found
 
 
-def bash_targets(command, output, code):
+def pages_in_doubt(text):
+    """The pages of the writes the client reports as in doubt."""
+    return [match.group(1) for line in IN_DOUBT.findall(text or "") for match in PAGE_PATH.finditer(line)]
+
+
+def bash_targets(command, output, code, errors=""):
     """[(ref, body replaced)] of the pages the client wrote, and whether it fetched a page.
 
     The pages are the client's own write lines in the output, whatever the shell shape; when the
     output holds none, the client's `update` in the command, as far as it can be parsed. A call
     that exited 4 (done in part) also checks the page of the command: the one its message names
     (`done in part on <url>`), and the command's refs when the output shows fewer pages than the
-    command has updates."""
+    command has updates. A write in doubt is said on stderr (`errors` when the call succeeded)."""
     replaced = bool(re.search(r"--replace-file\b", command))
     calls = client_calls(command)
     updates = [update_ref(arguments) for verb, arguments in calls if verb == "update"]
     refs = [ref for ref in updates if ref]
     lines = written_lines(output)
     pages = [url for _, url in lines]
-    if not lines and code == 0:
+    doubted = pages_in_doubt(f"{output}\n{errors}")
+    if not lines and not doubted and code == 0:
         pages = list(refs)
     if code == 4:
         partial = [m.group(1) for m in PARTIAL_ON.finditer(output or "")]
         pages += partial
-        shown_pages = {page_key(url) for url in [u for verb, u in lines if verb == "updated"] + partial}
+        shown_pages = {page_key(url) for url in [u for verb, u in lines if verb == "updated"] + partial + doubted}
         if len(shown_pages) < len(updates):
             pages += refs
+    pages += doubted
     return [(page, replaced) for page in pages], whole_fetch(command, calls)
 
 
@@ -255,16 +268,16 @@ def connector_targets(tool, tool_input, response):
 
 
 def output_of(event):
-    """(exit code or None, the text the call printed): on PostToolUse the call's stdout, after a
-    failure the host's `error` text, which starts `Exit code <n>`."""
+    """(exit code or None, the text the call printed, its stderr): on PostToolUse the call's stdout and
+    stderr, after a failure the host's `error` text, which starts `Exit code <n>` and holds both."""
     if "error" in event and event.get("hook_event_name") != "PostToolUse":
         error = str(event.get("error") or "")
         match = re.match(r"\s*Exit code (\d+)", error)
-        return (int(match.group(1)) if match else None), error
+        return (int(match.group(1)) if match else None), error, ""
     response = event.get("tool_response")
     if isinstance(response, dict):
-        return 0, str(response.get("stdout") or "")
-    return 0, str(response or "")
+        return 0, str(response.get("stdout") or ""), str(response.get("stderr") or "")
+    return 0, str(response or ""), ""
 
 
 # ---------------------------------------------------------------------------------------------
@@ -343,13 +356,13 @@ def main():
         return SILENT, ""
     tool = str(event.get("tool_name") or "")
     tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
-    code, output = output_of(event)
+    code, output, errors = output_of(event)
     fetched = False
     if tool == "Bash":
         command = tool_input.get("command")
         if not isinstance(command, str) or not NAMES_CLIENT.search(command):
             return SILENT, ""
-        targets, fetched = bash_targets(command, output, code)
+        targets, fetched = bash_targets(command, output, code, errors)
         fetched = fetched and code == 0
     elif CONNECTOR.match(tool):
         if code != 0:

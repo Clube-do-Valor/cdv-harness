@@ -214,6 +214,127 @@ class CardHookTest(HookCase):
             f"Exit code 4\ndone in part on {first['url']}: written: properties. Not written: body")))
         self.assertSays(proc, first["url"], "request-zone:")
 
+    def client_run(self, argv, *failures):
+        """(exit code, stdout, stderr) of the real client over the fake Notion, where each (method, path,
+        answer) of `failures` answers for it: a status, or the exception the transport raises."""
+        fake, module = cf.fake_from_state(self.state), cf.real_client()
+        fake.now = cf.CREATED
+        module.SLEEP = lambda seconds: None
+        module.TRANSPORT = fake
+        for method, path, answer in failures:
+            def handler(request, answer=answer):
+                if isinstance(answer, tuple):
+                    return answer
+                if isinstance(answer, int):
+                    return answer, {"object": "error", "status": answer, "code": "synthetic", "message": "synthetic"}
+                raise getattr(module, answer)("synthetic") if isinstance(answer, str) else answer
+            fake.on(method, path, handler)
+        with mock.patch.dict(os.environ, self.env, clear=True):
+            return cf.run_main(module, argv)
+
+    def failed(self, command, run, **extra):
+        """The host's event for a Bash call that ended in the client run `run`."""
+        code, out, err = run
+        return self.event("Bash", {"command": command}, error=f"Exit code {code}\n{out}{err}", **extra)
+
+    def test_a_write_in_doubt_whose_page_the_client_names_is_checked(self):
+        page = self.add(cf.task(1, ""))
+        other = self.add(cf.task(2, ""))
+        parent = self.add(cf.task(3, ""))
+        clean = self.add(cf.task(4, GOOD))
+        body = self.tmp / "f.md"
+        body.write_text("Uma linha.\n", encoding="utf-8")
+        one, page_path, body_path = cf.key(1), f"/v1/pages/{page['id']}", f"/v1/pages/{page['id']}/markdown"
+        props = ["update", one, "--set", "Status=Done"]
+        append = ["update", one, "--append-file", str(body)]
+        command = f"{CLIENT_CMD} update {one} --set 'Status=Done'"
+        loop = f"for k in {one} {cf.key(2)}; do {CLIENT_CMD} update $k --set 'Status=Done'; done"
+
+        # In doubt on the first write: exit 1, no `updated` line, and the message names the page
+        for number, (argv, path, answer) in enumerate((
+                (props, page_path, 502), (props, page_path, 529), (props, page_path, TimeoutError("slow")),
+                (props, page_path, ConnectionResetError("reset")), (append, body_path, 503))):
+            with self.subTest(argv=argv, answer=answer):
+                run = self.client_run(argv, ("PATCH", path, answer))
+                self.assertEqual(run[0], 1, run)
+                self.assertIn("In doubt: ", run[2])
+                self.assertNotIn("updated", run[1])
+                proc = self.hook(self.failed(command, run, session=f"doubt-{number}"))
+                self.assertSays(proc, cf.hex32(page["id"]), "request-zone:")
+                self.assertEqual(proc.stderr.count("request-zone:"), 1)
+
+        # Refused or never sent: the message may name the page too, and nothing is checked
+        self.clear_calls()
+        for argv, path, answer, code in ((props, page_path, 409, 1), (props, page_path, 400, 2),
+                                         (props, page_path, 401, 3), (props, page_path, 429, 1),
+                                         (props, page_path, "Unsent", 1), (append, body_path, ConnectionRefusedError("no"), 1)):
+            with self.subTest(argv=argv, answer=answer):
+                run = self.client_run(argv, ("PATCH", path, answer))
+                self.assertEqual(run[0], code, run)
+                self.assertNotIn("In doubt: ", run[2])
+                self.assertSilent(self.hook(self.failed(command, run)))
+        self.assertEqual(self.calls(), [])
+
+        # In doubt on a later write: exit 4, the page is checked once
+        run = self.client_run(props + ["--append-file", str(body)], ("PATCH", body_path, TimeoutError("slow")))
+        self.assertEqual(run[0], 4, run)
+        self.assertIn("In doubt: ", run[2])
+        proc = self.hook(self.failed(loop, run, session="later"))
+        self.assertSays(proc, page["url"])
+        self.assertEqual(proc.stderr.count("request-zone:"), 1)
+
+        # One call, one update in doubt and one that landed: both, whichever decided the call's exit code
+        doubt = self.client_run(props, ("PATCH", page_path, 502))
+        landed = f"updated {other['url']}\n"
+        proc = self.hook(self.failed(loop, (1, landed, doubt[2]), session="both"))
+        self.assertSays(proc, cf.hex32(page["id"]), other["url"])
+        for name, out, err in (("stderr", landed, doubt[2]), ("2>&1", doubt[2] + landed, "")):
+            with self.subTest(exit=0, doubt_on=name):
+                proc = self.hook(self.event("Bash", {"command": loop}, {"stdout": out, "stderr": err, "interrupted": False},
+                                            session="zero " + name))
+                self.assertSays(proc, cf.hex32(page["id"]), other["url"])
+        masked = self.hook(self.event("Bash", {"command": command + " 2>&1 | tail -3"}, {"stdout": doubt[2], "stderr": ""},
+                                      session="masked"))
+        self.assertSays(masked, cf.hex32(page["id"]))
+        self.assertEqual(masked.stderr.count("request-zone:"), 1)
+        # The first update in doubt, the second done in part (exit 4): each page once, the keys add nothing
+        two = {"command": f"{CLIENT_CMD} update {one} --set 'Status=Done'; "
+                          f"{CLIENT_CMD} update {cf.key(2)} --set 'Status=Done' --append-file f.md"}
+        proc = self.hook(self.event("Bash", two, session="two", error=(
+            f"Exit code 4\n{landed}{doubt[2]}done in part on {other['url']}: written: properties Status. Not written: x")))
+        self.assertSays(proc, cf.hex32(page["id"]), other["url"])
+        self.assertEqual(proc.stderr.count("request-zone:"), 2)
+        # A whole-body replace in doubt is judged as one, and a clean card in doubt says nothing
+        theirs = self.add(cf.task(5, "", assignee=(BRUNO,)))
+        run = self.client_run(["update", cf.key(5), "--replace-file", str(body)],
+                              ("PATCH", f"/v1/pages/{theirs['id']}/markdown", 504))
+        self.assertSays(self.hook(self.failed(f"{CLIENT_CMD} update {cf.key(5)} --replace-file f.md", run)), "request-zone:")
+        run = self.client_run(["update", cf.key(4), "--set", "Status=Done"], ("PATCH", f"/v1/pages/{clean['id']}", 502))
+        self.assertIn("In doubt: ", run[2])
+        self.assertSilent(self.hook(self.failed(f"{CLIENT_CMD} update {cf.key(4)} --set 'Status=Done'", run)))
+
+        # A create in doubt names its parent and no page of its own: nothing is checked
+        create = f"{CLIENT_CMD} create --parent {cf.key(3)} --set 'title=Plano'"
+        run = self.client_run(["create", "--parent", parent["id"], "--set", "title=Plano"], ("POST", "/v1/pages", 502))
+        self.assertEqual(run[0], 1, run)
+        self.assertIn("In doubt: ", run[2])
+        self.assertIn(cf.hex32(parent["id"]), run[2])
+        self.clear_calls()
+        self.assertSilent(self.hook(self.failed(create, run)))
+        # unless Notion said which page the create committed and only reading it back failed
+        run = self.client_run(["create", "--parent", parent["id"], "--set", "title=Plano"],
+                              ("POST", "/v1/pages", (503, {"object": "error", "status": 503, "code": "synthetic", "message": "x",
+                                                           "additional_data": {"committed_resource_id": other["id"]}})),
+                              ("GET", f"/v1/pages/{other['id']}", TimeoutError("slow")))
+        self.assertIn("In doubt: ", run[2])
+        proc = self.hook(self.failed(create, run, session="committed"))
+        self.assertSays(proc, cf.hex32(other["id"]))
+        self.assertNotIn(cf.hex32(parent["id"]), proc.stderr)
+        self.clear_calls()
+        # The same words in a command that does not name the client are not a write
+        self.assertSilent(self.hook(self.event("Bash", {"command": "cat notes.txt"}, {"stdout": doubt[2], "stderr": ""})))
+        self.assertEqual(self.calls(), [])
+
     def test_connector_page_writes_are_checked_under_any_server_prefix(self):
         bad = self.add(cf.task(1, ""))
         other = self.add(cf.task(2, ""))
