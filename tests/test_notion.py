@@ -1372,6 +1372,61 @@ class WriteOutcomeTest(ClientTestCase):
         self.assertNotIn("Run the command again", err)
 
 
+    def test_a_lookup_that_fails_after_a_create_in_doubt_keeps_it_in_doubt(self):
+        pages = self.tmp / "pages.json"
+        lookups = {"timeout": "did not answer", "reset": "reset", "429": "429"}
+        positions = (("alone", 0, 1), ("first of 3", 0, 1), ("second of 3", 1, 4))  # which create is in doubt, exit
+        parents = ((COLLECTION + DS_TASKS, "Task name", "POST", rf"/v1/data_sources/{DS_TASKS}/query",
+                    f"data source Tasks ({COLLECTION}{DS_TASKS})"),
+                   (page_url(PROJECT), "title", "POST", r"/v1/search", f"page {page_url(PROJECT)}"))
+        for parent, title_key, method, lookup_path, where in parents:
+            for lookup, words in lookups.items():
+                for position, doubtful, exit_code in positions:
+                    title = f"Lookup {title_key} {lookup} {position}"
+                    with self.subTest(parent=title_key, lookup=lookup, position=position):
+                        self.fake.overrides.clear()
+                        self.fake.calls.clear()
+                        posts = []
+
+                        def landed_in_doubt(r, doubtful=doubtful):
+                            posts.append(r)
+                            if len(posts) - 1 != doubtful:
+                                return None
+                            self.fake.create_page(r.json)  # it landed: only the answer was lost
+                            return error(503, "service_unavailable", "Try again later.")
+
+                        def lookup_fails(r, lookup=lookup):
+                            if r.json and r.json.get("filter", {}).get("value") == "data_source":
+                                return None  # resolving the parent is not the lookup
+                            return ends_in(lookup)(r)
+
+                        self.fake.on("POST", r"/v1/pages", landed_in_doubt)
+                        self.fake.on(method, lookup_path, lookup_fails)
+                        if position == "alone":
+                            args = ("--set", f"{title_key}={title}")
+                        else:
+                            pages.write_text(json.dumps([{"properties": {title_key: title}}] * 3))
+                            args = ("--pages-file", pages)
+                        code, out, err = self.run_cli("create", "--parent", parent, *args)
+                        self.assertEqual(code, exit_code, err)
+                        self.assertEqual(len(posts), doubtful + 1, "the create in doubt is never sent again")
+                        self.assertTrue(self.fake.sent(method, lookup_path), "the page was looked for")
+                        self.assertIn(f"In doubt: {title!r} (", err)
+                        self.assertIn("could not be looked for", err)
+                        self.assertIn(words, err)
+                        self.assertIn(f"look for a page titled {title!r} in {where} before creating it again", err)
+                        for wrong in ("Not created", "nothing was made", "nothing changed", "Run the command again"):
+                            self.assertNotIn(wrong, err)
+                        if position != "alone":
+                            self.assertIn(f"not sent: {title!r}", err)
+        for doc in ("SKILL.md", "references/api-limits.md"):
+            with self.subTest(doc=doc):
+                said = " ".join((SKILL_DIR / doc).read_text(encoding="utf-8").split())
+                self.assertRegex(said, r"cannot look \(the search fails, times out or keeps answering 429\), the create "
+                                       r"stays `?[Ii]n doubt`?")
+                self.assertIn("look for a page with that title in that parent before creating it again", said)
+
+
 class TransportTest(ClientTestCase):
     def test_429_waits_retry_after_then_succeeds(self):
         answers = [(429, {"object": "error", "status": 429, "code": "rate_limited", "message": "slow down"}, {"Retry-After": "2"}),

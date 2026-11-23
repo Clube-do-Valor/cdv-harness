@@ -139,7 +139,8 @@ class CreateInDoubt(Fail):
                      'found from this integration since the minute the command started; it was not sent again')
         self.advice = (f'it may have been created and may still appear, so look for a page titled {name} in {where} '
                        'before creating it again')
-        super().__init__(REFUSED, f'In doubt: the create of {name} ({cause}): {self.advice}', IN_DOUBT, cause)
+        code = NO_TOKEN if lookup is not None and lookup.code == NO_TOKEN else REFUSED  # 401 keeps exit 3
+        super().__init__(code, f'In doubt: the create of {name} ({cause}): {self.advice}', IN_DOUBT, cause)
 
 
 class Unsent(ConnectionError):
@@ -1451,7 +1452,7 @@ def create_one(client, kind, parent, payload, title, started, seen=(), where='')
     except WriteInDoubt as doubt:
         try:
             page = find_created(client, kind, parent, title, started, doubt, seen)
-        except ApiError as lookup:
+        except Fail as lookup:  # any failure to look - an answer, a timeout, a lost connection, 429 - leaves it in doubt
             raise CreateInDoubt(doubt, title, where, lookup)
         if page is None:
             raise CreateInDoubt(doubt, title, where)
