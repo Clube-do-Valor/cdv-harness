@@ -20,7 +20,7 @@ The public REST API covers almost everything the Notion MCP did, but not all of 
 ## Limits a command can meet
 
 - **Rate:** a fixed 60-second window per integration (about 3 requests a second on most plans, 10 on Business and Enterprise) plus a workspace budget shared by every integration. The client waits out each 429 (`Retry-After`, at most 5 times); a shared token means teammates share the window, so prefer one `--count` to many fetches.
-- **Writes in doubt:** a 502, 503, 504 or a timeout on a write may have been applied. The client never resends a create blindly; for an update, fetch the page and check before running it again.
+- **Writes in doubt:** a 502, 503, 504 or a timeout on a write may have been applied. The client never resends a create blindly; for an update, fetch the page and check before running it again. After a create in doubt the client looks for a page with that title made by this integration since the minute the command started: Notion stores `created_time` to the minute, so a page with the same title made earlier in that minute (another run, a teammate on the same token) looks the same. Read the page found (`notion fetch <url>`) before treating it as the new one, and avoid creating two pages with one title in the same minute.
 - **Sizes:** 2,000 characters per rich text piece (the client splits titles and text), 100 items per people, relation or multi-select write, 100 edits per `--edit` call, about 5,000 blocks per body write and about 20,000 per read (a longer page reads back with `<unknown>` markers and `truncated`).
 - **Nesting:** filter groups two levels deep.
 - **Query results:** 10,000 rows per query on Notion's side; the client stops at 2,000 unless `--max-rows` raises it.

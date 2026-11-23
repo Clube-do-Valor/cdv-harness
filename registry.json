@@ -95,7 +95,7 @@
       "owner": "augusto-henriques",
       "description": "Read, query, create, edit and comment on Notion pages and data sources through the public REST API with the bundled `notion` client (one API token on the machine, no Notion MCP needed) — fetch a card by url, id or ticket key with its properties and body, query a data source with a readable condition and counts, search, change properties in the short format, edit the body in Notion-flavored Markdown, comment, upload and download files, find people. Triggers on any Notion request: \"lê o card\", \"busca no Notion\", \"atualiza o status do card\", \"move o card\", \"escreve no corpo do card\", \"comenta no card\", \"quantos cards\", \"lista as tasks do projeto\", \"fetch this Notion page\", a pasted notion.so or app.notion.com link, or a ticket key. The core skills that touch the card run their Notion steps through this client. Do NOT use to decide what a delivery note or a bug analysis says (cdv-notion-ticket and cdv-debug own the content), or for another ticket system.",
       "path": "skills/cdv-notion",
-      "contentHash": "18409129f0805f23aa559925032ab6c7e00fa209c58316b09c6667b3904fd6f7"
+      "contentHash": "7339f0cd899a9f71374f1788964c4aea7fb66ccc65e59e706db75995765fb452"
     },
     {
       "name": "cdv-notion-ticket",

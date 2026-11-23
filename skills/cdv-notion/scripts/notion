@@ -1347,7 +1347,8 @@ def create_one(client, kind, parent, payload, title, started, seen=()):
             raise CreateInDoubt(doubt.status, title, lookup)
         if page is None:
             raise CreateInDoubt(doubt.status, title)
-        note = f' (Notion answered {doubt.status}, but the page was created; not sent again)'
+        note = (f' (Notion answered {doubt.status}; not sent again: found by its title among the pages this '
+                'integration made since the minute the command started; check it is the new page)')
     client.say(f"created {page.get('url')} {client.key_of(page)}".rstrip() + note)
     return page
 

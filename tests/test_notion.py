@@ -1026,6 +1026,27 @@ class CreateTest(ClientTestCase):
                 self.assertNotIn(other["url"], out)
                 self.fake.overrides.clear()
 
+    def test_a_page_found_after_a_create_in_doubt_is_marked_to_check(self):
+        def fail_after_writing(r):
+            self.fake.create_page(r.json)
+            return error(503, "service_unavailable", "Try again later.")
+
+        self.fake.on("POST", r"/v1/pages", fail_after_writing)
+        code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--set", "Task name=Found later")
+        self.assertEqual(code, 0, err)
+        found = [pg for pg in self.fake.pages.values() if self.fake.title_of(pg) == "Found later"][0]
+        line = [line for line in out.splitlines() if line.startswith("created ")][0]
+        self.assertTrue(line.startswith(f"created {found['url']} {key(200)} "), line)  # where a caller reads them
+        self.assertNotIn("the page was created", line)
+        for words in ("503", "found by its title", "not sent again", "check"):
+            self.assertIn(words, line)
+        for name in ("SKILL.md", "references/api-limits.md"):
+            with self.subTest(file=name):
+                said = " ".join((SKILL_DIR / name).read_text(encoding="utf-8").split())
+                self.assertRegex(said, r"`created_time` to the minute")
+                self.assertRegex(said, r"same title made earlier in that minute")
+                self.assertRegex(said, r"[Rr]ead the page found .{0,40}before treating it as the new one")
+
     def test_create_after_503_ignores_an_older_page_with_the_same_title(self):
         title = "Weekly sync"
         older = self.fake.add_page(task_page(uid(0x4100), 151, title, created_by=BOT,

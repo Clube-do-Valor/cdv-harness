@@ -70,7 +70,7 @@ Write a multi-line `OLD` or `NEW` from a file: `--edit "$(cat old.md)" "$(cat ne
 | `3` | no usable token (missing, revoked, mistyped) | the user runs `notion auth login` in a terminal |
 | `4` | done in part: some `--edit` did not match, or a later write was refused (`Not written`, `Not created`) or ended in doubt (`In doubt`) after an earlier one landed (the properties set, the pages created, by url) | report what was written, what was not and what is in doubt; re-fetch and rerun only what was not written or not sent, never the whole command; check a step in doubt in Notion before running it again |
 
-A rate limit (429) is waited out inside the client (`Retry-After`, at most 5 times). A create that ends in 502, 503, 504 or a timeout is never sent twice: the client looks for the page first.
+A rate limit (429) is waited out inside the client (`Retry-After`, at most 5 times). A create that ends in 502, 503, 504 or a timeout is never sent twice: the client looks for the page first. Notion stores `created_time` to the minute, so the page found is one with that title made by this integration since the minute the command started, and a page with the same title made earlier in that minute (another run, a teammate on the same token) cannot be told apart: read the page found (`notion fetch <url>`) before treating it as the new one.
 
 ## Composition
 
