@@ -511,6 +511,15 @@ class Card:
     def id(self):
         return self.page.get("id", "")
 
+    @property
+    def key(self):
+        """The ticket key of the page (its unique id property), or an empty string."""
+        for value in (self.page.get("properties") or {}).values():
+            unique = value.get("unique_id") if isinstance(value, dict) and value.get("type") == "unique_id" else None
+            if unique and unique.get("prefix") and unique.get("number") is not None:
+                return f"{unique['prefix']}-{unique['number']}"
+        return ""
+
 
 def source_title(page):
     parent = page.get("parent") or {}
@@ -959,6 +968,8 @@ def load_card(ref):
 
 def cmd_check(args):
     card = load_card(args.ref)
+    if args.page_id and card is not None and card.id:
+        print(f"page: {card.id} {card.key}".rstrip())
     if card is None or card.kind is None:
         items = []
     elif not args.body_replaced and (before_since(card) or someone_elses(card)):
@@ -1004,6 +1015,9 @@ def build_parser():
     check.add_argument("ref")
     check.add_argument("--body-replaced", action="store_true", help="the write replaced the whole body")
     check.add_argument("--json", action="store_true", help="the findings as a list of {rule, message, fix}")
+    # for the card-check hook: the first line is the id and the key of the page read, so one page named
+    # by its key, its url and its id is one page
+    check.add_argument("--page-id", action="store_true", help=argparse.SUPPRESS)
     check.set_defaults(func=cmd_check)
     accept = sub.add_parser("accept-request", help="pin the request zone as it now stands")
     accept.add_argument("ref")

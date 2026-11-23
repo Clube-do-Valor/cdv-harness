@@ -82,8 +82,14 @@ def hyphenated(text):
     return "-".join(match.groups()).lower() if match else None
 
 
-def page_key(ref):
-    return hyphenated(ref) or ref.strip().upper()
+def named_page(checker, ref):
+    """The page id a reference holds, as the client reads it (a url's path, or the page its `?p=` opens);
+    None for a key."""
+    try:
+        found = checker.client().parse_ref(ref)
+        return found.value if found.kind == "id" else None
+    except Exception:
+        return hyphenated(ref)
 
 
 def shown(ref):
@@ -209,9 +215,9 @@ def bash_targets(command, output, code, errors=""):
 
     The pages are the client's own write lines in the output, whatever the shell shape; when the
     output holds none, the client's `update` in the command, as far as it can be parsed. A call
-    that exited 4 (done in part) also checks the page of the command: the one its message names
-    (`done in part on <url>`), and the command's refs when the output shows fewer pages than the
-    command has updates. A write in doubt is said on stderr (`errors` when the call succeeded)."""
+    that exited 4 (done in part) also checks the page its message names (`done in part on <url>`) and the
+    pages of the command. A write in doubt is said on stderr (`errors` when the call succeeded). One page
+    may come under several names: main() checks it once."""
     replaced = bool(re.search(r"--replace-file\b", command))
     calls = client_calls(command)
     updates = [update_ref(arguments) for verb, arguments in calls if verb == "update"]
@@ -221,13 +227,9 @@ def bash_targets(command, output, code, errors=""):
     doubted = pages_in_doubt(f"{output}\n{errors}")
     if not lines and not doubted and code == 0:
         pages = list(refs)
-    if code == 4:
-        partial = [m.group(1) for m in PARTIAL_ON.finditer(output or "")]
-        pages += partial
-        shown_pages = {page_key(url) for url in [u for verb, u in lines if verb == "updated"] + partial + doubted}
-        if len(shown_pages) < len(updates):
-            pages += refs
     pages += doubted
+    if code == 4:
+        pages += [m.group(1) for m in PARTIAL_ON.finditer(output or "")] + refs
     return [(page, replaced) for page in pages], whole_fetch(command, calls)
 
 
@@ -293,8 +295,9 @@ class Session:
             self.data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             self.data = {}
-        self.data.setdefault("fails", {})
-        self.data.setdefault("silent", [])
+        self.data.setdefault("fails", {})   # page id (the reference while it is not known) -> failed checks in a row
+        self.data.setdefault("silent", [])  # page ids
+        self.data.setdefault("pages", {})   # key -> page id, as the checker read it
 
     def save(self):
         try:
@@ -332,17 +335,21 @@ def budget():
 
 
 TIMED_OUT = "timed out"
+PAGE_READ = re.compile(r"page: (\S+)(?: (\S+))?(?:\n|$)")
 
 
 def check(ref, replaced, timeout=CHECK_TIMEOUT):
-    argv = [sys.executable, str(checker_path()), "check", ref] + (["--body-replaced"] if replaced else [])
+    """(exit code, the findings, the id of the page read, its key) of `card_contract.py check`."""
+    argv = [sys.executable, str(checker_path()), "check", "--page-id", ref] + (["--body-replaced"] if replaced else [])
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
-        return TIMED_OUT, ""
+        return TIMED_OUT, "", None, None
     except OSError:
-        return None, ""
-    return proc.returncode, proc.stdout.strip()
+        return None, "", None, None
+    read = PAGE_READ.match(proc.stdout)
+    text = proc.stdout[read.end():] if read else proc.stdout
+    return proc.returncode, text.strip(), read and read.group(1), read and read.group(2)
 
 
 NO_TOKEN = ("card-check: cards are not being checked on this machine: the cdv-notion client has no usable Notion "
@@ -384,22 +391,33 @@ def main():
         except Exception:
             pass
     session = Session(root, str(event.get("session_id") or ""))
-    said, seen, unchecked, limit = [], set(), 0, budget()
+    said, seen, limit = [], set(), budget()
+    silent, pages = session.data["silent"], session.data["pages"]
+    late = {"id": 0, "key": 0}  # pages not checked, by what names them
     for ref, replaced in targets:
-        key = page_key(ref)
-        if key in seen or key in session.data["silent"]:
+        # One page is one page whatever names it: its id, which a url holds, the session knows for a key
+        # it has seen, and the checker says once it has read the page.
+        named = named_page(checker, ref)
+        key = named or pages.get(ref.strip().upper()) or ref.strip().upper()
+        if key in seen or key in silent:
             continue
         seen.add(key)
         if session.data.get("no_token"):
             break
         left = limit - (time.monotonic() - STARTED)
-        if left < MIN_CHECK_SECONDS:
-            unchecked += 1
-            continue
-        result, text = check(ref, replaced, min(CHECK_TIMEOUT, left))
+        result = TIMED_OUT
+        if left >= MIN_CHECK_SECONDS:
+            result, text, read, read_key = check(ref, replaced, min(CHECK_TIMEOUT, left))
         if result == TIMED_OUT:
-            unchecked += 1
+            late["id" if named else "key"] += 1
             continue
+        if read:
+            if read_key:
+                pages[read_key.upper()] = read
+            if read != key and (read in seen or read in silent):
+                continue
+            seen.add(read)
+            key = read
         if result == 3:
             session.data["no_token"] = True
             said.append(NO_TOKEN)
@@ -416,6 +434,7 @@ def main():
             said.append(message)
         elif result == 0:
             session.data["fails"].pop(key, None)
+    unchecked = max(late.values())  # a page the output names by its url is the command's by its key
     if unchecked:
         said.append(f"card-check: {unchecked} more {'page' if unchecked == 1 else 'pages'} this call wrote "
                     f"{'was' if unchecked == 1 else 'were'} not checked inside the hook's time budget of "

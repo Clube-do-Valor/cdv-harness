@@ -439,6 +439,81 @@ class CardHookTest(HookCase):
         self.assertSays(again, "request-zone:")
         self.assertNotIn("in a row", again.stderr)
 
+    def checks_of(self, page):
+        """How many times the checker read this page since the log was cleared."""
+        return self.calls().count(f"GET /v1/pages/{page['id']}/markdown")
+
+    def test_a_page_is_one_page_whatever_names_it(self):
+        page = self.add(cf.task(1, ""))
+        other = self.add(cf.task(2, ""))
+        one, two = cf.key(1), cf.key(2)
+        printed = f"updated {page['url']}\n"
+        miss = "Exit code 4\n" + printed
+        part = f"done in part on {page['url']}: written: properties. Not written: body"
+        doubt = f"In doubt: properties Status (PATCH /v1/pages/{page['id']}: HTTP 502): it may have been applied"
+        once = {  # one call that names page 1 more than once, exit 4
+            "two updates, a miss in the second": (
+                f"{CLIENT_CMD} update {one} --set 'Status=Done' && {CLIENT_CMD} update {one} --edit a b --edit c d",
+                miss + printed + "done in part; not applied: edit 2"),
+            "a miss in one update": (f"{CLIENT_CMD} update {one} --edit a b --edit c d", miss + "done in part; not applied: edit 2"),
+            "done in part on the page": (f"{CLIENT_CMD} update {one} --set 'Status=Done' --append-file f.md", miss + part),
+            "by its key and by its url": (
+                f"{CLIENT_CMD} update {one} --set 'Status=Done' > /dev/null; {CLIENT_CMD} update {page['url']} --append-file f.md",
+                "Exit code 4\n" + part),
+            "by its key, then by its url, with no output": (
+                f"{CLIENT_CMD} update {one} --set 'Status=Done' > /dev/null; {CLIENT_CMD} update {page['url']} --edit a b --edit c d > /dev/null",
+                "Exit code 4\ndone in part; not applied: edit 2"),
+            "by its id with and without hyphens": (
+                f"{CLIENT_CMD} update {page['id']} --set 'Status=Done'; {CLIENT_CMD} update {cf.hex32(page['id'])} --append-file f.md",
+                "Exit code 4\n" + part),
+            "by its key in small letters": (f"{CLIENT_CMD} update {one.lower()} --edit a b --edit c d", miss + "done in part; not applied: x"),
+            "in doubt and by its key": (f"{CLIENT_CMD} update {one} --set 'Status=Done'; {CLIENT_CMD} update {one} --append-file f.md",
+                                        f"Exit code 4\n{doubt}\n{part}"),
+        }
+        for number, (name, (command, error)) in enumerate(once.items()):
+            with self.subTest(call=name):
+                self.clear_calls()
+                proc = self.hook(self.event("Bash", {"command": command}, error=error, session=f"once-{number}"))
+                self.assertSays(proc, "request-zone:")
+                self.assertEqual(proc.stderr.count("request-zone:"), 1, proc.stderr)
+                self.assertEqual(self.checks_of(page), 1)
+        # Two pages in one call are still two pages
+        both = {"command": f"{CLIENT_CMD} update {one} --set 'Status=Done' && {CLIENT_CMD} update {two} --edit a b --edit c d"}
+        proc = self.hook(self.event("Bash", both, session="both", error=(
+            f"{miss}updated {other['url']}\ndone in part; not applied: edit 2")))
+        self.assertEqual(proc.stderr.count("request-zone:"), 2, proc.stderr)
+        # A connector create that shows the page by its url and by its id
+        proc = self.hook(self.event("mcp__x__notion-create-pages", {"pages": [{}]}, {"pages": [
+            {"id": page["id"], "url": page["url"]}, {"id": cf.hex32(page["id"])}]}, session="connector"))
+        self.assertEqual(proc.stderr.count("request-zone:"), 1, proc.stderr)
+
+        # One counter across calls: the line comes once, on the third failed check, then silence
+        for number, names in enumerate(((one, page["url"]), (page["url"], one), (page["id"], one.lower()),
+                                        (one, cf.hex32(page["id"])))):
+            with self.subTest(names=names):
+                session = f"turns-{number}"
+                for turn in range(1, 7):
+                    ref = names[(turn - 1) % 2]
+                    self.clear_calls()
+                    quiet = turn % 2 == 1  # every other write shows no output: the command names the page
+                    proc = self.hook(self.bash(f"{CLIENT_CMD} update '{ref}' --set 'Status=Done'" + (" > /dev/null" if quiet else ""),
+                                               stdout="" if quiet else printed, session=session))
+                    if turn > 3:
+                        self.assertSilent(proc)
+                        self.assertEqual(self.calls(), [], turn)
+                        continue
+                    self.assertEqual(self.checks_of(page), 1, turn)
+                    self.assertEqual(proc.stderr.count("request-zone:"), 1, proc.stderr)
+                    self.assertEqual(proc.stderr.count("3 checks in a row"), 1 if turn == 3 else 0, proc.stderr)
+        # The page an address opens in a peek is the page it names
+        peek = f"https://www.notion.so/board-{cf.hex32(other['id'])}?p={cf.hex32(page['id'])}&pm=s"
+        for ref in (peek, one):
+            proc = self.hook(self.bash(f"{CLIENT_CMD} update '{ref}' --set 'Status=Done' > /dev/null", session="peek"))
+            self.assertNotIn("in a row", proc.stderr)
+        third = self.hook(self.bash(f"{CLIENT_CMD} update '{peek}' --set 'Status=Done' > /dev/null", session="peek"))
+        self.assertSays(third, "3 checks in a row")
+        self.assertNotIn("in a row", self.hook(self.update(two, session="peek")).stderr)
+
     def test_two_entries_of_one_call_run_one_check(self):
         self.add(cf.task(1, ""))
         payload = self.update(cf.key(1), use_id="toolu_same_call")
