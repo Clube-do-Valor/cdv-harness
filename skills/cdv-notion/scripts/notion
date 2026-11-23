@@ -171,12 +171,25 @@ def is_write(method, path):
 # ---------------------------------------------------------------------------------------------
 
 
+def origin(url):
+    """(scheme, host, port) of a url, the port filled in from the scheme; None when the port is not a number."""
+    parts = urllib.parse.urlsplit(url)
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port or {'https': 443, 'http': 80}.get(scheme)
+    except ValueError:
+        return None
+    return scheme, (parts.hostname or '').lower(), port
+
+
 class SameHostRedirects(urllib.request.HTTPRedirectHandler):
-    """Follow a redirect, but never carry the token to another host."""
+    """Follow a redirect, but carry the token only when the scheme, the host and the port all stay the same:
+    never to another host or port, and never from https to http. A relative redirect stays (urllib has
+    already joined it to the request's url)."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
-        if new is not None and urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+        if new is not None and (origin(newurl) is None or origin(newurl) != origin(req.full_url)):
             for name in list(new.headers):
                 if name.lower() == 'authorization':
                     del new.headers[name]

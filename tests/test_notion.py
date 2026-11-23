@@ -1518,6 +1518,59 @@ class RedirectTest(ClientTestCase):
         landed = [headers for path, headers in api_seen if path == "/v1/users/landed"]
         self.assertEqual(landed[0].get("authorization"), "Bearer " + TOKEN)
 
+    def test_a_redirect_that_changes_the_scheme_drops_the_token(self):
+        """Same host and port, another scheme: the token stays behind, both ways. The module's own _OPENER and
+        its redirect handler run; only its HTTPS connection is replaced, since no local server speaks TLS."""
+        import http.client
+        import urllib.request
+        import urllib.response
+
+        me = json.dumps({"object": "user", "id": BOT, "type": "bot", "name": "Card bot"}).encode()
+        holder = []
+        api_host, api_seen = self.serve(lambda path: (302, {"Location": f"https://{holder[0]}/v1/users/landed"}, b"")
+                                        if path == "/v1/users/up" else (200, {"Content-Type": "application/json"}, me))
+        holder.append(api_host)
+        over_tls = []
+
+        def https_open(req):
+            over_tls.append((urlsplit(req.full_url).path, {k.lower(): v for k, v in req.header_items()}))
+            if urlsplit(req.full_url).path == "/v1/users/down":
+                code, headers, body = 302, {"Location": f"http://{api_host}/v1/users/landed"}, b""
+            else:
+                code, headers, body = 200, {"Content-Type": "application/json"}, me
+            message = http.client.HTTPMessage()
+            for name, value in headers.items():
+                message[name] = value
+            answer = urllib.response.addinfourl(io.BytesIO(body), message, req.full_url, code)
+            answer.msg = "OK" if code == 200 else "Found"
+            return answer
+
+        tls = [h for h in self.n._OPENER.handlers if isinstance(h, urllib.request.HTTPSHandler)][0]
+        patcher = mock.patch.object(tls, "https_open", https_open)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        bypass = mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"})
+        bypass.start()
+        self.addCleanup(bypass.stop)
+        self.n.TRANSPORT = self.n.urllib_transport
+        self.n.API_HOST = api_host
+
+        self.n.API_ROOT = f"https://{api_host}"  # https -> http on the same host and port
+        code, out, err = self.run_cli("api", "GET", "/v1/users/down")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(over_tls[0][1].get("authorization"), "Bearer " + TOKEN)
+        self.assertEqual([path for path, _ in api_seen], ["/v1/users/landed"])
+        self.assertNotIn("authorization", api_seen[0][1])
+
+        over_tls.clear()
+        self.n.API_ROOT = f"http://{api_host}"  # http -> https on the same host and port
+        code, out, err = self.run_cli("api", "GET", "/v1/users/up")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(api_seen[-1][0], "/v1/users/up")
+        self.assertEqual(api_seen[-1][1].get("authorization"), "Bearer " + TOKEN)
+        self.assertEqual([path for path, _ in over_tls], ["/v1/users/landed"])
+        self.assertNotIn("authorization", over_tls[0][1])
+
 
 class QueryTest(ClientTestCase):
     def last_filter(self):
