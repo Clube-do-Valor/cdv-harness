@@ -366,6 +366,7 @@ class Notion:
         self._bot = None
         self._people = None
         self._listed = None
+        self._warned_unlisted = False
         self._settings = None
         self._schemas = {}
 
@@ -549,16 +550,23 @@ class Notion:
             self.cache.put('people', known)
 
     def list_users(self):
-        """(people known after listing, None) or (people from rows read, the reason the list failed)."""
+        """(people known after listing, None) or (people from rows read, the reason the list failed, as the API
+        gave it)."""
         try:
             users, _ = self.pages_of('GET', '/v1/users')
         except ApiError as error:
-            if error.status in (403, 404):
-                return self.people(), 'the integration has no user-information capability, so only people seen in rows read are known'
-            raise
+            return self.people(), f'{error.status} {error.api_code}: {error.api_message}'.strip()
         for user in users:
             self.remember(user)
         return self.people(), None
+
+    def warn_unlisted(self, reason):
+        """One line per run: a person found by name or e-mail was matched without the workspace's user list."""
+        if reason and not self._warned_unlisted:
+            self._warned_unlisted = True
+            self.warn(f'warning: the list of users could not be read (GET /v1/users answered {reason}); a name or '
+                      'e-mail was matched only over the people seen in pages read on this machine. Pass '
+                      '`user://<uuid>`, or turn on the integration\'s user information capability, to remove the doubt')
 
     def user_name(self, identifier):
         known = self.people().get(identifier)
@@ -995,7 +1003,8 @@ class Notion:
         """Every person whose name or e-mail contains `text`, over the listed users and the cache; an exact
         e-mail match is the one person meant, never an ambiguity."""
         needle = fold(text)
-        people, _ = self.everyone()
+        people, reason = self.everyone()
+        self.warn_unlisted(reason)
         exact = [(i, p) for i, p in people.items() if needle and fold(p.get('email')) == needle]
         if len(exact) == 1:
             return exact
@@ -2031,9 +2040,10 @@ def cmd_download(client, args):
 def cmd_users(client, args):
     needle = fold(' '.join(args.text))
     people, reason = client.list_users()
+    client.warn_unlisted(reason)
     matches = [(i, p) for i, p in people.items() if needle in fold(p.get('name')) or needle in fold(p.get('email'))]
     if not matches:
-        raise Fail(REFUSED, f"nobody matches {' '.join(args.text)!r}" + (f' ({reason})' if reason else ''))
+        raise Fail(REFUSED, f"nobody matches {' '.join(args.text)!r}")
     for identifier, person in sorted(matches, key=lambda m: m[1].get('name', '')):
         client.say(' '.join(filter(None, [f'user://{identifier}', person.get('name'), person.get('email'),
                                           '(bot)' if person.get('type') == 'bot' else ''])))

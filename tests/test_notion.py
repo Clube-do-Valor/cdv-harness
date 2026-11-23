@@ -1581,6 +1581,42 @@ class PeopleTest(ClientTestCase):
                 self.assertEqual(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]["Assignee"],
                                  {"people": [{"id": wanted}]})
 
+    def test_unreadable_user_list_warns_once_and_still_resolves(self):
+        self.fake.data_sources[DS_TASKS]["properties"]["Reviewer"] = {
+            "id": "rv", "name": "Reviewer", "type": "people", "people": {}}
+        code, out, err = self.run_cli("fetch", PAGE)  # Ana Lima reaches the cache from the row read
+        self.assertEqual(code, 0, err)
+
+        def doubt_lines(err):
+            return [line for line in err.splitlines() if "only over the people seen in pages read" in line]
+
+        code, out, err = self.run_cli("update", PAGE, "--set", "Assignee=Ana", "--set", "Reviewer=Ana Lima")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(doubt_lines(err), [])
+        self.assertNotIn("warning", err)
+        for status in (403, 500):
+            with self.subTest(status=status):
+                self.fake.users_status = status
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("update", PAGE, "--set", "Assignee=Ana", "--set", "Reviewer=ana@example.com")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"],
+                                 {"Assignee": {"people": [{"id": ANA}]}, "Reviewer": {"people": [{"id": ANA}]}})
+                self.assertIn("Ana Lima", out)
+                lines = doubt_lines(err)
+                self.assertEqual(len(lines), 1, err)
+                for words in (f"{status} restricted_resource", "Insufficient permissions for this endpoint.",
+                              "user://<uuid>", "user information capability"):
+                    self.assertIn(words, lines[0])
+                code, out, err = self.run_cli("users", "find", "ana")
+                self.assertEqual(code, 0, err)
+                self.assertIn("user://" + ANA, out)
+                self.assertEqual(len(doubt_lines(err)), 1, err)
+        self.fake.users_status = 200
+        code, out, err = self.run_cli("users", "find", "ana")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(doubt_lines(err), [])
+
     def test_whoami_from_settings_then_git(self):
         self.settings(me="ana@example.com")
         code, out, err = self.run_cli("whoami")
