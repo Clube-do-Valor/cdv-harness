@@ -7,6 +7,7 @@ keys and data source references are built at runtime so the public scan never se
 
 import contextlib
 import datetime
+import http.server
 import importlib.machinery
 import importlib.util
 import io
@@ -17,7 +18,9 @@ import shutil
 import stat
 import sys
 import tempfile
+import threading
 import unittest
+import urllib.request
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -1031,6 +1034,59 @@ class TransportTest(ClientTestCase):
             self.assertEqual(call.headers["authorization"], "Bearer " + TOKEN)
             self.assertEqual(call.headers["notion-version"], "2026-03-11")
         self.assertTrue([c for c in self.fake.calls if c.host == "files.example.com"])
+
+
+class RedirectTest(ClientTestCase):
+    """The real transport (urllib_transport and its redirect handler) against two local servers."""
+
+    def serve(self, answer):
+        seen = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                seen.append((self.path, {k.lower(): v for k, v in self.headers.items()}))
+                status, headers, body = answer(self.path)
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        return "127.0.0.1:%d" % server.server_address[1], seen
+
+    def test_redirect_to_another_host_drops_the_token(self):
+        me = json.dumps({"object": "user", "id": BOT, "type": "bot", "name": "Card bot"}).encode()
+        other, other_seen = self.serve(lambda path: (200, {"Content-Type": "application/json"}, me))
+
+        def api(path):
+            if path == "/v1/users/me":
+                return 307, {"Location": f"http://{other}/v1/users/me"}, b""
+            if path == "/v1/users/same":
+                return 302, {"Location": "/v1/users/landed"}, b""
+            return 200, {"Content-Type": "application/json"}, me
+
+        api_host, api_seen = self.serve(api)
+        self.n.API_HOST, self.n.API_ROOT = api_host, f"http://{api_host}"
+        self.n._OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), self.n.SameHostRedirects())
+        self.n.TRANSPORT = self.n.urllib_transport
+        code, out, err = self.run_cli("api", "GET", "/v1/users/me")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["id"], BOT)
+        self.assertEqual(api_seen[0][1].get("authorization"), "Bearer " + TOKEN)
+        self.assertEqual([path for path, _ in other_seen], ["/v1/users/me"])
+        self.assertNotIn("authorization", other_seen[0][1])
+        code, out, err = self.run_cli("api", "GET", "/v1/users/same")
+        self.assertEqual(code, 0, err)
+        landed = [headers for path, headers in api_seen if path == "/v1/users/landed"]
+        self.assertEqual(landed[0].get("authorization"), "Bearer " + TOKEN)
 
 
 class QueryTest(ClientTestCase):
