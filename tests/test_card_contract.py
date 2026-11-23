@@ -430,6 +430,57 @@ class RequestPinTest(CardCase):
         self.assertClean(page)
         self.assertEqual(len(self.pins()), 1)
 
+    def build(self, kind, number, request):
+        """A clean card of this kind whose request is `request`; (page id, function that builds its body)."""
+        if kind == "task":
+            def body(text):
+                return f"## Pedido\n\n{text}\n\n" + entrega()
+            return self.add(cf.task(number, body(request))), body
+
+        def body(text):
+            return cf.project_body(current=CURRENT, request=text)
+        return self.add(cf.project(number, body(request))), body
+
+    def assertRequest(self, pairs, expected):
+        """Each (name, text as pinned, text as read later) gives the rules `expected`, on both kinds."""
+        for name, before, after in pairs:
+            for kind in ("task", "project"):
+                with self.subTest(kind=kind, change=name):
+                    page, body = self.build(kind, 100 + len(self.fake.pages), before)  # a page of its own
+                    self.assertClean(page)
+                    self.set_body(page, body(after))
+                    self.assertEqual(self.rules(page), expected)
+
+    def test_a_change_inside_a_code_fence_of_the_request_is_reported(self):
+        log = "O erro:\n\n```\nfalha no boleto 10\n```\n\nObrigado."
+        nested = "````\n```\n## Entrega\n```\nfalha no boleto 10\n````"
+        self.assertRequest([
+            ("one word", log, log.replace("boleto 10", "boleto 99")),
+            ("with a language", log.replace("```\nf", "```text\nf"), log.replace("```\nf", "```text\nf").replace("10", "99")),
+            ("a tilde fence", log.replace("```", "~~~"), log.replace("```", "~~~").replace("10", "99")),
+            ("inside a list item", "- O erro:\n\n  ```\n  boleto 10\n  ```", "- O erro:\n\n  ```\n  boleto 99\n  ```"),
+            ("stars are text in a fence", "```\nselect **\n```", "```\nselect\n```"),
+            ("a tag is text in a fence", "```\n<b>x</b>\n```", "```\nx\n```"),
+            ("a longer fence around a shorter one", nested, nested.replace("boleto 10", "boleto 99")),
+            ("after a line that only starts like the closing mark", "```\na\n```js\n**10**\n```", "```\na\n```js\n10\n```"),
+        ], ["request-changed"])
+        self.assertRequest([
+            ("after a line with the marks inline", "```x``` é o nome.\n\n**fim**", "```x``` é o nome.\n\n<b>fim</b>"),
+            ("whitespace", log, log.replace("falha no", "falha   no")),
+            ("the language alone", log, log.replace("```\nf", "```text\nf")),
+            ("the fence's own marks", log, log.replace("```", "~~~~")),
+            ("the same", nested, nested),
+        ], [])
+        for number, kind in enumerate(("task", "project"), start=1):
+            with self.subTest(fetched=kind):
+                page, body = self.build(kind, number, nested)
+                code, out, err = cf.run_main(self.n, ["fetch", page])
+                self.assertEqual(code, 0, err)
+                self.assertTrue(self.cc.pin_from_fetch_output(out))
+                self.assertClean(page)
+                self.set_body(page, body(nested.replace("boleto 10", "boleto 99")))
+                self.assertEqual(self.rules(page), ["request-changed"])
+
 
 class FailureTest(CardCase):
     def test_no_token_exits_3_and_an_unreadable_page_exits_4_with_the_client_message(self):

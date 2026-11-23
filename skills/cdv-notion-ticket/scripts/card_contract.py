@@ -155,7 +155,15 @@ def fold(text):
 
 
 def digest(text):
-    words = " ".join(plain(line) for line in text.splitlines()).split()
+    """The sha256 of the request's words: each line as plain text, and what a code fence holds as it
+    is written (the fence's own marks and its language are formatting), whitespace collapsed."""
+    lines = text.splitlines()
+    words = []
+    for line, state in zip(lines, fences(lines)):
+        if state is None:
+            words += "" if EMPTY_PARAGRAPH.match(line.strip()) else plain(line).split()
+        elif state == INSIDE:
+            words += line.split()
     return hashlib.sha256(" ".join(words).encode("utf-8")).hexdigest()
 
 
@@ -175,18 +183,33 @@ BOLD_DATE = re.compile(
 )
 
 
+FENCE_OPEN = re.compile(r"(`{3,})[^`]*$|(~{3,})")
+MARK, INSIDE = "mark", "inside"
+
+
+def fences(lines):
+    """What each line is to a code fence: MARK (a line that opens or closes one), INSIDE, or None. A
+    fence closes on a line of its own character alone, at least as long as the one that opened it."""
+    out, opened = [], None
+    for line in lines:
+        bare = line.strip()
+        if opened is None:
+            match = FENCE_OPEN.match(bare)
+            opened = (match.group(1) or match.group(2)) if match else None
+            out.append(MARK if match else None)
+        elif bare and set(bare) == {opened[0]} and len(bare) >= len(opened):
+            opened = None
+            out.append(MARK)
+        else:
+            out.append(INSIDE)
+    return out
+
+
 def body_lines(markdown):
     """The body's lines with fenced code blanked out, so nothing inside a fence is a heading, and an
     empty paragraph as a fetch returns it (`<p />`, `<p/>`, `<empty-block/>`) read as a blank line."""
-    out, fence = [], None
-    for line in (markdown or "").splitlines():
-        marker = line.lstrip()[:3]
-        if marker in ("```", "~~~"):
-            fence = None if fence == marker else (fence or marker)
-            out.append("")
-            continue
-        out.append("" if fence or EMPTY_PARAGRAPH.match(line.strip()) else line)
-    return out
+    lines = (markdown or "").splitlines()
+    return ["" if state or EMPTY_PARAGRAPH.match(line.strip()) else line for line, state in zip(lines, fences(lines))]
 
 
 def heading(line, level=None):
@@ -262,32 +285,25 @@ def request_span(lines):
     return start, end
 
 
-def request_zone(lines):
-    """The text from `## Pedido` to `## Entrega` (or to `## Fechamento`, or the end), or None."""
-    span = request_span(lines)
-    return None if span is None else "\n".join(lines[span[0] + 1 : span[1]])
-
-
 TOGGLE_OPEN = re.compile(r"^<toggle(?:\s[^>]*)?>$")
 
 
 def toggles(lines):
     """[(title, child lines)] of the toggles at the top of the body."""
-    return [(title, children) for title, children, _, _ in toggle_spans(lines)]
+    return [(title, [lines[i] for i in children]) for title, children, _, _ in toggle_spans(lines)]
 
 
 def toggle_spans(lines):
-    """[(title, child lines, first, end)] of the toggles at the top of the body, with the line
+    """[(title, child lines' range, first, end)] of the toggles at the top of the body, with the line
     indexes the toggle runs over (its closing tag included)."""
     found, index = [], 0
     while index < len(lines):
         if not TOGGLE_OPEN.match(lines[index].strip()):
             index += 1
             continue
-        depth, title, children, cursor = 1, None, [], index + 1
+        depth, title, first_child, cursor = 1, None, None, index + 1
         while cursor < len(lines) and depth:
-            line = lines[cursor]
-            stripped = line.strip()
+            stripped = lines[cursor].strip()
             if TOGGLE_OPEN.match(stripped):
                 depth += 1
             elif stripped == "</toggle>":
@@ -296,9 +312,9 @@ def toggle_spans(lines):
                     break
             if title is None and stripped:
                 title = re.sub(r"^#{1,6}\s+", "", stripped)
-            elif title is not None:
-                children.append(line)
+                first_child = cursor + 1
             cursor += 1
+        children = range(cursor if first_child is None else first_child, cursor)
         found.append((plain(re.sub(r"<[^>]+>", "", title or "")), children, index, cursor + 1))
         index = cursor + 1
     return found
@@ -500,16 +516,20 @@ def write_pin(page_id, value):
         pass  # a pin that cannot be stored only means the next check pins again
 
 
-def card_request(kind, lines, names_map):
-    """The request zone's text of a card of this kind, or None when it has none."""
+def card_request(kind, markdown, names_map):
+    """The request zone's text of a card of this kind, or None when it has none. The zone is found on
+    the lines with the fences blanked out, and its text is taken as the body holds it, fences included."""
+    lines, children = body_lines(markdown), None
     if kind == "task":
-        return request_zone(lines)
-    if kind == "project":
+        span = request_span(lines)
+        children = span and range(span[0] + 1, span[1])
+    elif kind == "project":
         wanted = fold(names_map["projects"]["toggles"]["request"])
-        for title, children in toggles(lines):
-            if fold(title) == wanted:
-                return "\n".join(children)
-    return None
+        children = next((inside for title, inside, _, _ in toggle_spans(lines) if fold(title) == wanted), None)
+    if children is None:
+        return None
+    whole = markdown.splitlines()
+    return "\n".join(whole[index] for index in children)
 
 
 def request_reaches_its_end(kind, lines, names_map):
@@ -576,9 +596,9 @@ def pin_from_fetch_output(text):
         kind = "project"
     else:
         return False
-    lines = body_lines(body)
-    zone_text = card_request(kind, lines, names_map)
-    if zone_text is None or not request_reaches_its_end(kind, lines, names_map) or read_pin(page_id) is not None:
+    zone_text = card_request(kind, body, names_map)
+    if zone_text is None or not request_reaches_its_end(kind, body_lines(body), names_map) \
+            or read_pin(page_id) is not None:
         return False
     write_pin(page_id, digest(zone_text))
     return True
@@ -626,7 +646,7 @@ def status_rule(card, found):
 
 
 def request_rule(card, found):
-    text = card_request(card.kind, card.lines, card.names)
+    text = card_request(card.kind, card.markdown, card.names)
     if text is None:
         return
     value = digest(text)
@@ -850,7 +870,7 @@ def cmd_check(args):
 
 def cmd_accept(args):
     card = load_card(args.ref)
-    text = None if card is None or card.kind is None else card_request(card.kind, card.lines, card.names)
+    text = None if card is None or card.kind is None else card_request(card.kind, card.markdown, card.names)
     if text is None:
         print(f"{args.ref} has no request zone; nothing was pinned")
         return CLEAN
