@@ -238,5 +238,53 @@ class HelpdeskTest(SentenceCase):
             self.assertFalse("notion-ticket-template" in text, f"{name} still names notion-ticket-template.md")
 
 
+class ProjectSkillTest(SentenceCase):
+    def setUp(self):
+        self.text = skill("cdv-notion-project")
+
+    def sentence(self, *patterns):
+        return self.assertSentence(self.text, *patterns, where="cdv-notion-project/SKILL.md")
+
+    def test_project_skill_is_listed_and_says_when_it_runs(self):
+        lint = subprocess.run([str(REPO_ROOT / "bin" / "harness"), "lint"], cwd=REPO_ROOT, capture_output=True, text=True)
+        self.assertEqual(lint.returncode, 0, lint.stdout + lint.stderr)
+        self.assertIn("`cdv-notion-project`", read(REPO_ROOT / "CATALOG.md"))
+        registry = json.loads(read(REPO_ROOT / "registry.json"))
+        self.assertIn("cdv-notion-project", [entry["name"] for entry in registry["skills"]])
+        description = re.search(r"^description: >\n((?:  .*\n)+)", self.text, re.M).group(1)
+        description = " ".join(description.split())
+        for when in (r"briefing to refine", r"project to cut into tasks", r"scope change to log", r"Do NOT use"):
+            self.assertRegex(description, when)
+
+    def test_refining_a_project_writes_the_current_toggle_only(self):
+        self.sentence(r"refines a project", r"writes nothing inside the request toggle",
+                      r"current toggle with the sub-headings of the contract in their order",
+                      r"effort score in the checklist toggle and in the score property")
+        headings = ["`### 🎯 Objetivo`", "`### ✅ O que será feito`", "`### 🚫 O que NÃO será feito`",
+                    "`### 🔗 Dependências`", "`### 🔎 Decisões`", "`### 🧾 Mudanças de escopo`"]
+        step = section(self.text, "Step 2 - Refine the briefing")
+        positions = [step.index(h) for h in headings]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_tasks_are_one_plan_each_and_shown_before_any_card(self):
+        self.sentence(r"proposes the tasks of a project", r"each task is one plan",
+                      r"about a week and a half of work for a person", r"shown to the developer before any card exists",
+                      r"creates only the cards the developer approves", r"task skeleton",
+                      r"`## Pedido` quoting the part of the briefing it serves")
+
+    def test_an_approved_plan_updates_the_project_in_one_pass(self):
+        self.sentence(r"plan of the project is approved", r"in one pass", r"executors", r"status",
+                      r"effort score", r"list of tasks", r"current toggle")
+
+    def test_scope_changes_are_logged_after_the_first_plan_not_fixes(self):
+        self.sentence(r"enters or leaves `O que será feito` or `O que NÃO será feito`", r"task is added",
+                      r"score changes", r"after the first approved plan", r"one line under `### 🧾 Mudanças de escopo`",
+                      r"contract's shape")
+        step = section(self.text, "Step 5 - Log a scope change")
+        self.assertIn("`- **<dd/mm>** · Entrou: <...>. Saiu: <...>. <who decided, or where it came from>. "
+                      "CES de <x> para <y>.`", step)
+        self.sentence(r"fix made after the merge", r"log nothing")
+
+
 if __name__ == "__main__":
     unittest.main()
