@@ -960,6 +960,50 @@ class CreateTest(ClientTestCase):
         self.assertIn("Not created: 'Step 1'", err)
         self.assertIn("not sent: 'Step 2'", err)
 
+    def test_a_later_write_in_doubt_is_reported_in_doubt_not_unwritten(self):
+        note = self.tmp / "note.md"
+        note.write_text("Shipped.\n")
+
+        def answer(status):
+            def handler(r):
+                if status == "timeout":
+                    raise TimeoutError("timed out")
+                return error(status, "service_unavailable", "Try again later.")
+            return handler
+
+        for status in (502, 503, 504, "timeout"):
+            with self.subTest(status=status):
+                self.fake.overrides.clear()
+                self.fake.calls.clear()
+                self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", answer(status))
+                code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--append-file", note)
+                self.assertEqual(code, 4, err)
+                self.assertEqual(self.page["properties"]["Status"]["status"]["name"], "Rollout")
+                self.assertEqual(len(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}/markdown")), 1)
+                self.assertRegex(err, r"written: properties Status\b")
+                self.assertIn("In doubt: body added at the end", err)
+                self.assertIn("fetch the page and check", err)
+                self.assertNotIn("Not written", err)
+                self.assertNotIn("Rerun only what was not written", err)
+
+        self.fake.overrides.clear()
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", answer(503))
+        code, out, err = self.run_cli("update", PAGE, "--set", "Status=Done", "--edit", "by hand", "manually",
+                                      "--append-file", note)
+        self.assertEqual(code, 4, err)
+        self.assertIn("In doubt: body edits 1", err)
+        self.assertIn("not sent: body added at the end", err)
+        self.assertIn("Rerun only what was not sent", err)
+        self.assertNotIn("Not written", err)
+
+        self.fake.overrides.clear()
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", lambda r: error(400, "validation_error", "Bad markdown."))
+        code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--append-file", note)
+        self.assertEqual(code, 4, err)
+        self.assertRegex(err, r"Not written: body added at the end \(.*400.*\): Notion refused it and nothing changed")
+        self.assertIn("Rerun only what was not written", err)
+        self.assertNotIn("In doubt", err)
+
     def test_create_after_503_finds_the_page_and_does_not_resend(self):
         for status in (502, 503, 504):
             with self.subTest(status=status):

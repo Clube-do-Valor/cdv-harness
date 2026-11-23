@@ -1175,10 +1175,17 @@ def cmd_update(client, args):
             if not landed:
                 raise
             rest = [name for name, _ in steps[number + 1:]]
-            raise Fail(PARTIAL, f"done in part on {page.get('url')}: written: {'; '.join(landed)}. Not written: {label} "
-                                f"({failure.message})" + (f"; not sent: {'; '.join(rest)}" if rest else '')
+            if isinstance(failure, WriteInDoubt):
+                failed = (f'In doubt: {label} ({failure.message}): it may have been applied, so fetch the page and '
+                          'check it before running that part again')
+                again = 'Rerun only what was not sent' if rest else ''
+            else:
+                failed = f'Not written: {label} ({failure.message}): Notion refused it and nothing changed'
+                again = 'Rerun only what was not written' + (' or not sent' if rest else '')
+            raise Fail(PARTIAL, f"done in part on {page.get('url')}: written: {'; '.join(landed)}. {failed}"
+                       + (f"; not sent: {'; '.join(rest)}" if rest else '')
                        + (f"; edits that did not apply: {'; '.join(misses)}" if misses else '')
-                       + '. Rerun only what was not written')
+                       + (f'. {again}' if again else ''))
         if not landed and not (properties or args.icon):
             client.say(f"updated {page.get('url')}")  # only once a write has landed (write_properties says it itself)
         landed.append(label)
