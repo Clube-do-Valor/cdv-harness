@@ -750,6 +750,23 @@ class UpdateTest(ClientTestCase):
         self.assertEqual(patch["Project"], {"relation": [{"id": PROJECT}]})
         self.assertEqual(patch["Completed?"], {"checkbox": True})
 
+    def test_update_date_start_keeps_the_end_of_a_range_and_an_empty_end_clears_it(self):
+        self.page["properties"]["Done at"]["date"] = {"start": "2026-11-17", "end": "2026-11-28", "time_zone": None}
+        code, out, err = self.run_cli("update", PAGE, "--set", "date:Done at:start=2026-11-24")
+        self.assertEqual(code, 0, err)
+        patch = self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]
+        self.assertEqual(patch["Done at"], {"date": {"start": "2026-11-24", "end": "2026-11-28"}})
+        code, out, err = self.run_cli("update", PAGE, "--set", "date:Done at:end=")
+        self.assertEqual(code, 0, err)
+        patch = self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]
+        self.assertEqual(patch["Done at"], {"date": {"start": "2026-11-24"}})
+        self.page["properties"]["Done at"]["date"] = {"start": "2026-11-17", "end": "2026-11-28", "time_zone": None}
+        code, out, err = self.run_cli("update", PAGE, "--set", "date:Done at:start=2026-11-24",
+                                      "--set", "date:Done at:end=")
+        self.assertEqual(code, 0, err)
+        patch = self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]
+        self.assertEqual(patch["Done at"], {"date": {"start": "2026-11-24"}})
+
     def test_update_prints_properties_as_stored(self):
         code, out, err = self.run_cli("update", PAGE, "--set", "Status=rollout", "--set", "Notes=Weekly export")
         self.assertEqual(code, 0, err)

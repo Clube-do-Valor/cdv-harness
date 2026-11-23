@@ -1103,14 +1103,18 @@ class Notion:
         start, end = fields.get('start'), fields.get('end')
         if start is not None and start.strip() in ('', 'null', 'none'):
             return {'date': None}
+        current = ((page or {}).get('properties', {}).get(name) or {}).get('date') or {}
         if start is None and end is not None:
-            current = ((page or {}).get('properties', {}).get(name) or {}).get('date') or {}
             start = current.get('start')
             if not start:
                 raise Fail(USAGE, f'date:{name}:end needs a start: the page has none, so pass date:{name}:start too')
         if start is None:
             raise Fail(USAGE, f'date:{name} needs :start')
         value = {'start': start}
+        if end is None:  # only :start given: move the start, keep the range and its time zone
+            end = current.get('end')
+            if current.get('time_zone') and 'T' in start:
+                value['time_zone'] = current['time_zone']
         if end:
             value['end'] = end
         return {'date': value}
