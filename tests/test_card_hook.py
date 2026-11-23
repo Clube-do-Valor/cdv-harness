@@ -7,6 +7,7 @@ logged beside it. There is no profile.yaml anywhere: the hook needs none."""
 
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import re
@@ -105,6 +106,43 @@ class HookCase(unittest.TestCase):
                 return page["url"]
         return None
 
+    def hook_module(self):
+        loader = importlib.machinery.SourceFileLoader("card_check_hook", str(self.hooks / "card-check"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        module.checker_path, module.client_path = lambda: self.checker, lambda: self.client
+        return module
+
+    def run_module(self, module, payload, env=None):
+        """(exit code, message) of the hook's main() in this process."""
+        with mock.patch.dict(os.environ, env or self.env, clear=True), mock.patch("sys.stdin", io.StringIO(json.dumps(payload))):
+            return module.main()
+
+    def checks(self, payload):
+        """[(task number, whether it was checked as a whole-body replace)] of the checks a call starts, in
+        order: the hook's main() with the checker replaced by a record of the calls it gets."""
+        module, found = self.hook_module(), []
+
+        def check(ref, *flags, **timeout):
+            for page in self.fake.pages.values():
+                number = page["properties"]["Task ID"]["unique_id"]["number"]
+                if ref.upper() == cf.key(number) or cf.hex32(page["id"]) in ref.replace("-", ""):
+                    found.append((number, self.replaced(number, page, flags)))
+                    return 1, "finding", page["id"], cf.key(number)
+            raise AssertionError(f"checked {ref!r}, which is no page")
+
+        module.check = check
+        self.run_module(module, dict(payload, session_id="s-" + uuid.uuid4().hex))
+        return found
+
+    def replaced(self, number, page, flags):
+        return flags[0]
+
+    def pages(self, command, stdout="", error=None):
+        """The task numbers a Bash call checks, in order."""
+        payload = self.bash(command, stdout=stdout) if error is None else self.event("Bash", {"command": command}, error=error)
+        return [number for number, _ in self.checks(payload)]
+
     def assertSays(self, proc, *needles):
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
         self.assertEqual(proc.stdout, "")
@@ -162,7 +200,16 @@ class CardHookTest(HookCase):
         self.assertEqual(proc.stderr.count("request-zone:"), 2)
         mixed = bash(f"{CLIENT_CMD} update {one} --set 'Status=Done' > /dev/null; K={two}; {CLIENT_CMD} update $K --set 'Status=Done'",
                      stdout=f"updated {second['url']}\n")
-        self.assertSays(self.hook(mixed), second["url"], "request-zone:")  # the line decides, not the command
+        proc = self.hook(mixed)  # the first from the command, the second from the output, each once
+        self.assertSays(proc, f"check {one})", second["url"])
+        self.assertEqual(proc.stderr.count("request-zone:"), 2, proc.stderr)
+        labelled = bash(f"for k in {one} {two}; do echo -n \"$k: \"; {CLIENT_CMD} update $k --set 'Status=Done'; done",
+                        stdout=f"{one}: updated {first['url']}\n{two}: updated {second['url']}\n")
+        proc = self.hook(labelled)
+        self.assertSays(proc, first["url"], second["url"])
+        self.assertEqual(proc.stderr.count("request-zone:"), 2, proc.stderr)
+        default = bash(f"N=${{N:-{CLIENT_CMD}}}; $N update $KEY --set 'Status=Done'", stdout=printed)
+        self.assertSays(self.hook(default), first["url"], "request-zone:")
         single = bash(f"for k in {one}; do {CLIENT_CMD} update $k --set 'Status=Done'; done", stdout=printed)
         self.assertSays(self.hook(single), first["url"], "request-zone:")
         heredoc = bash(f"cat > b.md <<'EOF'\nIt's the card.\nEOF\n{CLIENT_CMD} update {cf.key(3)} --replace-file b.md",
@@ -180,6 +227,161 @@ class CardHookTest(HookCase):
         self.assertSilent(self.hook(bash("cat notion-log.txt", stdout=printed)))
         self.assertSilent(self.hook(bash(f"echo notion update {one}", stdout=f"notion update {one}\n")))
         self.assertEqual(self.calls(), [])
+
+    def test_the_client_line_is_taken_wherever_it_sits_in_the_output(self):
+        pages = [self.add(cf.task(n, "")) for n in (1, 2)]
+        one, two = (page["url"] for page in pages)
+        loop = f"for k in $KEYS; do {CLIENT_CMD} update $k --set 'Status=Done'; done"
+        for name, output, expected in (
+                ("a line of its own", f"updated {one}\nupdated {two}\n", [1, 2]),
+                ("after a label", f"a: updated {one}\nb: updated {two}\n", [1, 2]),
+                ("glued to a label", f"a=updated {one}\nTSKupdated {two}\n", [1, 2]),
+                ("two on a line", f"updated {one} updated {two}", [1, 2]),
+                ("indented, in quotes, with a full stop", f"   'updated {one}'\n(updated {two}).\n", [1, 2]),
+                ("after a label, created", f"new: created {one} {cf.key(1)}\n", [1]),
+                ("in the app's address", f"updated https://app.notion.com/p/{cf.hex32(pages[0]['id'])}\n", [1]),
+                ("another host", f"updated https://example.com/{cf.hex32(pages[0]['id'])}\n", []),
+                ("a host that only ends like it", f"updated https://notnotion.so/{cf.hex32(pages[0]['id'])}\n", []),
+                ("a Notion address with no page", "updated https://www.notion.so/product\n", []),
+                ("no scheme", f"updated {one.replace('https://', '')}\n", []),
+                ("the word alone", "updated 3 files\n", [])):
+            with self.subTest(output=name):
+                self.assertEqual(self.pages(loop, stdout=output), expected)
+                self.assertEqual(self.pages(loop, error="Exit code 1\n" + output), expected)
+        for spelling in (f"N={CLIENT_CMD}; $N update $KEY", f"N=${{N:-{CLIENT_CMD}}}; $N update $KEY", "${N:-notion} update $KEY",
+                         f"\"${{N:-{CLIENT_CMD}}}\" update $KEY", "${N:=notion} update $KEY", f"x=$({CLIENT_CMD} update $KEY)",
+                         f"x=`{CLIENT_CMD} update $KEY`", f"{CLIENT_CMD} \\\n  update $KEY", "xargs notion update",
+                         "python3 -c \"run(['notion', 'update'])\"", f"eval '{CLIENT_CMD} update $KEY'"):
+            with self.subTest(spelling=spelling):
+                self.assertEqual(self.pages(spelling, stdout=f"updated {one}\n"), [1])
+        for name, tail in (("nested past reading", "echo " + "$(" * 3000 + ")" * 3000), ("not closed", "echo \"$(x")):
+            with self.subTest(command=name):
+                self.assertEqual(self.pages(f"{CLIENT_CMD} update $KEY; {tail}", stdout=f"updated {one}\n"), [1])
+        for command in ("cat notes.txt", "cat notion-log.txt", "cd cdv-notion && cat x", "cat my.notion.txt", "ls notions"):
+            with self.subTest(not_the_client=command):
+                self.assertEqual(self.pages(command, stdout=f"updated {one}\n"), [])
+
+    def test_the_command_names_the_pages_of_a_write_with_no_output(self):
+        for n in (1, 2, 3):
+            self.add(cf.task(n, ""))
+        one, two = cf.key(1), cf.key(2)
+        write = f"{CLIENT_CMD} update {one} --set 'Status=In progress'"
+        shapes = {
+            "a list": f"cd x && {write} > /dev/null; echo done",
+            "after a list that may fail": f"false || {write} > /dev/null",
+            "in the background of a list": f"true & {write} > /dev/null",
+            "a pipeline": f"echo x | {write} | tail -1 > /dev/null",
+            "both streams in a pipeline": f"{write} |& cat > /dev/null",
+            "a redirection before the client": f"> /dev/null {write}",
+            "a redirection glued to the word": f"{write}>/dev/null",
+            "both streams": f"{write} > out.txt 2>&1",
+            "both streams, short": f"{write} &> out.txt",
+            "standard error first": f"2>err.txt {write} >> out.txt",
+            "flags before the page": f"{CLIENT_CMD} update --set 'Status=In progress' {one} > /dev/null",
+            "a flag with its value glued": f"{CLIENT_CMD} update --set='Status=Done' {one} > /dev/null",
+            "a flag cut short": f"{CLIENT_CMD} update --app f.md {one} > /dev/null",
+            "an edit with two values": f"{CLIENT_CMD} update --edit 'a b' c {one} > /dev/null",
+            "a subshell": f"(cd x && {write}) > /dev/null",
+            "a group": f"{{ {write}; }} > /dev/null",
+            "bash -c": f"bash -c \"{write}\" > /dev/null",
+            "bash with options": f"bash -o pipefail -ec \"{write}\" > /dev/null",
+            "sh -c inside bash -c": f"bash -c \"sh -c '{CLIENT_CMD} update {one} --icon x'\" > /dev/null",
+            "bash -c under a wrapper": f"timeout 60 bash -lc \"{write}\" > /dev/null",
+            "env": f"env -u A -i X=1 {write} > /dev/null",
+            "timeout": f"timeout -k 5 --signal=TERM 60 {write} > /dev/null",
+            "nice": f"nice -n 5 {write} > /dev/null",
+            "nohup": f"nohup {write} > /dev/null",
+            "time": f"time -p {write} > /dev/null",
+            "exec": f"exec -a name {write} > /dev/null",
+            "command": f"command -p {write} > /dev/null",
+            "sudo": f"sudo -E -u root X=1 {write} > /dev/null",
+            "sudo with glued options": f"sudo -nuroot {write} > /dev/null",
+            "two wrappers": f"nohup env X=1 timeout 60 {write} > /dev/null",
+            "the test of an if": f"if {write} > /dev/null; then echo ok; fi",
+            "the body of an if": f"if true; then {write} > /dev/null; fi",
+            "the else of an if": f"if false; then :; else {write} > /dev/null; fi",
+            "the elif of an if": f"if false; then :; elif {write} > /dev/null; then :; fi",
+            "a negated test": f"if ! {write} > /dev/null; then :; fi",
+            "the body of a for": f"for i in 1 2; do {write} > /dev/null; done",
+            "the test of a while": f"while ! {write} > /dev/null; do sleep 1; done",
+            "the body of a while": f"while read line; do {write} > /dev/null; done < list.txt",
+            "the test of an until": f"until {write} > /dev/null; do sleep 1; done",
+            "a substitution inside quotes": f"OUT=\"$({write})\"",
+            "a substitution inside quotes, with words": f"echo \"got $({write}) there\" > /dev/null",
+            "a substitution": f"OUT=$({write})",
+            "backquotes inside quotes": f"OUT=\"`{CLIENT_CMD} update {one} --icon x`\"",
+            "a substitution inside a substitution": f"OUT=\"$(echo \"$({write})\")\"",
+            "a heredoc in a substitution": f"git commit -m \"$(cat <<'EOF'\nIt's (a\nEOF\n)\" && {write} > /dev/null",
+            "an interpreter": f"python3 {write} > /dev/null",
+            "an interpreter with options": f"python3 -u -X dev -Wignore {write} > /dev/null",
+            "an interpreter under env": f"/usr/bin/env python3.11 -u {write} > /dev/null",
+            "a shell in front of the client": f"bash -e {write} > /dev/null",
+            "a variable": f"N={CLIENT_CMD}\n$N update {one} --icon x > /dev/null",
+            "a variable in quotes": f"N='{CLIENT_CMD}'; \"${{N}}\" update {one} --icon x > /dev/null",
+            "a variable with its default": f"N=${{N:-{CLIENT_CMD}}}; $N update {one} --icon x > /dev/null",
+            "a default with no assignment": f"${{N:-{CLIENT_CMD}}} update {one} --icon x > /dev/null",
+            "a variable with the interpreter": f"N=\"python3 -u {CLIENT_CMD}\"; $N update {one} --icon x > /dev/null",
+            "an exported variable": f"export N={CLIENT_CMD}; $N update {one} --icon x > /dev/null",
+            "the page in a variable": f"K={one}; {CLIENT_CMD} update \"$K\" --icon x > /dev/null",
+            "the page in a variable of an if": f"if true; then K={one}; fi; {CLIENT_CMD} update $K --icon x > /dev/null",
+            "a loop inside an if": f"if true; then for k in {one}; do {CLIENT_CMD} update $k --icon x > /dev/null; done; fi",
+            "a comment before": f"# it's the card\n{write} > /dev/null",
+            "a comment after": f"{write} > /dev/null # it's done",
+            "a line cut in two": f"{CLIENT_CMD} \\\n  update {one} \\\n  --icon x > /dev/null",
+            "a heredoc with an apostrophe before": f"cat > b.md <<'EOF'\nIt's the card.\nEOF\n{write} > /dev/null",
+            "a heredoc fed to it": f"{CLIENT_CMD} update {one} --append-file - > /dev/null <<EOF\nIt's (the card\nEOF\n",
+            "a heredoc run by a shell": f"bash <<'EOF' > /dev/null\n{write}\nEOF",
+            "a quoted hash": f"echo '#' x#y; {write} > /dev/null",
+            "an ANSI string": f"echo $'it\\'s'; {write} > /dev/null",
+            "arithmetic": f"i=$((1<<2))\n{write} > /dev/null",
+            "an indented heredoc before": f"cat > b.md <<-EOF\n\tIt's the card.\n\tEOF\n{write} > /dev/null",
+            "a process substitution": f"diff <({write}) x > /dev/null",
+            "a subshell in a substitution": f"OUT=\"$( (cd x; true); {write} )\"",
+            "the verb in the variable": f"N='{CLIENT_CMD} update'; $N {one} --icon x > /dev/null",
+            "a quote left open": f"{write} > /dev/null; echo it's",
+        }
+        for name, command in shapes.items():
+            with self.subTest(shape=name):
+                self.assertEqual(self.pages(command), [1])
+                self.assertEqual(self.pages(command, error="Exit code 1\nrefused"), [])  # only on a call that ended well
+        several = {
+            "a loop over keys": (f"for k in {one} {two}; do {CLIENT_CMD} update $k --icon x > /dev/null; done", "", [1, 2]),
+            "hidden, then printed": (f"{write} > /dev/null && {CLIENT_CMD} update {two} --icon x", f"updated {self.url(two)}\n", [2, 1]),
+            "printed, then hidden": (f"{write} && {CLIENT_CMD} update {two} --icon x > /dev/null", f"updated {self.url(one)}\n", [1, 2]),
+            "hidden, then printed through a variable": (
+                f"{write} > /dev/null; {CLIENT_CMD} update $K --icon x", f"updated {self.url(two)}\n", [2, 1]),
+            "each printed": (f"{write}; {CLIENT_CMD} update {two} --icon x", f"updated {self.url(one)}\nupdated {self.url(two)}\n", [1, 2]),
+            "one page twice": (f"{write}; {write}", f"updated {self.url(one)}\nupdated {self.url(one)}\n", [1]),
+            "one page by key and url": (f"{write}; {CLIENT_CMD} update {self.url(one)} --icon x", "", [1]),
+            "created beside a hidden update": (
+                f"{write} > /dev/null; {CLIENT_CMD} create --parent Tasks --set 'Task name=y'", f"created {self.url(two)} {two}\n", [2, 1]),
+        }
+        for name, (command, stdout, expected) in several.items():
+            with self.subTest(pages=name):
+                self.assertEqual(self.pages(command, stdout=stdout), expected)
+        nothing = {
+            "echo": f"echo notion update {one}",
+            "printf": f"printf '%s' 'notion update {one}'",
+            "a comment": f"# {write}\ntrue",
+            "a comment after a command": f"true # ; {write}",
+            "the text of a heredoc": f"cat > notes.md <<'EOF'\n{write}\nEOF",
+            "an indented heredoc": f"cat > notes.md <<-EOF\n\t{write}\n\tEOF\ntrue",
+            "a commit message": f"git commit -m 'x; notion update {one}'",
+            "an argument": f"grep -r \"notion update {one}\" .",
+            "an ANSI string": f"echo $'a\\'; {CLIENT_CMD} update {one}; echo \\'b'",
+            "the arguments of a command string": f"bash -c 'echo $0' notion update {one}",
+            "the arguments of code in a string": f"python3 -c 'print(1)' notion update {one}",
+            "code in a string": f"python3 -c \"print('notion update {one}')\"",
+            "where the client is": f"command -v notion update {one}",
+            "a page in an unknown variable": f"{CLIENT_CMD} update $KEY --icon x",
+            "a variable read anew": f"K={one}; read K; {CLIENT_CMD} update $K --icon x",
+            "other verbs": f"{CLIENT_CMD} fetch {one}; {CLIENT_CMD} comments add {one} --body z",
+            "a page only in a value": f"{CLIENT_CMD} update --set {one} $KEY",
+            "another program": f"./my-notion update {one}",
+        }
+        for name, command in nothing.items():
+            with self.subTest(nothing=name):
+                self.assertEqual(self.pages(command), [])
 
     def test_a_failed_client_call_is_checked_only_on_exit_4(self):
         self.add(cf.task(1, ""))

@@ -72,6 +72,12 @@ class ContractTextTest(SentenceCase):
         self.assertSentence(project, r"Mudanças de escopo", r"bold `dd/mm` date")
         self.assertIn("## The five moments of a task", text)
 
+    def test_the_reference_says_which_hidden_writes_the_hook_does_not_see(self):
+        self.assertSentence(read(CONTRACT), r"output is hidden", r"any other shape", r"not seen", r"bash -c", r"redirection",
+                            r"substitution", r"interpreter", *(rf"`{name}`" for name in (
+                                "env", "timeout", "nice", "nohup", "time", "exec", "command", "sudo", "if", "for", "while",
+                                "until")))
+
     def test_contract_states_the_three_limits(self):
         limits = section(read(CONTRACT), "Limits")
         self.assertSentence(limits, r"`\*\*Pronto quando:\*\*`|Pronto quando", r"1 to 5 list items")

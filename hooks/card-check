@@ -4,9 +4,10 @@ the card contract before the agent's next step.
 
 It fires after every `Bash` call and every connector page write. When the call wrote a page - a
 command that names the cdv-notion client and whose output holds the client's own write lines
-(`updated <url>`, `created <url> <key>`), whatever the shell shape; with no such line, the client's
-`update <ref>` in the command as far as it parses (a failed call checks the pages its output shows
-as written, and on exit 4, done in part, also the page of the command; a write the client reports as
+(`updated <url>`, `created <url> <key>`) wherever they sit, whatever the shell shape, and on a call that
+ended well also the pages the client's `update <ref>` names in the command, as far as it can be read: a
+write whose output is hidden inside a shape the reading does not open is not seen (a failed call checks
+the pages its output shows as written, and on exit 4, done in part, also the pages of the command; a write the client reports as
 in doubt is checked like one that landed, on the page its message names, and a write refused or
 never sent is not); or the connector's `notion-update-page` or `notion-create-pages` under any server
 prefix - it runs `card_contract.py check <ref>` (with `--body-replaced` after a whole-body replace)
@@ -43,8 +44,9 @@ CONNECTOR = re.compile(r"^mcp__.+__notion-(update-page|create-pages)$")
 UUID = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{8})-?([0-9a-fA-F]{4})-?([0-9a-fA-F]{4})-?([0-9a-fA-F]{4})-?"
                   r"([0-9a-fA-F]{12})(?![0-9a-fA-F])")
 URL = re.compile(r"https?://[^\s\"'<>),]+")
-# update flags that take values; --edit takes two
-VALUE_FLAGS = {"--set": 1, "--edit": 2, "--replace-file": 1, "--append-file": 1, "--prepend-file": 1, "--icon": 1}
+# the flags of `update` and how many values each takes
+UPDATE_FLAGS = {"--set": 1, "--edit": 2, "--replace-file": 1, "--append-file": 1, "--prepend-file": 1, "--icon": 1,
+                "--allow-deleting-content": 0, "--help": 0}
 CHECK_TIMEOUT = 25
 # The whole hook ends inside this many seconds, before the host's timeout of 30 (door 3), whatever the
 # number of pages a call wrote. CARD_CHECK_BUDGET can only lower it.
@@ -104,10 +106,13 @@ def shown(ref):
 # ---------------------------------------------------------------------------------------------
 
 
-# The command names the client: a word `notion`, or a path ending in `/notion` (`N=<path>/notion`).
-NAMES_CLIENT = re.compile(r"(?:^|[\s/'\"=;&|(`])notion(?=$|[\s'\";&|)`])")
-# The lines the client prints for a write, on stdout: `updated <url>` and `created <url> <key>`.
-WRITE_LINE = re.compile(r"^\s*(updated|created) (https?://\S+)")
+# The command names the client: a word `notion`, or a path ending in `/notion` (`N=<path>/notion`,
+# `${N:-<path>/notion}`, `${N:-notion}`).
+NAMES_CLIENT = re.compile(r"(?:^|[\s/'\"=;&|(`]|:-)notion(?=$|[\s'\";&|)`}])")
+# The lines the client prints for a write, on stdout: `updated <url>` and `created <url> <key>`, wherever
+# they sit (a loop may print a label before them).
+WRITE_LINE = re.compile(r"(updated|created) (https?://[^\s\"'<>),]+)")
+NOTION_HOST = re.compile(r"(?:[a-z0-9-]+\.)*notion\.(?:so|com|site)", re.I)
 # A done-in-part update names its page: `done in part on <url>: written: ...`.
 PARTIAL_ON = re.compile(r"done in part on (https?://\S+?):(?:\s|$)")
 # A write in doubt (sent, with no answer the client can trust), alone or after a write that landed:
@@ -115,94 +120,405 @@ PARTIAL_ON = re.compile(r"done in part on (https?://\S+?):(?:\s|$)")
 # refused (`Not written:`) or unsent (`Not sent:`) write names that path too, and is not one.
 IN_DOUBT = re.compile(r"(?m)^\s*(?:done in part\b.*?\. )?In doubt: .*$")
 PAGE_PATH = re.compile(r"/v1/pages/(" + UUID.pattern + ")")
-SHELLS = {"bash", "sh", "zsh", "dash"}
-# Words before the program that only change how it runs.
-WRAPPERS = {"do", "then", "else", "time", "exec", "command", "nohup", "!"}
-ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+MAX_DEPTH = 3  # a command string inside a command string
+OPERATOR = re.compile(r"&&|\|\||;;&|;;|;&|\|&|[;|&()]")
+REDIRECTION = re.compile(r"&>>|&>|>>|>\||>&|<<<|<<-|<<|<&|<>|>|<")
 
 
-def simple_commands(command, depth=0):
-    """The simple commands of a command line, quoted words kept whole (`--set 'Status=In progress'`),
-    in order, the command string of a `bash -c` opened up after the command that runs it. A command
-    the shell splitter cannot parse is split at whitespace and operators (harness_hook.lex)."""
-    out, current = [], []
-    for word in h.lex(command) + [";"]:
-        if word in h.OPERATORS or (word and set(word) <= set(";&|()")):
-            if current:
+class Unreadable(ValueError):
+    """A command whose quotes or parentheses do not close."""
+
+
+class Command:
+    """One simple command: its words with the quotes taken off, whether a stream of it is redirected, the
+    bodies of its heredocs, the commands its substitutions run, and the operators on its two sides."""
+
+    def __init__(self, before=""):
+        self.words, self.redirected, self.heredocs, self.inside = [], False, [], []
+        self.before, self.after = before, ""
+
+
+class Reader:
+    """Reads a shell command line into its simple commands: quotes, escapes, comments, operators,
+    redirections, heredocs and command substitutions, also inside double quotes."""
+
+    def __init__(self, text):
+        self.text, self.at = text, 0
+
+    def commands(self, closer=""):
+        """The simple commands up to `closer` (the parenthesis of a substitution) or the end."""
+        text, out, current, depth = self.text, [], Command(), 0
+        word, bare, wants, heredocs = None, True, None, []
+
+        def end_word():
+            nonlocal word, bare, wants
+            if word is not None:
+                if wants == "heredoc":
+                    heredocs[-1][1] = word
+                elif not wants:
+                    current.words.append(word)
+                wants = None
+            word, bare = None, True
+
+        def end_command(operator):
+            nonlocal current
+            end_word()
+            if current.words or current.redirected or current.inside:
+                current.after = operator
                 out.append(current)
-                words = h.command_words(current)
-                if depth < 3 and words and os.path.basename(words[0]) in SHELLS:
-                    for index in range(1, len(words) - 1):
-                        if re.fullmatch(r"-[a-z]*c", words[index]):
-                            out += simple_commands(words[index + 1], depth + 1)
-                            break
-            current = []
-        else:
-            current.append(word)
-    return out
+                current = Command(operator)
+            elif operator != "\n":  # a blank line keeps the operator before it
+                current.before = operator
+
+        while self.at < len(text):
+            char = text[self.at]
+            if text.startswith("\\\n", self.at):
+                self.at += 2
+            elif char == "\n":
+                self.at += 1
+                end_command("\n")
+                for owner, delimiter, dash in heredocs:
+                    owner.heredocs.append(self.heredoc(delimiter, dash))
+                heredocs = []
+            elif char.isspace():
+                self.at += 1
+                end_word()
+            elif char == "#" and word is None:
+                while self.at < len(text) and text[self.at] != "\n":
+                    self.at += 1
+            elif char in "<>" and text[self.at + 1 : self.at + 2] == "(":
+                start = self.at
+                current.inside += self.substitution(self.at + 2)
+                word, bare = (word or "") + text[start : self.at], False
+            elif char in "<>" or text.startswith("&>", self.at):
+                if word is not None and bare and word.isdigit():
+                    word = None  # the number of the stream
+                end_word()
+                operator = REDIRECTION.match(text, self.at).group(0)
+                self.at += len(operator)
+                current.redirected, wants = True, "target"
+                if operator in ("<<", "<<-"):
+                    wants = "heredoc"
+                    heredocs.append([current, "", operator == "<<-"])
+            elif char == ")" and closer and not depth:
+                self.at += 1
+                end_command("")
+                return out
+            elif OPERATOR.match(text, self.at):
+                operator = OPERATOR.match(text, self.at).group(0)
+                self.at += len(operator)
+                depth += {"(": 1, ")": -1}.get(operator, 0)
+                end_command(operator)
+            else:
+                said, quoted, inside = self.piece()
+                current.inside += inside
+                word, bare = (word or "") + said, bare and not quoted
+        if closer:
+            raise Unreadable("a substitution is not closed")
+        end_command("")
+        return out
+
+    def piece(self):
+        """(text, quoted?, commands run) of the next piece of a word."""
+        text, start, char = self.text, self.at, self.text[self.at]
+        if char == "\\":
+            self.at += 2
+            return text[start + 1 : self.at], True, []
+        if char == "'":
+            self.at = self.find("'", start + 1) + 1
+            return text[start + 1 : self.at - 1], True, []
+        if text.startswith("$'", start):
+            match = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S).match(text, start)
+            if not match:
+                raise Unreadable("a quote is not closed")
+            self.at = match.end()
+            return re.sub(r"\\(.)", r"\1", match.group(1)), True, []
+        if char == '"' or text.startswith('$"', start):
+            self.at += 1 if char == '"' else 2
+            said, inside = [], []
+            while self.at < len(text) and text[self.at] != '"':
+                if text[self.at] == "\\" and text[self.at + 1 : self.at + 2] in ("\\", '"', "$", "`", "\n"):
+                    said.append(text[self.at + 1].strip("\n"))
+                    self.at += 2
+                elif text[self.at] in "$`":
+                    piece, _, run = self.expansion()
+                    said.append(piece)
+                    inside += run
+                else:
+                    said.append(text[self.at])
+                    self.at += 1
+            self.at = self.find('"', self.at) + 1
+            return "".join(said), True, inside
+        if char in "$`":
+            return self.expansion()
+        self.at += 1
+        return char, False, []
+
+    def expansion(self):
+        """A `$(...)`, backquotes or `${...}` as it is written, with the commands it runs."""
+        text, start = self.text, self.at
+        if text[start] == "`":
+            end = start + 1
+            while text[end : end + 1] != "`":
+                end += 2 if text[end : end + 1] == "\\" else 1
+                if end >= len(text):
+                    raise Unreadable("a backquote is not closed")
+            self.at = end + 1
+            return text[start : self.at], False, Reader(re.sub(r"\\([`\\$])", r"\1", text[start + 1 : end])).commands()
+        if text.startswith("$(", start):
+            run = self.substitution(start + 2)
+            return text[start : self.at], False, run
+        if text.startswith("${", start):
+            self.at = self.closing_brace(start + 1)
+            return text[start : self.at], False, []
+        self.at += 1
+        return text[start], False, []
+
+    def substitution(self, start):
+        self.at = start
+        return self.commands(closer=")")
+
+    def find(self, char, start):
+        end = self.text.find(char, start)
+        if end < 0:
+            raise Unreadable("a quote is not closed")
+        return end
+
+    def closing_brace(self, start):
+        """The place after the brace that closes the one at `start`."""
+        depth = 0
+        for at in range(start, len(self.text)):
+            depth += {"{": 1, "}": -1}.get(self.text[at], 0)
+            if not depth:
+                return at + 1
+        raise Unreadable("a brace is not closed")
+
+    def heredoc(self, delimiter, dash):
+        """The heredoc's body, read up to its delimiter."""
+        body = []
+        while self.at < len(self.text):
+            end = self.text.find("\n", self.at)
+            end = len(self.text) if end < 0 else end
+            line, self.at = self.text[self.at : end], end + 1
+            if (line.lstrip("\t") if dash else line) == delimiter:
+                break
+            body.append(line)
+        return "\n".join(body)
+
+
+def read_commands(command):
+    """(the simple commands, whether the reading is whole) of a command line. A command whose quotes do
+    not close is split at whitespace and operators instead (harness_hook.lex)."""
+    try:
+        return Reader(command).commands(), True
+    except Unreadable:
+        out, current = [], Command()
+        for word in h.lex(command) + [";"]:
+            if word in h.OPERATORS or (word and set(word) <= set(";&|()")):
+                if current.words:
+                    out.append(current)
+                current = Command(word)
+            else:
+                current.words.append(word)
+        return out, False
+
+
+def every_command(command, depth=0):
+    """The simple commands a command line runs, in order: what its substitutions run before the command
+    that holds them, and the command string (or the heredoc) a shell is given after the shell."""
+
+    def walk(commands):
+        for one in commands:
+            yield from walk(one.inside)
+            yield one
+            words = program(one.words)
+            if depth < MAX_DEPTH and words and os.path.basename(words[0]) in SHELLS:
+                index, letters = options(words, 1, *SHELL_OPTIONS)
+                if "c" in letters:
+                    yield from every_command(words[index], depth + 1) if index < len(words) else ()
+                elif index >= len(words):
+                    for body in one.heredocs:
+                        yield from every_command(body, depth + 1)
+
+    yield from walk(read_commands(command)[0])
+
+
+# ---------------------------------------------------------------------------------------------
+# The client in the command
+# ---------------------------------------------------------------------------------------------
+
+SHELLS = {"bash", "sh", "zsh", "dash"}
+SHELL_OPTIONS = ("oO", ("--rcfile", "--init-file"))
+PYTHON = re.compile(r"python[\d.]*")
+PYTHON_OPTIONS = ("WXcm", ("--check-hash-based-pycs",))
+# Words of the shell before a command, and programs that only change how the next one runs: their short
+# and long options that take a value, and how many words of their own come before the program.
+KEYWORDS = {"if", "then", "elif", "else", "while", "until", "do", "!", "{"}
+WRAPPERS = {
+    "env": ("uCS", ("--unset", "--chdir", "--split-string"), 0),
+    "timeout": ("ks", ("--kill-after", "--signal"), 1),
+    "nice": ("n", ("--adjustment",), 0),
+    "nohup": ("", (), 0),
+    "time": ("fo", ("--format", "--output"), 0),
+    "exec": ("a", (), 0),
+    "command": ("", (), 0),
+    "sudo": ("ugpChrtTUDR", ("--user", "--group", "--prompt", "--chdir", "--host", "--role", "--type", "--chroot",
+                             "--close-from", "--other-user", "--command-timeout"), 0),
+}
+DECLARES = {"export", "declare", "local", "readonly", "typeset"}
+NAME = r"[A-Za-z_][A-Za-z0-9_]*"
+ASSIGNMENT = re.compile(rf"({NAME})=(.*)", re.S)
+VARIABLE = re.compile(rf"\$(?:({NAME})|\{{({NAME})(?::?[-=](.*))?\}})", re.S)
+
+
+def options(words, index, short, long):
+    """(index after the options, their short letters) of the options that start at `index`."""
+    letters = set()
+    while index < len(words) and words[index].startswith("-"):
+        word = words[index]
+        index += 1
+        if word == "--":
+            break
+        if word.startswith("--"):
+            index += word in long
+            continue
+        for place, letter in enumerate(word[1:], start=2):
+            letters.add(letter)
+            if letter in short:
+                index += place == len(word)  # the value is the next word, unless it is glued
+                break
+    return index, letters
 
 
 def program(words):
-    """The words from the program on: `env` with its options and assignments, `timeout <n>`, `nice`
-    and the other wrappers skipped, and `python3 <client>` read as the client."""
+    """The words of a simple command from the program on: the shell's own words, assignments and the
+    wrappers skipped. Nothing for `command -v`, which only says where the program is."""
     index = 0
     while index < len(words):
-        word, base = words[index], os.path.basename(words[index])
-        if word in WRAPPERS or ASSIGNMENT.match(word):
+        base = os.path.basename(words[index])
+        if words[index] in KEYWORDS or ASSIGNMENT.match(words[index]):
             index += 1
-        elif base in ("env", "nice", "timeout"):
-            index += 1
-            while index < len(words) and words[index].startswith("-"):  # env's VAR= words: the loop above
-                takes_value = words[index] in ("-u", "-n", "-s", "-k", "--signal", "--kill-after", "--unset", "--adjustment")
-                index += 2 if takes_value else 1
-            if base == "timeout" and index < len(words):
-                index += 1  # the duration
+        elif base in WRAPPERS:
+            short, long, own = WRAPPERS[base]
+            index, letters = options(words, index + 1, short, long)
+            if base == "command" and letters & {"v", "V"}:
+                return []
+            index += own
         else:
             break
-    words = words[index:]
-    if words and os.path.basename(words[0]).startswith("python") and len(words) > 1:
-        words = words[1:]
-    return words
+    return words[index:]
+
+
+class Variables:
+    """The variables a command line assigns, each with the values it can hold (a `for` gives several)."""
+
+    def __init__(self):
+        self.held = {}
+
+    def values(self, word):
+        """The values a word can stand for; None for one the command does not tell (a variable of the
+        session, a substitution)."""
+        match = VARIABLE.fullmatch(word)
+        if match:
+            values = self.held.get(match.group(1) or match.group(2))
+            if values is None and match.group(3):
+                return self.values(match.group(3))
+            return values or [None]
+        return [None if "$" in word or "`" in word else word]
+
+    def run(self, words):
+        """Take what a simple command assigns; True when that is all it does."""
+        while words and words[0] in KEYWORDS:
+            words = words[1:]
+        if not words:
+            return True
+        pairs = []
+        for word in words[1:] if words[0] in DECLARES else words:
+            match = ASSIGNMENT.fullmatch(word)
+            if not match:
+                break
+            pairs.append(match.groups())
+        else:
+            for name, value in pairs:
+                self.held[name] = self.values(value)
+            return True
+        if words[0] == "for" and words[2:3] == ["in"]:
+            self.held[words[1]] = [value for word in words[3:] for value in self.values(word)]
+        for word in words[words.index("read"):] if "read" in words else []:
+            self.held.pop(word, None)
+        return False
+
+
+def client_words(words, variables):
+    """The words of a simple command from the client on, or nothing: the client by its name or path,
+    held in a variable, or behind an interpreter with its options."""
+    words = program(words)
+    for _ in range(2):
+        if not words:
+            return []
+        base = os.path.basename(words[0])
+        if base == "notion":
+            return words
+        known = variables.values(words[0])[0] if VARIABLE.fullmatch(words[0]) else None
+        if known:
+            words = program(known.split() + words[1:])
+            base = os.path.basename(words[0]) if words else ""
+        if base in SHELLS or PYTHON.fullmatch(base):
+            index, letters = options(words, 1, *(SHELL_OPTIONS if base in SHELLS else PYTHON_OPTIONS))
+            words = [] if letters & {"c", "m"} else words[index:]
+    return words if words and os.path.basename(words[0]) == "notion" else []
+
+
+class Call:
+    """One call of the client: its verb, and for an `update` the pages it names (None: one it names by
+    something the command does not tell)."""
+
+    def __init__(self, words, variables):
+        self.verb, self.refs = words[1], []
+        if self.verb == "update":
+            ref = update_ref(words[2:])
+            self.refs = variables.values(ref) if ref else [None]
 
 
 def client_calls(command):
-    """(verb, arguments) of each simple command that runs the cdv-notion client, in order. The client
-    held in a variable assigned earlier in the same command (`N=<path>; $N update ...`) is the client."""
-    found, assigned = [], {}
-    for segment in simple_commands(command):
-        if not h.command_words(segment):
-            assigned.update(word.split("=", 1) for word in segment)
+    """The calls of the cdv-notion client in a command line, in order."""
+    found, variables = [], Variables()
+    for one in every_command(command):
+        if not one.words or variables.run(one.words):
             continue
-        words = program(segment)
-        if words:
-            variable = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", words[0])
-            if variable and variable.group(1) in assigned:
-                words = [assigned[variable.group(1)]] + words[1:]
-        if len(words) >= 2 and os.path.basename(words[0]) == "notion":
-            found.append((words[1], words[2:]))
+        words = client_words(one.words, variables)
+        if len(words) >= 2:
+            found.append(Call(words, variables))
     return found
 
 
+def update_flag(word):
+    """The flag of `update` a word is, also cut short as argparse accepts it; None when it is none."""
+    name = word.partition("=")[0]
+    found = [name] if name in UPDATE_FLAGS else [flag for flag in UPDATE_FLAGS if flag.startswith(name)]
+    return found[0] if len(found) == 1 else None
+
+
 def update_ref(arguments):
-    """The page an `update` names; None when it names none or only a variable (`$k`)."""
+    """The word that is the page of an `update`, or None."""
     index = 0
     while index < len(arguments):
         word = arguments[index]
-        if word.startswith("--"):
-            index += 1 + (0 if "=" in word else VALUE_FLAGS.get(word, 0))
-            continue
-        return None if word[:1] in "$<>&|" else word
+        if not word.startswith("--"):
+            return word
+        index += 1 + (0 if "=" in word else UPDATE_FLAGS.get(update_flag(word), 0))
     return None
+
+
+def is_notion_page(url):
+    host = re.sub(r"^https?://(?:[^/@]*@)?([^/:?#]*).*$", r"\1", url, flags=re.S)
+    return bool(NOTION_HOST.fullmatch(host) and UUID.search(url))
 
 
 def written_lines(output):
     """[(verb, url)] of the client's write lines in the call's output."""
-    found = []
-    for line in (output or "").splitlines():
-        match = WRITE_LINE.match(line)
-        if match:
-            found.append((match.group(1), match.group(2).rstrip(".;:,")))
-    return found
+    found = [(match.group(1), match.group(2).rstrip(".;:,")) for match in WRITE_LINE.finditer(output or "")]
+    return [(verb, url) for verb, url in found if is_notion_page(url)]
 
 
 def pages_in_doubt(text):
@@ -213,30 +529,29 @@ def pages_in_doubt(text):
 def bash_targets(command, output, code, errors=""):
     """[(ref, body replaced)] of the pages the client wrote, and whether it fetched a page.
 
-    The pages are the client's own write lines in the output, whatever the shell shape; when the
-    output holds none, the client's `update` in the command, as far as it can be parsed. A call
-    that exited 4 (done in part) also checks the page its message names (`done in part on <url>`) and the
-    pages of the command. A write in doubt is said on stderr (`errors` when the call succeeded). One page
-    may come under several names: main() checks it once."""
+    The pages are those of the client's own write lines, wherever they sit in the output, and, on a call
+    that ended well or exited 4 (done in part), those the client's `update` calls name, as far as the
+    command can be read. A call that exited 4 also checks the page its message names (`done in part on
+    <url>`). A write in doubt is said on stderr (`errors` when the call succeeded). One page may come
+    under several names: main() checks it once."""
     replaced = bool(re.search(r"--replace-file\b", command))
-    calls = client_calls(command)
-    updates = [update_ref(arguments) for verb, arguments in calls if verb == "update"]
-    refs = [ref for ref in updates if ref]
-    lines = written_lines(output)
-    pages = [url for _, url in lines]
-    doubted = pages_in_doubt(f"{output}\n{errors}")
-    if not lines and not doubted and code == 0:
-        pages = list(refs)
-    pages += doubted
+    try:
+        calls = client_calls(command)
+    except (IndexError, RecursionError):  # a command nested past reading: the output still names its pages
+        calls = []
+    pages = [url for _, url in written_lines(output)] + pages_in_doubt(f"{output}\n{errors}")
     if code == 4:
-        pages += [m.group(1) for m in PARTIAL_ON.finditer(output or "")] + refs
+        pages += [m.group(1) for m in PARTIAL_ON.finditer(output or "")]
+    # a loop that failed does not tell which of its pages it reached: the output does
+    for call in calls if code == 0 else [call for call in calls if code == 4 and len(call.refs) == 1]:
+        pages += [ref for ref in call.refs if ref]
     return [(page, replaced) for page in pages], whole_fetch(command, calls)
 
 
 def whole_fetch(command, calls):
     """True when the command's one client call is a `fetch` with nothing piped, redirected or run
     after it, so the call's output is the fetch's own output."""
-    if [verb for verb, _ in calls] != ["fetch"]:
+    if [call.verb for call in calls] != ["fetch"]:
         return False
     words = h.lex(command)
     if "fetch" not in words:

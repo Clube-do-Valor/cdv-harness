@@ -2,7 +2,12 @@
 
 What a Notion card holds, in which order, within which limits, and which moment writes each part.
 Every skill that writes a card writes it from here; `scripts/card_contract.py` holds a card to it,
-and the `card-check` hook runs that check after every card write. The card is read by the business
+and the `card-check` hook runs that check after every card write. The hook takes the pages from the
+lines the client prints and, on a call that ended well, from the `notion update` calls it can read in
+the command: a write whose output is hidden inside any other shape than a list, a pipeline, a
+redirection, `bash -c`, a wrapper (`env`, `timeout`, `nice`, `nohup`, `time`, `exec`, `command`,
+`sudo`), the body of `if`, `for`, `while` or `until`, a command substitution or an interpreter in
+front of the client (a script, `eval` or `xargs`, for example) is not seen. The card is read by the business
 in pt-BR, so the zone titles and labels are pt-BR and fixed; the text inside them follows the card.
 
 The names of the workspace (data sources, properties, statuses, toggles) are the names map in
