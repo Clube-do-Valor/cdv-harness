@@ -1204,7 +1204,7 @@ def assignment(key, value):
 
 
 def cmd_create(client, args):
-    started = NOW().replace(second=0, microsecond=0)
+    started = NOW().replace(second=0, microsecond=0)  # the minute the command started: Notion's created_time precision
     kind, parent = client.resolve(args.parent)
     if args.pages_file:
         try:
@@ -1269,11 +1269,26 @@ def find_created(client, kind, parent, title, started, doubt):
     else:
         candidates = [p for p in client.call('POST', '/v1/search', {
             'query': title, 'filter': {'property': 'object', 'value': 'page'}, 'page_size': 100}).get('results', [])
-            if p.get('parent', {}).get('page_id') == parent['id'] and p.get('created_time', '') >= since]
+            if p.get('parent', {}).get('page_id') == parent['id']]
+    # The filter is not trusted alone: each candidate is checked here too, its creator and its time.
     for candidate in candidates:
-        if (candidate.get('created_by') or {}).get('id') == bot and client.title_of(candidate) == title:
+        if ((candidate.get('created_by') or {}).get('id') == bot and client.title_of(candidate) == title
+                and created_at_or_after(candidate, started)):
             return candidate
     return None
+
+
+def created_at_or_after(page, started):
+    """Whether the page's created_time is at or after `started`. Notion stores created_time to the
+    minute, so `started` is the command's start rounded down to its minute."""
+    stamp = page.get('created_time') or ''
+    try:
+        created = datetime.datetime.fromisoformat(stamp.replace('Z', '+00:00'))
+    except ValueError:
+        return False
+    if created.tzinfo is None:
+        created = created.replace(tzinfo=datetime.timezone.utc)
+    return created >= started
 
 
 # ---------------------------------------------------------------------------------------------

@@ -6,6 +6,7 @@ copied from a real workspace: ids are made up, people are "Ana Lima" and "Bruno 
 keys and data source references are built at runtime so the public scan never sees one."""
 
 import contextlib
+import datetime
 import importlib.machinery
 import importlib.util
 import io
@@ -220,6 +221,7 @@ class FakeNotion:
         self.files = {}
         self.next_number = 200
         self.next_id = 0x5000
+        self.now = "2026-11-22T09:30:00.000Z"  # created_time of new pages, to the minute as Notion stores it
 
     # -- plumbing -------------------------------------------------------------------------
 
@@ -473,7 +475,7 @@ class FakeNotion:
         if "data_source_id" in parent:
             ds = parent["data_source_id"]
             schema = self.data_sources[ds]["properties"]
-            page = task_page(identifier, self.next_number, "", status=None)
+            page = task_page(identifier, self.next_number, "", status=None, created_time=self.now)
             page["parent"] = {"type": "data_source_id", "data_source_id": ds, "database_id": DB_TASKS}
             self.next_number += 1
             for name, written in (body.get("properties") or {}).items():
@@ -484,6 +486,7 @@ class FakeNotion:
         else:
             title = "".join(t["text"]["content"] for t in body["properties"]["title"]["title"])
             page = child_page(identifier, title, parent["page_id"])
+            page["created_time"] = self.now
         if body.get("icon"):
             page["icon"] = body["icon"]
         self.add_page(page, body.get("markdown", ""))
@@ -533,6 +536,7 @@ class ClientTestCase(unittest.TestCase):
         self.n.TRANSPORT = self.fake
         self.sleeps = []
         self.n.SLEEP = self.sleeps.append
+        self.n.NOW = lambda: datetime.datetime(2026, 11, 22, 9, 30, 15, tzinfo=datetime.timezone.utc)
         self.keyring_calls = []
         self.keyring = None  # None: no keyring on this machine; a string: the stored token
         self.n.secret_tool = self.fake_secret_tool
@@ -904,6 +908,30 @@ class CreateTest(ClientTestCase):
                 self.assertIn(mine["url"], out)
                 self.assertNotIn(other["url"], out)
                 self.fake.overrides.clear()
+
+    def test_create_after_503_ignores_an_older_page_with_the_same_title(self):
+        title = "Weekly sync"
+        older = self.fake.add_page(task_page(uid(0x4100), 151, title, created_by=BOT,
+                                             created_time="2026-01-01T08:00:00.000Z"))
+        just_before = self.fake.add_page(task_page(uid(0x4101), 152, title, created_by=BOT,
+                                                   created_time="2026-11-22T09:29:00.000Z"))
+        child = self.fake.add_page(child_page(uid(0x4102), title, PROJECT))
+        child["created_time"] = "2026-01-01T08:00:00.000Z"
+        # The fake applies no created_time condition, so only the client's own check keeps these out.
+        self.fake.on("POST", r"/v1/pages", lambda r: error(503, "service_unavailable", "Try again later."))
+        for parent, setting in ((COLLECTION + DS_TASKS, "Task name=" + title), (page_url(PROJECT), "title=" + title)):
+            with self.subTest(parent=parent):
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("create", "--parent", parent, "--set", setting)
+                self.assertEqual(code, 1, out + err)
+                self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+                for page in (older, just_before, child):
+                    self.assertNotIn(page["url"], out + err)
+                self.assertNotIn("created ", out)
+                lookups = [c.json for c in self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query")]
+                if parent.startswith(COLLECTION):
+                    self.assertIn({"timestamp": "created_time", "created_time": {"on_or_after": "2026-11-22T09:30:00.000Z"}},
+                                  lookups[-1]["filter"]["and"])
 
     def test_create_after_timeout_without_page_exits_1_sent_once(self):
         def timeout(r):
