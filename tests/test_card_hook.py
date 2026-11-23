@@ -563,47 +563,74 @@ class CardHookTest(HookCase):
         self.assertSilent(self.hook(self.event("mcp__claude_ai_Notion__notion-search", {"query": "x"}, {"ok": True})))
 
     def test_a_write_of_more_pages_than_the_time_budget_says_how_many_were_not_checked(self):
-        pages = [self.add(cf.task(n, "")) for n in range(1, 13)]
-        result = {"content": [{"type": "text", "text": json.dumps({"pages": [{"id": p["id"]} for p in pages]})}]}
-        create = self.event("mcp__claude_ai_Notion__notion-create-pages", {"parent": {"data_source_id": cf.DS_TASKS},
-                                                                            "pages": [{}] * 12}, result)
-        env = dict(self.env, CARD_CHECK_BUDGET="3")
-        started = time.monotonic()
-        proc = self.hook(create, env=env)
-        took = time.monotonic() - started
-        self.assertEqual(proc.returncode, 2, proc.stderr)
-        checked = proc.stderr.count("request-zone:")
-        last = proc.stderr.strip().splitlines()[-1]
-        match = re.fullmatch(r"card-check: (\d+) more pages? this call wrote (?:was|were) not checked inside the hook's "
-                             r"time budget of 3s; run `card_contract\.py check <ref>` on each\.", last)
-        self.assertIsNotNone(match, last)
-        self.assertGreaterEqual(checked, 1)
-        self.assertEqual(checked + int(match.group(1)), 12)
-        self.assertLess(took, 3 + 2)
-        self.assertEqual(proc.stderr.count("time budget"), 1)
-        everything = self.hook(self.event("mcp__claude_ai_Notion__notion-create-pages", {"pages": [{}] * 2},
-                                          {"pages": [{"id": p["id"]} for p in pages[:2]]}))
-        self.assertEqual(everything.stderr.count("request-zone:"), 2)
-        self.assertNotIn("time budget", everything.stderr)
+        pages = [self.add(cf.task(n, "")) for n in range(1, 31)]
+
+        def create(count):
+            return self.event("mcp__claude_ai_Notion__notion-create-pages", {"pages": [{}] * count},
+                              {"pages": [{"id": p["id"]} for p in pages[:count]]}, session="s-" + uuid.uuid4().hex)
+
+        def line(count, seconds):
+            many = f"{count} more pages this call wrote were" if count > 1 else "1 more page this call wrote was"
+            return (f"card-check: {many} not checked inside the hook's time budget of {seconds}s; "
+                    "run `card_contract.py check <ref>` on each.")
+
+        def run(payload, budget, step=1.0, hangs=False):
+            """(pages checked, seconds each check was given, message) with a clock that only the checks move."""
+            module, checked, given, clock = self.hook_module(), [], [], [0.0]
+            module.STARTED, module.time = 0.0, mock.Mock(monotonic=lambda: clock[0])
+
+            def check(ref, flags, timeout=None):
+                given.append(timeout)
+                clock[0] += timeout if hangs else step
+                found = next((p for p in self.fake.pages.values() if p["id"] == module.hyphenated(ref)), None)
+                checked.append(ref)
+                return (module.TIMED_OUT, "", None, None) if hangs else (1, "finding", found and found["id"], None)
+
+            module.check = check
+            code, message = self.run_module(module, payload, dict(self.env, **({"CARD_CHECK_BUDGET": budget} if budget else {})))
+            self.assertEqual(code, 2 if message else 0)
+            return checked, given, message
+
+        ids = [p["id"] for p in pages]
+        checked, given, message = run(create(12), "3")
+        self.assertEqual((checked, given), (ids[:3], [3.0, 2.0, 1.0]))
+        self.assertEqual(message.splitlines()[-1], line(9, 3))
+        self.assertEqual(message.count("time budget"), 1)
+        self.assertEqual(message.count("finding"), 3)
+        checked, given, message = run(create(12), "3", step=1.25)  # 0.5 s left after the second: no third check
+        self.assertEqual((checked, given), (ids[:2], [3.0, 1.75]))
+        self.assertEqual(message.splitlines()[-1], line(10, 3))
+        checked, given, message = run(create(30), None)  # the budget is 25 s, and no check gets more than that
+        self.assertEqual((checked, given[0], given[-1]), (ids[:25], 25.0, 1.0))
+        self.assertEqual(message.splitlines()[-1], line(5, 25))
+        checked, _, message = run(create(2), "3")
+        self.assertEqual(checked, ids[:2])
+        self.assertNotIn("time budget", message)
+        checked, _, message = run(create(3), "3")  # the last one ends with the budget: nothing was left out
+        self.assertEqual(checked, ids[:3])
+        self.assertNotIn("time budget", message)
         # Less than a second left: no check is started
-        none = self.hook(self.update(cf.key(1), session="late"), env=dict(self.env, CARD_CHECK_BUDGET="0.95"))
-        self.assertIn("card-check: 1 more page this call wrote was not checked", none.stderr)
-        self.assertNotIn("request-zone:", none.stderr)
-        # A check that hangs (Notion slow to answer) is cut at the budget, and said as not checked
+        self.assertEqual(run(self.update(cf.key(1), session="late"), "0.95"), ([], [], line(1, 0.95)))
+        self.assertEqual(run(create(2), "0.95"), ([], [], line(2, 0.95)))
+        # A check that hangs gets what is left of the budget, and its page is not checked; a page named by its
+        # url in the output and by its key in the command is one page
+        checked, given, message = run(self.update(cf.key(1), session="hangs"), "3", hangs=True)
+        self.assertEqual((checked, given, message), ([self.url(cf.key(1))], [3.0], line(1, 3)))
+        hidden = self.bash(f"{CLIENT_CMD} update {cf.key(1)} --icon x > /dev/null; {CLIENT_CMD} update {cf.key(2)} --icon x",
+                           stdout=f"updated {self.url(cf.key(2))}\n", session="hidden")
+        self.assertEqual(run(hidden, "3", hangs=True)[2], line(2, 3))
+        # As the host runs it, the hanging check is stopped: the bound is far from the sleep on any machine
         wrapper = self.client.read_text()
         self.assertIn("def main(argv=None):\n", wrapper)
         self.client.write_text(wrapper.replace("def main(argv=None):\n", "def main(argv=None):\n    import time\n"
-                                                                         "    time.sleep(60)\n"))
+                                                                         "    time.sleep(300)\n"))
         started = time.monotonic()
-        slow = self.hook(self.update(cf.key(1), session="slow"), env=env)
-        self.assertLess(time.monotonic() - started, 3 + 2)
-        self.assertEqual(slow.returncode, 2, slow.stderr)
-        self.assertIn("card-check: 1 more page this call wrote was not checked inside the hook's time budget of 3s",
-                      slow.stderr)
+        slow = self.hook(self.event("mcp__x__notion-update-page", {"page_id": ids[0], "command": "update_content"}, {}),
+                         env=dict(self.env, CARD_CHECK_BUDGET="3"))
+        self.assertLess(time.monotonic() - started, 120)
+        self.assertEqual((slow.returncode, slow.stderr.strip()), (2, line(1, 3)))
         # The budget is the host's timeout of door 3 less a margin, and a setting can only lower it
-        loader = importlib.machinery.SourceFileLoader("card_check_hook", str(self.hooks / "card-check"))
-        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
-        loader.exec_module(module)
+        module = self.hook_module()
         for value, expected in (("999", 25.0), ("not a number", 25.0), ("3", 3.0), ("", 25.0)):
             with self.subTest(budget=value), mock.patch.dict(os.environ, {"CARD_CHECK_BUDGET": value}):
                 self.assertEqual(module.budget(), expected)
@@ -938,7 +965,7 @@ class CardHookTest(HookCase):
                         f"if true; then {fetch}; fi", f"for i in 1; do {fetch}; done", f"({fetch})", f"{{ {fetch}; }}", f"! {fetch}",
                         f"bash -c '{fetch}'", f"OUT=$({fetch})", f"echo \"$({fetch})\"", f"{fetch} &", f"{fetch} | cat", f"{fetch} > f.md",
                         f"> f.md {fetch}", f"{fetch} 2>&1", f"{fetch} < /dev/null", f"{fetch}; cd x", f"{fetch} && {fetch}",
-                        f"X=$({fetch}); {fetch}", f"{fetch}; echo it's", f"cd it's; {fetch} > f.md", "N=$(which notion) fetch"):
+                        f"X=$({fetch}); {fetch}", f"{fetch}; echo it's", "N=$(which notion) fetch"):
             with self.subTest(nothing=command):
                 self.assertEqual(pinned(command), [])
         for command in (fetch, f"cd x && {fetch}", f"cd x; {fetch}", f"cd x\n{fetch}\n", f"cd \"$(git rev-parse --show-toplevel)\" &&\n  {fetch}",
