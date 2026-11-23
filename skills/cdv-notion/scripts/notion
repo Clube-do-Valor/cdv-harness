@@ -1245,8 +1245,9 @@ def cmd_update(client, args):
             raise Fail(USAGE, f'the new body leaves out {len(dropped)} child item(s) that Notion would delete: {listed}. '
                               'Keep their <page>/<database> tags in the file, or pass --allow-deleting-content')
 
-    # Everything above only read. From here each request writes; once one has landed, a later refusal
-    # is "done in part" (exit 4), with what landed and what did not, so a rerun does not repeat it.
+    # Everything above only read. From here each request writes; a write that fails, the first one included,
+    # is reported by report_writes with what landed, its own case and what was never sent (exit 4 once one
+    # has landed), so a rerun repeats nothing.
     steps, landed, misses = [], [], []
     if properties or args.icon:
         what = []
@@ -1267,8 +1268,6 @@ def cmd_update(client, args):
         try:
             write()
         except Fail as failure:
-            if not landed:
-                raise
             rest = [name for name, _ in steps[number + 1:]]
             raise report_writes('update', landed, label, failure, rest, where=page.get('url'), misses=misses)
         if not landed and not (properties or args.icon):
@@ -1437,8 +1436,6 @@ def cmd_create(client, args):
         try:
             page = create_one(client, kind, parent, payload, title, started, seen, where)
         except Fail as failure:
-            if not created:
-                raise
             rest = [repr(t or '(untitled)') for _, t in payloads[number + 1:]]
             raise report_writes('create', created, repr(title or '(untitled)'), failure, rest, total=len(payloads),
                                 where=where)

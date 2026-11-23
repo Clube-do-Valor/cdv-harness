@@ -1329,6 +1329,49 @@ class WriteOutcomeTest(ClientTestCase):
                     self.assertIn(f"not sent: {title!r}", err)
 
 
+    def test_a_first_write_in_doubt_names_it_and_what_was_never_sent(self):
+        note = self.tmp / "note.md"
+        note.write_text("Shipped.\n")
+        before = self.fake.markdown[PAGE]
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", ends_in("504"))
+        code, out, err = self.run_cli("update", PAGE, "--edit", "by hand", "manually", "--append-file", note)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(len(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}/markdown")), 1)
+        self.assertEqual(self.fake.markdown[PAGE], before)
+        self.assertIn("In doubt: body edits 1 (", err)
+        self.assertIn("504", err)
+        self.assertIn("fetch the page and check", err)
+        self.assertIn("not sent: body added at the end", err)
+        self.assertIn("Rerun only what was not sent", err)
+        self.assertNotIn("Not written", err)
+        self.assertNotIn("updated", out)
+
+        self.fake.overrides.clear()
+        self.fake.calls.clear()
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}", ends_in("503"))
+        code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--prepend-file", note, "--append-file", note)
+        self.assertEqual(code, 1, err)
+        self.assertIn("In doubt: properties Status (", err)
+        self.assertIn("not sent: body added at the start; body added at the end", err)
+        self.assertEqual(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}/markdown"), [])
+
+        self.fake.overrides.clear()
+        self.fake.calls.clear()
+        pages = self.tmp / "pages.json"
+        pages.write_text(json.dumps([{"properties": {"Task name": f"First doubt {i}"}} for i in range(3)]))
+        self.fake.on("POST", r"/v1/pages", ends_in("503"))
+        code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--pages-file", pages)
+        self.assertEqual(code, 1, err)
+        self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+        self.assertIn("In doubt: 'First doubt 0' (", err)
+        self.assertIn("may still appear", err)
+        self.assertIn(f"look for a page titled 'First doubt 0' in data source Tasks ({COLLECTION}{DS_TASKS})", err)
+        self.assertIn("not sent: 'First doubt 1', 'First doubt 2'", err)
+        self.assertIn("Rerun with only the pages not sent", err)
+        self.assertNotIn("Not created", err)
+        self.assertNotIn("Run the command again", err)
+
+
 class TransportTest(ClientTestCase):
     def test_429_waits_retry_after_then_succeeds(self):
         answers = [(429, {"object": "error", "status": 429, "code": "rate_limited", "message": "slow down"}, {"Retry-After": "2"}),
