@@ -563,6 +563,12 @@ class ReadBackTest(CardCase):
                 self.assertEqual(self.rules(log), [])
         coloured = full_task().replace("**Objetivo:**", '<span color="blue"><b>Objetivo:</b></span>')
         self.assertEqual(self.rules(self.add(cf.task(50, coloured, status="Rollout", pr=PR_URL, summary=SUMMARY))), [])
+        for offset, date in enumerate(('<span color="red"><b>12/11</b></span>', '**<span color="red">12/11</span>**')):
+            with self.subTest(date=date):
+                body = cf.project_body(current=CURRENT.replace("**12/11**", date))
+                self.assertEqual(self.rules(self.add(cf.project(60 + offset, body))), [])
+        unbold = cf.project_body(current=CURRENT.replace("**12/11**", '<span color="red">12/11</span>'))
+        self.assertEqual(self.rules(self.add(cf.project(62, unbold))), ["scope-log"])
         entity = cf.project_body(current=CURRENT).replace("Discovery & Define", "Discovery &amp; Define")
         self.assertIn("Discovery &amp; Define", entity)
         self.assertEqual(self.rules(self.add(cf.project(51, entity))), [])

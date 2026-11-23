@@ -126,6 +126,7 @@ def limits():
 
 ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|<>$~])")
 INLINE_TAG = re.compile(r"</?[A-Za-z][\w-]*(?:\s[^<>]*)?/?>")
+BOLD_TAG = re.compile(r"</?(?:b|strong)>", re.I)
 EMPTY_PARAGRAPH = re.compile(r"^<(?:p|empty-block)\s*/>$")
 
 
@@ -779,7 +780,8 @@ def project_rules(card, found):
     for line in children[scope + 1 :]:
         if heading(line):
             break
-        if line.strip() and not BOLD_DATE.match(ESCAPE.sub(r"\1", line.strip())):
+        bare = INLINE_TAG.sub(lambda m: m.group(0) if BOLD_TAG.match(m.group(0)) else "", line.strip())
+        if line.strip() and not BOLD_DATE.match(ESCAPE.sub(r"\1", html.unescape(bare))):
             found.add("scope-log", f"the scope line '{quote(plain(line))}' does not start with a bold date",
                       "Write it as `- **dd/mm** · Entrou: <...>. Saiu: <...>. <who decided>. CES de <x> para <y>.`")
 
