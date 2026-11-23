@@ -121,8 +121,10 @@ notion update <card> --append-file analise-<slug>.md
 When the description has something after the reporter's text that must stay last, anchor the block instead: copy the last heading and the reporter's exact last line from the fetched body, and replace them with themselves plus the block:
 
 ```
-notion update <card> --edit "$(cat anchor.md)" "$(cat anchor.md analise-<slug>.md)"
+notion update <card> --edit "$(cat anchor.md)" "$(cat anchor.md; printf '\n\n'; cat analise-<slug>.md)"
 ```
+
+The command writes the blank line between the anchor and the block itself, so the `## Análise técnica` heading starts its own section whether or not `anchor.md` ends with a newline.
 
 `anchor.md` holds `## <last heading>` and the reporter's exact last line; it must match one place in the body. If the reporter's text repeats earlier in the description (e.g., copied between two sections), keep the last section's `##` header in the anchor to disambiguate. An anchor that matches nothing exits `1` and changes nothing: fetch again and copy the text as it is now.
 

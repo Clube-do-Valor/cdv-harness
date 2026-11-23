@@ -2524,6 +2524,11 @@ class CoreSkillsTest(unittest.TestCase):
         template = CORE_FILES["notion-ticket-template.md"].read_text(encoding="utf-8")
         self.assertIn("<toggle>", template)
 
+    def test_the_anchored_append_writes_its_own_separator(self):
+        template = CORE_FILES["notion-ticket-template.md"].read_text(encoding="utf-8")
+        self.assertNotIn('"$(cat anchor.md analise-<slug>.md)"', template)
+        self.assertIn("""--edit "$(cat anchor.md)" "$(cat anchor.md; printf '\\n\\n'; cat analise-<slug>.md)\"""", template)
+
 
 if __name__ == "__main__":
     unittest.main()

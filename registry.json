@@ -23,7 +23,7 @@
       "owner": "augusto-henriques",
       "description": "Read-only root-cause investigation for backend bugs (integrations and sync jobs especially), from a Laravel log, a Sentry issue, or a human report, ending in an evidence-backed report. Triggers on \"investigue esse erro\", \"olha esse log\", \"esse cliente reportou\", \"esse 404 da integração\", \"esse erro do workflow\", or a pasted stack trace. When the user signals fix intent (\"vamos consertar\", \"plano de fix\"), sizes the fix and asks: a small fix (≤ ~3 files, no migration, no new screen) can be done here as \"fix direto\" (fix + test + express finalize); anything larger than small hands off to `cdv-kickoff`. Never produces a multi-phase plan. Do NOT use for feature implementation, refactors, frontend-only bugs, or generic Laravel questions.",
       "path": "skills/cdv-debug",
-      "contentHash": "a119d7b5c6f23d17e4f1f7f792561e5cb23d44ef83c6362303afd75fdb6c888c"
+      "contentHash": "1a167ea55f1d5cc0aaf1dbe692adf60593afa5bcf2d44295bf7a5b059571b1b2"
     },
     {
       "name": "cdv-factory-finalize",
