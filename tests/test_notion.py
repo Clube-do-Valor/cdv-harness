@@ -2313,6 +2313,17 @@ class CacheTest(ClientTestCase):
         self.assertTrue(cache.is_dir())
 
 
+class PeopleCacheRaceTest(ClientTestCase):
+    def test_two_sessions_that_loaded_the_cache_before_either_wrote_keep_both_people(self):
+        first, second = self.n.Notion(), self.n.Notion()
+        self.assertEqual((first.people(), second.people()), ({}, {}))  # both loaded the empty cache
+        second.remember(GUEST)
+        first.remember(USERS[BRUNO])
+        saved = json.loads((self.home / ".cache" / "cdv-notion" / "people.json").read_text())
+        self.assertEqual(sorted(saved), sorted([JOANA, BRUNO]))
+        self.assertEqual(sorted(first.people()), sorted([JOANA, BRUNO]))
+
+
 class StaleCacheTest(ClientTestCase):
     """What the cache holds can be older than the workspace: a read re-reads it once before it refuses."""
 

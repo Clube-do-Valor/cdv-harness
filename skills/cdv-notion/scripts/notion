@@ -662,6 +662,8 @@ class Notion:
             entry['email'] = email
         if known.get(user['id']) != entry:
             known[user['id']] = entry
+            for other, seen in (self.cache.get('people') or {}).items():  # another session may have written meanwhile
+                known.setdefault(other, seen)
             self.cache.put('people', known)
 
     def list_users(self):
