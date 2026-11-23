@@ -1146,8 +1146,6 @@ def cmd_update(client, args):
         if args.icon:
             what.append('icon')
         steps.append((' and '.join(what), lambda: write_properties(client, page, properties, args.icon)))
-    else:
-        client.say(f"updated {page.get('url')}")
     if args.edit:
         matched = [(number, old, new) for number, old, new, state in plan if state == 'matched']
         steps.append(('body edits ' + ', '.join(str(n) for n, *_ in matched),
@@ -1167,6 +1165,8 @@ def cmd_update(client, args):
                                 f"({failure.message})" + (f"; not sent: {'; '.join(rest)}" if rest else '')
                        + (f"; edits that did not apply: {'; '.join(misses)}" if misses else '')
                        + '. Rerun only what was not written')
+        if not landed and not (properties or args.icon):
+            client.say(f"updated {page.get('url')}")  # only once a write has landed (write_properties says it itself)
         landed.append(label)
     if misses:
         raise Fail(PARTIAL, 'done in part; not applied: ' + '; '.join(misses))

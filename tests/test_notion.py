@@ -836,6 +836,24 @@ class UpdateTest(ClientTestCase):
         sent = self.fake.sent("PATCH", rf"/v1/pages/{PAGE}/markdown")[-1].json
         self.assertTrue(sent["replace_content"]["allow_deleting_content"])
 
+    def test_update_says_updated_only_after_a_write_landed(self):
+        note = self.tmp / "note.md"
+        note.write_text("Shipped.\n")
+        before = self.fake.markdown[PAGE]
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", lambda r: error(400, "validation_error", "Bad markdown."))
+        for args in (("--append-file", note), ("--edit", "by hand", "manually")):
+            with self.subTest(args=args[0]):
+                code, out, err = self.run_cli("update", PAGE, *args)
+                self.assertEqual(code, 2, err)
+                self.assertNotIn("updated", out)
+                self.assertEqual(self.fake.markdown[PAGE], before)
+        self.fake.overrides.clear()
+        for args in (("--append-file", note), ("--edit", "by hand", "manually")):
+            with self.subTest(args=args[0], answer=200):
+                code, out, err = self.run_cli("update", PAGE, *args)
+                self.assertEqual(code, 0, err)
+                self.assertIn("updated " + self.page["url"], out.splitlines())
+
     def test_trash_needs_confirm(self):
         code, out, err = self.run_cli("trash", PAGE)
         self.assertEqual(code, 2)
