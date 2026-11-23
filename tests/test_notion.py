@@ -992,6 +992,49 @@ class QueryTest(ClientTestCase):
         ]})
         self.assertIn("Export invoices", out)
 
+    def test_where_in_compiles_to_an_or_of_single_values(self):
+        properties = self.fake.data_sources[DS_TASKS]["properties"]
+        properties["Kind"] = {"id": "kd", "name": "Kind", "type": "select",
+                              "select": {"options": [option("Bug", 0), option("Feature", 1)]}}
+        properties["Score"] = {"id": "sc", "name": "Score", "type": "formula", "formula": {"expression": "1"}}
+
+        def any_of(name, kind, op, values):
+            return {"or": [{"property": name, kind: {op: v}} for v in values]}
+
+        examples = [
+            ("Status in ('Done', 'Rollout')", any_of("Status", "status", "equals", ["Done", "Rollout"])),
+            ("Kind in ('Bug', 'Feature')", any_of("Kind", "select", "equals", ["Bug", "Feature"])),
+            ("Tags in ('Backend', 'Helpdesk')", any_of("Tags", "multi_select", "contains", ["Backend", "Helpdesk"])),
+            ("Estimate in (1, 2, 3)", any_of("Estimate", "number", "equals", [1, 2, 3])),
+            ("Assignee in (user://" + ANA + ", user://" + BRUNO + ")", any_of("Assignee", "people", "contains", [ANA, BRUNO])),
+            ("Project in (" + page_url(PROJECT) + ", " + page_url(WIKI) + ")",
+             any_of("Project", "relation", "contains", [PROJECT, WIKI])),
+            ("Status in ('Done')", {"property": "Status", "status": {"equals": "Done"}}),
+            ("Status in ('Done', 'Rollout') AND Tags has 'Backend'",
+             {"and": [any_of("Status", "status", "equals", ["Done", "Rollout"]),
+                      {"property": "Tags", "multi_select": {"contains": "Backend"}}]}),
+            ("Status in ('Done', 'Rollout') OR Estimate = 1",
+             {"or": [{"property": "Status", "status": {"equals": "Done"}},
+                     {"property": "Status", "status": {"equals": "Rollout"}},
+                     {"property": "Estimate", "number": {"equals": 1}}]}),
+        ]
+        for expression, expected in examples:
+            with self.subTest(where=expression):
+                code, out, err = self.run_cli("query", COLLECTION + DS_TASKS, "--where", expression)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.last_filter(), expected)
+        self.fake.calls.clear()
+        refused = [
+            ("(Estimate = 1 AND Status in ('Done', 'Rollout')) OR Notes contains 'x'", "Status in ('Done', 'Rollout')"),
+            ("Score in (1, 2)", "Score"),
+        ]
+        for expression, named in refused:
+            with self.subTest(refused=expression):
+                code, out, err = self.run_cli("query", COLLECTION + DS_TASKS, "--where", expression)
+                self.assertEqual(code, 2, err)
+                self.assertIn(named, err)
+        self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
+
     def test_where_errors_exit_2_and_send_nothing(self):
         cases = [
             ("Stauts = 'Done'", "Stauts"),

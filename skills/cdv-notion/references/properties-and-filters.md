@@ -69,15 +69,16 @@ Assignee has me
 | title, text, url, e-mail, phone | `=` `!=` `contains`/`has` `in (...)` | `equals`, `does_not_equal`, `contains` |
 | number | `=` `!=` `>` `>=` `<` `<=` `in (...)` | `equals`, `greater_than`, `greater_than_or_equal_to`… |
 | unique id | the number operators; the value may be the key (`id = <PREFIX>-<n>`) | `unique_id` with the number |
-| select, status | `=` `!=` `in (...)` | `equals` (a list for `in`), `does_not_equal` |
+| select, status | `=` `!=` `in (...)` | `equals`, `does_not_equal` |
 | multi-select | `has`/`contains`/`=` `!=` `in (...)` | `contains`, `does_not_contain` |
-| date, created, edited | `=` `>` `>=` `<` `<=`; dates as `2026-11-01` or `today`, `one_week_ago`… | `equals`, `after`, `on_or_after`, `before`, `on_or_before` |
-| person, created by | `has`/`contains`/`=` `!=` with `me`, a name, an e-mail or `user://` | `contains`, `does_not_contain` with the user id |
-| relation | `has`/`contains`/`=` `!=` with a page reference | `contains`, `does_not_contain` with the page id |
+| date, created, edited | `=` `>` `>=` `<` `<=` `in (...)`; dates as `2026-11-01` or `today`, `one_week_ago`… | `equals`, `after`, `on_or_after`, `before`, `on_or_before` |
+| person, created by | `has`/`contains`/`=` `!=` `in (...)` with `me`, a name, an e-mail or `user://` | `contains`, `does_not_contain` with the user id |
+| relation | `has`/`contains`/`=` `!=` `in (...)` with a page reference | `contains`, `does_not_contain` with the page id |
 | checkbox | `=` `!=` with `__YES__`/`__NO__` | `equals`, `does_not_equal` |
 | every type but checkbox, unique id, timestamps | `is empty`, `is not empty` | `is_empty`, `is_not_empty` |
 
-- The API nests groups two levels deep at most: `(A OR B) AND C` works, a group inside a group inside a group exits `2`.
+- `Prop in (a, b, c)` becomes an `or` group of one single-value condition per value (`equals` for select, status, number, unique id, text and dates; `contains` for multi-select, person and relation), because those conditions take one value. On a type with no single-value equality (formula, rollup, files) it exits `2`.
+- The API nests groups two levels deep at most: `(A OR B) AND C` works, a group inside a group inside a group exits `2` naming the group. An `in (...)` counts as a group: `(A AND Status in ('Done', 'Rollout')) OR C` is three levels deep.
 - An unknown property, an operator the type does not have, or a value of the wrong type exits `2` naming the part; nothing is sent.
 - A status value that is not an option but is a status group name matches the whole group (Notion's rule).
 - Formula and rollup properties are not filtered by the condition: use `notion api POST /v1/data_sources/<id>/query --data '<filter json>'`.

@@ -1296,7 +1296,7 @@ NUMBER_OPS = {'=': 'equals', '!=': 'does_not_equal', '>': 'greater_than', '>=': 
               '<': 'less_than', '<=': 'less_than_or_equal_to'}
 
 
-def tokenize(text):
+def tokenize(text, spans=None):
     tokens, position = [], 0
     text = text.rstrip()
     while position < len(text):
@@ -1311,16 +1311,27 @@ def tokenize(text):
         if kind == 'bname':
             kind = 'qname'
         tokens.append((kind, value))
+        if spans is not None:
+            spans.append((match.start(kind), match.end()))
     return tokens
 
 
 class WhereParser:
-    """or_expr := and_expr (OR and_expr)* ; and_expr := atom (AND atom)* ; atom := '(' or_expr ')' | condition"""
+    """or_expr := and_expr (OR and_expr)* ; and_expr := atom (AND atom)* ; atom := '(' or_expr ')' | condition
+
+    Each condition node carries its source text, so a refusal can name the part it refuses."""
 
     def __init__(self, text):
-        self.text = text
-        self.tokens = tokenize(text)
+        self.text = text.rstrip()
+        self.spans = []
+        self.tokens = tokenize(text, self.spans)
         self.at = 0
+
+    def source(self, first, last):
+        start = self.spans[first][0]
+        if self.tokens[first][0] in ('str', 'qname'):
+            start -= 1  # the opening quote
+        return self.text[start:self.spans[last][1]]
 
     def peek(self, offset=0):
         index = self.at + offset
@@ -1358,13 +1369,20 @@ class WhereParser:
         return parts[0] if len(parts) == 1 else ('and', parts)
 
     def atom(self):
+        first = self.at
+        node = self.bare_atom()
+        if first < len(self.tokens) and self.at > first:
+            node = node + (self.source(first, min(self.at, len(self.tokens)) - 1),)
+        return node
+
+    def bare_atom(self):
         kind, value = self.peek()
         if kind == 'lparen':
             self.take()
             inner = self.or_expr()
             if self.take()[0] != 'rparen':
                 raise Fail(USAGE, 'a "(" in the condition is never closed')
-            return inner
+            return inner[:2] if inner[0] in ('and', 'or') else inner[:4]
         if kind not in ('word', 'qname'):
             raise Fail(USAGE, f'expected a property name, found {value!r}')
         name = self.take()[1]
@@ -1405,13 +1423,21 @@ class WhereParser:
         raise Fail(USAGE, f'expected a value after {name} {operator}')
 
 
+MAX_NESTING = 2
+
+
 def compile_where(client, text, schema):
     tree = WhereParser(text).parse()
-    compiled = compile_node(client, tree, schema)
+    sources = {}
+    compiled = compile_node(client, tree, schema, sources)
     depth = nesting(compiled)
-    if depth > 2:
-        raise Fail(USAGE, f'the condition nests {depth} groups deep and the API allows 2: '
-                          'nest at most one group inside another')
+    if depth > MAX_NESTING:
+        part = too_deep(compiled, depth, sources)
+        named = f'{part!r} is a group at level {depth}' if part else 'a group sits too deep'
+        hint = (' (an `in (...)` list becomes an OR group of one condition per value)'
+                if part and re.search(r'\bin\s*\(', part, re.I) else '')
+        raise Fail(USAGE, f'the condition nests {depth} groups deep and the API allows {MAX_NESTING}: {named}{hint}; '
+                          'nest at most one group inside another. Nothing was sent')
     return compiled
 
 
@@ -1422,15 +1448,35 @@ def nesting(node):
     return 0
 
 
-def compile_node(client, node, schema):
+def too_deep(node, depth, sources):
+    """The source text of the innermost group on the deepest path, or of the nearest named group above it."""
+    named = None
+    level = 0
+    while True:
+        key = 'and' if 'and' in node else ('or' if 'or' in node else None)
+        if key is None:
+            return named
+        level += 1
+        if id(node) in sources and sources[id(node)][0] is node:
+            named = sources[id(node)][1]
+        if level == depth:
+            return named
+        node = max(node[key], key=nesting)
+
+
+def compile_node(client, node, schema, sources):
     if node[0] in ('and', 'or'):
         children = []
         for child in node[1]:
-            compiled = compile_node(client, child, schema)
+            compiled = compile_node(client, child, schema, sources)
             children += compiled[node[0]] if node[0] in compiled and len(compiled) == 1 else [compiled]
-        return {node[0]: children}
-    _, name, operator, values = node
-    return compile_condition(client, schema, name, operator, values)
+        compiled = {node[0]: children}
+    else:
+        _, name, operator, values = node[:4]
+        compiled = compile_condition(client, schema, name, operator, values)
+    if len(node) > (2 if node[0] in ('and', 'or') else 4):
+        sources[id(compiled)] = (compiled, node[-1])  # the object is kept, so its id is never reused
+    return compiled
 
 
 def where_property(schema, name):
@@ -1475,8 +1521,11 @@ def compile_condition(client, schema, name, operator, values):
         return dict(head, **{key: {op: value}})
 
     def either(op, convert):
+        """One leaf, or for `in (...)` an OR group of one single-value leaf per value: the API's
+        equals and contains take one value, never a list."""
         if operator == 'in':
-            return {'or': [leaf(op, convert(v)) for v in values]}
+            leaves = [leaf(op, convert(v)) for v in values]
+            return leaves[0] if len(leaves) == 1 else {'or': leaves}
         return leaf(op, convert(values[0]))
 
     if kind in TEXT_TYPES:
@@ -1500,23 +1549,20 @@ def compile_condition(client, schema, name, operator, values):
             raise refuse()
         return leaf(NUMBER_OPS[operator], to_number(values[0]))
     if kind in ('select', 'status'):
-        if operator == 'in':
-            return leaf('equals', list(values))
-        ops = {'=': 'equals', '!=': 'does_not_equal'}
+        ops = {'=': 'equals', '!=': 'does_not_equal', 'in': 'equals'}
         if operator not in ops:
             raise refuse()
-        return leaf(ops[operator], values[0])
+        return either(ops[operator], str)
     if kind == 'multi_select':
-        if operator == 'in':
-            return leaf('contains', list(values))
-        ops = {'=': 'contains', 'contains': 'contains', '!=': 'does_not_contain'}
+        ops = {'=': 'contains', 'contains': 'contains', '!=': 'does_not_contain', 'in': 'contains'}
         if operator not in ops:
             raise refuse()
-        return leaf(ops[operator], values[0])
+        return either(ops[operator], str)
     if kind in ('date', 'timestamp', 'created_time', 'last_edited_time'):
-        if operator not in DATE_OPS:
+        ops = dict(DATE_OPS, **{'in': 'equals'})
+        if operator not in ops:
             raise refuse()
-        return leaf(DATE_OPS[operator], values[0])
+        return either(ops[operator], str)
     if kind in ('people', 'created_by', 'last_edited_by'):
         ops = {'=': 'contains', 'contains': 'contains', '!=': 'does_not_contain', 'in': 'contains'}
         if operator not in ops:
@@ -1528,13 +1574,19 @@ def compile_condition(client, schema, name, operator, values):
             raise refuse()
         return either(ops[operator], client.page_id_of)
     if kind == 'checkbox':
-        ops = {'=': 'equals', '!=': 'does_not_equal'}
+        ops = {'=': 'equals', '!=': 'does_not_equal', 'in': 'equals'}
         if operator not in ops:
             raise refuse()
-        word = values[0].casefold()
-        if word not in ('__yes__', '__no__', 'true', 'false', 'yes', 'no'):
-            raise Fail(USAGE, f'{prop_name} is a checkbox: compare it with __YES__ or __NO__')
-        return leaf(ops[operator], word in ('__yes__', 'true', 'yes'))
+
+        def to_bool(value):
+            word = value.casefold()
+            if word not in ('__yes__', '__no__', 'true', 'false', 'yes', 'no'):
+                raise Fail(USAGE, f'{prop_name} is a checkbox: compare it with __YES__ or __NO__')
+            return word in ('__yes__', 'true', 'yes')
+        return either(ops[operator], to_bool)
+    if operator == 'in':
+        raise Fail(USAGE, f'`{name} in (...)`: {prop_name} is a {kind} property, which has no single-value equality '
+                          'filter, so the list cannot be compiled; nothing was sent')
     raise Fail(USAGE, f'{prop_name} is a {kind} property, which the condition cannot filter; '
                       'use `notion api POST /v1/data_sources/<id>/query --data <filter>`')
 
