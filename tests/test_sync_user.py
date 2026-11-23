@@ -278,6 +278,36 @@ class UserHookTest(HarnessTestCase):
         self.assertNotIn("harness/hooks", lock["paths"])
         self.assertTrue((self.config / "skills" / "cdv-notion-ticket").is_dir())
 
+    def test_a_lock_written_before_v0_4_is_read_and_rewritten_relative_to_the_config_dir(self):
+        self.write_settings({"model": "opus"})
+        self.assertEqual(self.sync_user().returncode, 0)
+        lock_path = self.config / "harness-user.lock"
+        lock = json.loads(lock_path.read_text())
+        dropped = self.config / "skills" / "cdv-dropped"
+        dropped.mkdir(parents=True)
+        (dropped / "SKILL.md").write_text("a skill the core no longer ships\n")
+        # The lock as a release before v0.4 wrote it: paths relative to $HOME under `.claude/`, skills
+        # only, no hook keys; that release wrote no hook files and no hook entries.
+        old = {key: value for key, value in lock.items() if key not in ("hooks", "hooks_by_event")}
+        old["paths"] = [".claude/" + p for p in lock["paths"] if p.startswith("skills/")] + [".claude/skills/cdv-dropped"]
+        old["files"] = {".claude/" + p: d for p, d in lock["files"].items() if p.startswith("skills/")}
+        lock_path.write_text(json.dumps(old, indent=2) + "\n")
+        for path in sorted((self.config / "harness").rglob("*"), reverse=True):
+            path.unlink() if path.is_file() else path.rmdir()
+        (self.config / "harness").rmdir()
+        self.write_settings({"model": "opus"})
+        result = self.sync_user()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("refusing", result.stderr)
+        self.assertFalse(dropped.exists())
+        self.assertTrue((self.config / "skills" / "cdv-notion-ticket" / "SKILL.md").is_file())
+        self.assertTrue((self.config / "harness" / "hooks" / "card-check").is_file())
+        self.assertEqual(self.settings(), {"model": "opus", "hooks": user_entries()})
+        rewritten = json.loads(lock_path.read_text())
+        self.assertEqual(rewritten["paths"], sorted([f"skills/{n}" for n in SKILLS] + ["harness/hooks"]))
+        self.assertFalse([p for p in rewritten["files"] if p.startswith(".claude/")])
+        self.assertEqual(rewritten["hooks_by_event"], user_entries())
+
 
 class UserSkillsListTest(unittest.TestCase):
     def test_user_skills_name_cdv_notion_and_its_client_is_executable(self):
