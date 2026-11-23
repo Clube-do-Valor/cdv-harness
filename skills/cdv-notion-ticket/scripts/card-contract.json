@@ -1,0 +1,90 @@
+{
+  "names": {
+    "since": "2999-12-31",
+    "tasks": {
+      "source": "Tasks",
+      "properties": {
+        "status": "Status",
+        "summary": "Resumo",
+        "requester": "Requester",
+        "assignee": "Assignee",
+        "pull_request": "Pull Request",
+        "tags": "Tags",
+        "type": "Type",
+        "sprint": "Sprint",
+        "project": "Project",
+        "email": "Email"
+      },
+      "tag": "Helpdesk",
+      "types": {
+        "task": "Tarefa",
+        "bug": "Bug"
+      }
+    },
+    "status": {
+      "not_started": "Not started",
+      "in_progress": "In progress",
+      "pull_request_open": "Code Review",
+      "merged": "Rollout",
+      "deployed": "Rollout",
+      "done": "Done",
+      "archived": "Archived"
+    },
+    "sprints": {
+      "source": "Sprints",
+      "status_property": "Sprint status",
+      "current": "Current"
+    },
+    "projects": {
+      "source": "Projects",
+      "toggles": {
+        "request": "Descrição do Projeto",
+        "current": "Discovery & Define",
+        "checklist": "Checklist de Desenvolvimento"
+      },
+      "properties": {
+        "executors": "Executores",
+        "score": "Pontuação Total Projeto"
+      }
+    }
+  },
+  "limits": {
+    "done_when": [1, 5],
+    "closing": [1, 3],
+    "summary_characters": 200
+  },
+  "skeletons": {
+    "task": {
+      "moment": "merged",
+      "text": "## Pedido\n\n<the request as it arrived, in the words of who asked; never rewritten>\n\n## Entrega\n\n**Objetivo:** <one sentence>\n\n**Pronto quando:**\n\n- <1 to 5 criteria someone can observe>\n\n**Fora desta entrega:** <what does not enter, and where it goes>\n\n**Onde:** <repository>, <repository>\n\n**Plano:** <mention of the child page>\n\n**PRs:** <repository> #<n> · <repository> #<n>\n\n## Fechamento\n\n- <what changed for who asked>\n- Fora do código: <what was done or is pending outside the code>\n",
+      "example": "## Pedido\n\nA equipe de cobrança quer baixar as faturas do mês numa planilha, sem copiar uma por uma.\n\n## Entrega\n\n**Objetivo:** Exportar as faturas de um mês numa planilha com um clique.\n\n**Pronto quando:**\n\n- O botão Exportar aparece na tela de faturas.\n- A planilha traz uma linha por fatura do mês escolhido.\n- Um mês sem faturas gera a planilha só com o cabeçalho.\n\n**Fora desta entrega:** a exportação de notas fiscais, que fica para uma próxima tarefa.\n\n**Onde:** billing-api, billing-web\n\n**Plano:** <mention url=\"https://app.notion.com/p/0000e0010000400080000000000e0001\">Plano técnico: exportar faturas do mês</mention>\n\n**PRs:** billing-api #12 · billing-web #7\n\n## Fechamento\n\n- A tela de faturas ganhou o botão Exportar, que gera a planilha do mês escolhido.\n- Fora do código: a equipe de cobrança foi avisada da nova opção.\n",
+      "example_properties": {
+        "summary": "A equipe de cobrança baixa as faturas do mês numa planilha pela tela de faturas.",
+        "pull_request": "https://example.com/acme/billing-api/pull/12"
+      }
+    },
+    "task-small": {
+      "moment": "merged",
+      "text": "## Pedido\n\n<the request as it arrived, in the words of who asked; never rewritten>\n\n## Entrega\n\n**Objetivo:** <one sentence>\n\n**Pronto quando:**\n\n- <1 to 5 criteria someone can observe>\n\n**Fora desta entrega:** <what does not enter, and where it goes>\n\n**Onde:** <repository>, <repository>\n\n**PRs:** <repository> #<n> · <repository> #<n>\n\n## Fechamento\n\n- <what changed for who asked>\n- Fora do código: <what was done or is pending outside the code>\n",
+      "example": "## Pedido\n\nO rodapé do relatório mensal mostra o ano passado.\n\n## Entrega\n\n**Objetivo:** O rodapé do relatório mensal mostra o ano do relatório.\n\n**Pronto quando:**\n\n- Um relatório de 2026 traz 2026 no rodapé.\n\n**Fora desta entrega:** o layout do relatório, que não muda.\n\n**Onde:** reports-web\n\n**PRs:** reports-web #31\n\n## Fechamento\n\n- O rodapé do relatório mensal passou a mostrar o ano do relatório.\n- Fora do código: nada pendente.\n",
+      "example_properties": {
+        "summary": "O rodapé do relatório mensal mostra o ano certo.",
+        "pull_request": "https://example.com/acme/reports-web/pull/31"
+      }
+    },
+    "form-closing": {
+      "moment": "done",
+      "text": "## Fechamento\n\n- <what changed for who asked>\n- Fora do código: <what was done or is pending outside the code>\n\nPR: #<n>\n",
+      "example": "## Fechamento\n\n- Quando falta o cadastro no sistema de origem, a tela agora diz isso e indica o canal de suporte.\n- Fora do código: o cadastro que faltava foi feito pela equipe de suporte.\n\nPR: [#88](https://example.com/acme/portal/pull/88)\n",
+      "example_properties": {
+        "summary": "Faltava um cadastro no sistema de origem; ele foi feito e a tela já explica o caso.",
+        "pull_request": "https://example.com/acme/portal/pull/88"
+      }
+    },
+    "project": {
+      "moment": "in_progress",
+      "text": "### 🎯 Objetivo\n\n<one paragraph, present tense>\n\n### ✅ O que será feito\n\n- <...>\n\n### 🚫 O que NÃO será feito\n\n- <...>\n\n### 🔗 Dependências\n\n- <...>\n\n### 🔎 Decisões\n\n<pointer to the decisions and, per slice, to the task that holds its plan>\n\n### 🧾 Mudanças de escopo\n\n- **<dd/mm>** · Entrou: <...>. Saiu: <...>. <who decided, or where it came from>. CES de <x> para <y>.\n",
+      "example": "### 🎯 Objetivo\n\nA equipe de cobrança acompanha cada fatura do envio ao pagamento numa única tela.\n\n### ✅ O que será feito\n\n- A tela de faturas com o estado de cada uma.\n- A exportação das faturas do mês.\n\n### 🚫 O que NÃO será feito\n\n- A cobrança automática por e-mail.\n\n### 🔗 Dependências\n\n- O acesso de leitura ao sistema de pagamentos.\n\n### 🔎 Decisões\n\nAs decisões estão na pesquisa do projeto; o plano de cada parte está na sua tarefa.\n\n### 🧾 Mudanças de escopo\n\n- **03/11** · Entrou: a exportação das faturas do mês. Decidido com quem pediu. CES de 8 para 11.\n- **10/11** · Saiu: a cobrança automática por e-mail, para uma próxima etapa. Veio da validação com a equipe. CES sem mudança.\n"
+    }
+  }
+}
