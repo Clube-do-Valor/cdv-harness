@@ -883,6 +883,24 @@ class CardHookTest(HookCase):
         self.hook(self.bash(f"{CLIENT_CMD} fetch {cf.key(1)}", stdout=fetched.stdout))
         self.assertEqual(json.loads(stored[0].read_text())["digest"], "kept")
 
+    def test_a_write_of_a_page_read_in_part_says_only_its_property_findings(self):
+        quiet = self.add(cf.task(1, ""))
+        owing = self.add(cf.task(2, GOOD, type_=None))
+        self.assertSays(self.hook(self.update(cf.key(1), "--set", "'Status=Done'")), "request-zone:")
+        self.fake.cut = [quiet["id"], owing["id"]]
+        cf.save_state(self.fake, self.state)
+        checked = subprocess.run([sys.executable, str(self.checker), "check", cf.key(1)], capture_output=True, text=True,
+                                 env=self.env)
+        self.assertEqual((checked.returncode, checked.stdout), (0, ""))
+        self.assertIn("too long to read whole", checked.stderr)
+        self.assertSilent(self.hook(self.update(cf.key(1), "--set", "'Status=Done'")))
+        self.assertSilent(self.hook(self.update(cf.key(1), "--replace-file", "b.md")))
+        proc = self.hook(self.update(cf.key(2), "--set", "'Status=Done'"))
+        self.assertSays(proc, "type:")
+        self.assertNotIn("zone:", proc.stderr)
+        self.assertNotIn("too long", proc.stderr)
+        self.assertFalse((self.home / ".cache" / "cdv-notion" / "card-pins").exists())
+
     def test_a_cut_or_piped_fetch_pins_nothing(self):
         request = "## Pedido\n\nO pedido como chegou.\nCom uma segunda linha de quem pediu.\n\n"
         self.add(cf.task(1, request + GOOD.split("\n\n", 2)[2].replace("O pedido como chegou.\n\n", "")))

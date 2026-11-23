@@ -12,6 +12,10 @@ moment its status puts it in, and prints one line per rule it breaks:
 a card, a card created before the pattern's start day (`since`) or a card of someone else, unless
 `--body-replaced` says the write just replaced its whole body.
 
+A page whose body the client could not read whole (the read is marked `truncated`) has its properties
+judged and nothing of its body judged, pinned or compared; one line on stderr says so, and it is not a
+finding.
+
 Exit codes: 0 clean (or not judged); 1 findings; 2 the command or the settings file is wrong;
 3 no usable Notion token; 4 the page cannot be read (403, 404, Notion unreachable, no client).
 
@@ -530,7 +534,9 @@ class Card:
     def __init__(self, ref, fetched, names_map):
         self.ref = ref
         self.page = fetched.get("page") or {}
-        self.markdown = ((fetched.get("markdown") or {}).get("markdown")) or ""
+        body = fetched.get("markdown") or {}
+        self.markdown = body.get("markdown") or ""
+        self.whole = not body.get("truncated")
         self.names = names_map
         self.lines = body_lines(self.markdown)
         self.kind = None
@@ -827,7 +833,6 @@ def rank_of(card):
 
 
 def delivery_rules(card, found):
-    props = card.names["tasks"]["properties"]
     lines = card.lines
     pedido, entrega = h2_index(lines, "Pedido"), h2_index(lines, "Entrega")
     if pedido is None:
@@ -854,6 +859,10 @@ def delivery_rules(card, found):
         if not low <= count <= high:
             found.add("done-when", f"`**Pronto quando:**` has {count} list items, not {low} to {high}",
                       f"Keep {low} to {high} criteria someone can observe; a larger delivery is another card")
+
+
+def people_rules(card, found):
+    props = card.names["tasks"]["properties"]
     for role in ("assignee", "requester", "type"):
         if not filled(prop(card.page, props[role])):
             found.add("people" if role != "type" else "type", f"the property '{props[role]}' is empty",
@@ -889,7 +898,7 @@ def summary_rule(card, found):
                   f"Shorten it to one sentence of at most {most} characters")
 
 
-def pull_request_rules(card, found, rank):
+def pr_link_rule(card, found):
     name = card.names["tasks"]["properties"]["pull_request"]
     has_property = filled(prop(card.page, name))
     names_one, line = pr_line(card)
@@ -901,12 +910,19 @@ def pull_request_rules(card, found, rank):
     elif has_property and not names_one:
         found.add("pr-link", f"'{name}' is filled but the body names no pull request",
                   f"Add the line {shape} " + ("after `## Fechamento`" if form else "to `## Entrega`"))
-    if rank == RANKS["pull_request_open"] and not has_property:
+
+
+def pull_request_properties(card, found, rank):
+    name = card.names["tasks"]["properties"]["pull_request"]
+    if rank == RANKS["pull_request_open"] and not filled(prop(card.page, name)):
         found.add("pr-property", f"the card is in the pull request open status and '{name}' is empty",
                   f"Set '{name}' to the url of the pull request")
     if rank >= RANKS["pull_request_open"]:
         summary_rule(card, found)
-    if rank >= RANKS["merged"] and has_property:
+
+
+def closing_rule(card, found, rank):
+    if rank >= RANKS["merged"] and filled(prop(card.page, card.names["tasks"]["properties"]["pull_request"])):
         start = h2_index(card.lines, "Fechamento")
         low, high = limits()["closing"]
         if start is None:
@@ -960,17 +976,27 @@ def project_rules(card, found):
 
 
 def judge(card):
+    """The findings of a card. Of one whose body was not read whole, those of its properties only: a
+    zone, a label or a toggle that is not in the part read may be in the rest."""
     found = Findings()
-    status_rule(card, found)
-    request_rule(card, found)
+    if card.whole:
+        status_rule(card, found)
+        request_rule(card, found)
     if card.kind == "project":
-        project_rules(card, found)
+        if card.whole:
+            project_rules(card, found)
         return found.items
     rank = rank_of(card)
     if rank >= RANKS["in_progress"] and card.kind == "task":
-        delivery_rules(card, found)
+        if card.whole:
+            delivery_rules(card, found)
+        people_rules(card, found)
     if rank >= RANKS["pull_request_open"]:
-        pull_request_rules(card, found, rank)
+        if card.whole:
+            pr_link_rule(card, found)
+        pull_request_properties(card, found, rank)
+        if card.whole:
+            closing_rule(card, found, rank)
     return found.items
 
 
@@ -1004,6 +1030,11 @@ def load_card(ref):
     return card
 
 
+def say_not_whole(card):
+    print(f"the body of {card.ref} was too long to read whole: only its properties are judged, and no request is "
+          "pinned or compared", file=sys.stderr)
+
+
 def cmd_check(args):
     card = load_card(args.ref)
     if args.page_id and card is not None and card.id:
@@ -1014,6 +1045,8 @@ def cmd_check(args):
             and (before_since(card) or someone_elses(card)):
         items = []
     else:
+        if not card.whole:
+            say_not_whole(card)
         items = judge(card)
     if args.json:
         kept = lines_of(items)
@@ -1026,6 +1059,10 @@ def cmd_check(args):
 
 def cmd_accept(args):
     card = load_card(args.ref)
+    if card is not None and card.kind is not None and not card.whole:
+        say_not_whole(card)
+        print(f"{args.ref} was not read whole; nothing was pinned")
+        return CLEAN
     text = None if card is None or card.kind is None else card_request(card.kind, card.markdown, card.names)
     if text is None:
         print(f"{args.ref} has no request zone; nothing was pinned")

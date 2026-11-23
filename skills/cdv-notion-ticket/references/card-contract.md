@@ -217,3 +217,7 @@ inside a code fence, the target of every link and mention and the day of a date 
 the name shown is not kept: it follows the page or the person the mention points at. Of a picture
 or a file it keeps the caption and the address without its query string, whose signed part changes at
 every read.
+
+Of a page whose body the client could not read whole (the read is marked as truncated), the
+properties are judged and nothing of the body is: no zone, label or toggle, and no request is pinned
+or compared. One line on stderr says the body was too long to read whole; it is not a finding.

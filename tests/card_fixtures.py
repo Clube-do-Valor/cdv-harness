@@ -93,9 +93,16 @@ class CardNotion(FakeNotion):
                  "data_sources": [{"id": ds_id, "name": ds["title"][0]["plain_text"]}]}
             for ds_id, ds, db in ((i, d, d["parent"]["database_id"]) for i, d in self.data_sources.items())
         }
+        self.cut = []  # the pages whose body a read returns in part
 
     def add(self, page, markdown=""):
         return self.add_page(page, markdown)
+
+    def page_markdown(self, identifier):
+        read = super().page_markdown(identifier)
+        if identifier in self.cut:
+            read.update(truncated=True, unknown_block_ids=[uid(0xB10C)])
+        return read
 
 
 def people(*who):
@@ -199,7 +206,7 @@ def run_main(module, argv):
 # A fake `notion` client for subprocesses: the real client over a CardNotion kept in a JSON file
 # ---------------------------------------------------------------------------------------------
 
-STATE_KEYS = ("pages", "markdown", "comments", "next_id", "next_number")
+STATE_KEYS = ("pages", "markdown", "comments", "next_id", "next_number", "cut")
 
 
 def save_state(fake, path, calls=()):

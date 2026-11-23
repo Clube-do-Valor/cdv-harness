@@ -111,7 +111,7 @@
       "owner": "augusto-henriques",
       "description": "Own a Notion task card and a helpdesk form ticket from the request to the closing, in the card contract (references/card-contract.md): write the card at each moment of its event - request arrives, plan approved (the delivery zone and the plan as a child page), pull request open (the PRs line, the pull request property, the one-sentence summary), merged or deployed (the closing), validated by who asked - set the status of that moment, triage and close a form ticket, merge request cards that one delivery serves, and hold every write to card_contract.py check. Works through the cdv-notion client, in a repository or at user level. Called by cdv-kickoff, cdv-open-pr, cdv-debug, cdv-rollout and cdv-prod at their events; triggers on \"atualiza o card\", \"fecha o chamado\", \"escreve o card dessa entrega\", \"o que escrevo no ticket\", \"junta esses cards\". Do NOT use for the pull request description (cdv-finalize), a project page (cdv-notion-project), or the investigation report of a bug (cdv-debug keeps it in the chat).",
       "path": "skills/cdv-notion-ticket",
-      "contentHash": "6f91571485ce49bff8a53a9995caad95f429f2d27de1913b19ae79afb987f15e"
+      "contentHash": "5042f66e59fde8cbbaa536438db22a3685bc8d8f79e79c9b6a1174b804c63afc"
     },
     {
       "name": "cdv-open-pr",

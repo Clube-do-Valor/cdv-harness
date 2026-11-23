@@ -666,6 +666,100 @@ class FailureTest(CardCase):
         self.assertIn("could not reach", err)
 
 
+class CutBodyTest(CardCase):
+    """A page whose body the client could not read whole (the read is marked `truncated`)."""
+
+    LINE = re.compile(r"\A[^\n]*body[^\n]*too long to read whole[^\n]*\n\Z")
+
+    def cut(self, built):
+        page = self.add(built)
+        self.fake.cut.append(page)
+        return page
+
+    def pins(self):
+        folder = self.home / ".cache" / "cdv-notion" / "card-pins"
+        return sorted(folder.glob("*.json")) if folder.is_dir() else []
+
+    def test_a_cut_body_has_its_properties_judged_and_nothing_of_its_body(self):
+        nobody = {"assignee": (), "requester": (), "type_": None}
+        people = ["people", "people", "type"]
+        status = "**Status:** em andamento\n"
+        cases = [
+            ("an empty body", cf.task(1, ""), ["request-zone", "delivery-zone", "objective", "done-when"], []),
+            ("labels and people", cf.task(2, REQUEST + "## Entrega\n", **nobody), ["objective", "done-when"] + people, people),
+            ("too many criteria", cf.task(3, REQUEST + entrega(items=6)), ["done-when"], []),
+            ("a status in the body", cf.task(4, REQUEST + entrega() + status), ["status-in-body"], []),
+            ("a status in the body, not started", cf.task(5, status, status="Not started"), ["status-in-body"], []),
+            ("a pull request only in the body", cf.task(6, REQUEST + entrega(), status="Code Review", summary=SUMMARY),
+             ["pr-link", "pr-property"], ["pr-property"]),
+            ("a pull request only in the property", cf.task(7, REQUEST + entrega(prs=None), status="Code Review", pr=PR_URL,
+                                                            summary=SUMMARY), ["pr-link"], []),
+            ("pull request open with nothing filled", cf.task(8, full_task(closing=0, prs=None), status="Code Review", **nobody),
+             people + ["pr-property", "summary"], people + ["pr-property", "summary"]),
+            ("a long summary and no closing", cf.task(9, full_task(closing=0), status="Rollout", pr=PR_URL, summary="z" * 201),
+             ["summary", "closing"], ["summary"]),
+            ("too many closing items", cf.task(10, full_task(closing=4), status="Done", pr=PR_URL, summary=SUMMARY), ["closing"], []),
+            ("a form ticket", cf.task(11, "## Prazo\n\nSexta.\n", status="Done", email="c@example.com", pr=PR_URL),
+             ["pr-link", "summary", "closing"], ["summary"]),
+            ("a project with no toggle", cf.project(1, "Texto.\n"), ["project-toggle", "project-toggle"], []),
+            ("a project with no heading", cf.project(2, cf.project_body(current="Texto.\n\n### 🧾 Mudanças de escopo\n12/11 entrou")),
+             ["project-headings"] * 3 + ["scope-log"], []),
+        ]
+        for name, built, whole, expected in cases:
+            with self.subTest(case=name):
+                page = self.add(built)
+                self.assertEqual(sorted(self.rules(page)), sorted(whole))
+                self.assertEqual(self.check(page)[2], "")  # a body read whole says nothing
+                self.fake.cut.append(page)
+                self.assertEqual(self.rules(page), expected)
+                code, out, err = self.check(page)
+                self.assertEqual((code, len(out.splitlines())), (1 if expected else 0, len(expected)))
+                self.assertRegex(err, self.LINE)
+                self.assertEqual(self.rules(page, "--body-replaced"), expected)
+
+    def test_a_cut_body_pins_no_request_and_compares_none(self):
+        for number, (kind, body) in enumerate((("task", REQUEST + entrega()), ("project", cf.project_body(current=CURRENT))), 1):
+            with self.subTest(kind=kind):
+                page = self.add(getattr(cf, kind)(number, body))
+                before = len(self.pins())
+                self.fake.cut.append(page)
+                code, out, err = self.check(page)
+                self.assertEqual((code, out), (0, ""))
+                self.assertRegex(err, self.LINE)
+                self.assertEqual(len(self.pins()), before)
+                code, out, err = cf.run_main(self.cc, ["accept-request", page])
+                self.assertEqual(code, 0, err)
+                self.assertIn("nothing was pinned", out)
+                self.assertRegex(err, self.LINE)
+                self.assertEqual(len(self.pins()), before)
+                self.fake.cut.remove(page)
+                self.assertClean(page)
+                self.assertEqual(len(self.pins()), before + 1)
+                pinned = [path.read_text() for path in self.pins()]
+                changed = body.replace("planilha", "tabela").replace("O pedido como chegou", "Outro pedido")
+                self.set_body(page, changed)
+                self.fake.cut.append(page)
+                code, out, err = self.check(page)
+                self.assertEqual((code, out), (0, ""))
+                self.assertRegex(err, self.LINE)
+                cf.run_main(self.cc, ["accept-request", page])
+                self.assertEqual([path.read_text() for path in self.pins()], pinned)
+                self.fake.cut.remove(page)
+                self.assertEqual(self.rules(page), ["request-changed"])
+
+        early = self.cut(cf.task(9, "Cortado antes do pedido.\n"))
+        code, out, err = cf.run_main(self.cc, ["accept-request", early])
+        self.assertEqual((code, out), (0, f"{early} was not read whole; nothing was pinned\n"))
+        self.assertRegex(err, self.LINE)
+
+    def test_a_cut_body_of_a_page_that_is_not_judged_says_nothing(self):
+        for name, built in (("not a card", cf.row(1, cf.DS_WIKI)), ("older than the pattern", cf.task(1, "", created="2026-10-31T10:00:00.000Z")),
+                            ("someone else's", cf.task(2, "", assignee=(BRUNO,)))):
+            with self.subTest(page=name):
+                page = self.cut(built if isinstance(built, tuple) else (built, ""))
+                self.assertEqual(self.check(page), (0, "", ""))
+
+
 FINDING = re.compile(r"^[a-z][a-z-]+: [^\n]+\. [^\n]+$")
 
 
