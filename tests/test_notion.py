@@ -1497,6 +1497,27 @@ class TokenTest(ClientTestCase):
         self.assertIn("credentials", out)
         self.assertEqual(self.bearer(), "Bearer " + file_token)
 
+    def test_credentials_file_open_to_others_warns_once_and_works(self):
+        os.environ.pop("NOTION_API_TOKEN")
+        file_token = "ntn_file_value_33333333333333333333333"
+        credentials = self.home / ".config" / "notion" / "credentials"
+        credentials.parent.mkdir(parents=True)
+        credentials.write_text(file_token + "\n")
+        for mode in (0o644, 0o640):
+            with self.subTest(mode=oct(mode)):
+                credentials.chmod(mode)
+                code, out, err = self.run_cli("auth", "status")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.bearer(), "Bearer " + file_token)
+                warnings = [line for line in err.splitlines() if "chmod 600" in line]
+                self.assertEqual(len(warnings), 1, err)
+                self.assertIn(str(credentials), warnings[0])
+                self.assertIn(f"chmod 600 {credentials}", warnings[0])
+        credentials.chmod(0o600)
+        code, out, err = self.run_cli("auth", "status")
+        self.assertEqual(code, 0, err)
+        self.assertNotIn("chmod", err)
+
     def test_token_never_printed(self):
         self.fake.on("GET", rf"/v1/pages/{PAGE}/markdown",
                      lambda r: error(400, "validation_error", "bad header " + r.headers["authorization"]))

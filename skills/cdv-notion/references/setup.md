@@ -6,7 +6,7 @@ The client talks to the public REST API with one token: an internal integration'
 
 1. `$NOTION_API_TOKEN` (the variable the official `ntn` CLI also reads);
 2. the keyring: `secret-tool lookup service notion-api`;
-3. `~/.config/notion/credentials`, mode 600, the first non-comment line.
+3. `~/.config/notion/credentials`, mode 600, the first non-comment line. A file that group or others can read still works, and the client prints one warning line naming it and the `chmod 600` that fixes it.
 
 Store it once, in a terminal (not through the chat: the prompt needs a real TTY), with `notion auth login`. It reads the token at a hidden prompt, checks it with `GET /v1/users/me`, and stores it in the keyring, or in the credentials file with mode 600 when there is no keyring. `notion auth status` says where the token came from and whose it is; `notion auth logout` removes the keyring entry. Never paste a token in a chat, never commit it, never put it in a profile or an `.env` of a repository. The client never prints it and sends it only to `api.notion.com`.
 
