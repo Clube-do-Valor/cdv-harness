@@ -40,12 +40,15 @@ settings in ~/.config/cdv-notion/config.json ({"me": "<your e-mail>", "stamp_com
 import argparse
 import datetime
 import difflib
+import errno
 import getpass
+import http.client
 import json
 import mimetypes
 import os
 import re
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -69,9 +72,17 @@ DEFAULT_ROWS = 50
 MAX_ROWS = 2000
 SCHEMA_BUDGET = 6000
 UPLOAD_LIMIT = 20 * 1024 * 1024
-WRITE_TIMEOUTS = (502, 503, 504)
 
 DONE, REFUSED, USAGE, NO_TOKEN, PARTIAL = 0, 1, 2, 3, 4
+
+# What a write that did not succeed did. write_outcome() decides it, where the HTTP call is made; every
+# verb takes its words from OUTCOME_WORDS and every report of several writes from report_writes().
+NOT_SENT, REFUSED_WRITE, IN_DOUBT = 'not sent', 'refused', 'in doubt'
+OUTCOME_WORDS = {
+    NOT_SENT: 'the request never left this machine, so nothing changed',
+    REFUSED_WRITE: 'Notion refused it and nothing changed',
+    IN_DOUBT: 'the write is in doubt: it may have been applied, so read the object back before sending it again',
+}
 LOGIN_HINT = 'run `notion auth login` in a terminal'
 NO_TOKEN_HELP = (f'no Notion API token on this machine: {LOGIN_HINT} (or export {TOKEN_ENV}); '
                  'the cdv-notion skill, references/setup.md, says where the token comes from')
@@ -83,39 +94,74 @@ TOKEN_SHAPE = re.compile(r'\b(?:ntn|secret)_[A-Za-z0-9]{12,}')
 
 
 class Fail(Exception):
-    def __init__(self, code, message=''):
+    """A command that cannot go on. `outcome` is set on a write that did not succeed (NOT_SENT, REFUSED_WRITE
+    or IN_DOUBT, from write_outcome); `cause` is what happened, without the advice the message adds."""
+
+    def __init__(self, code, message='', outcome=None, cause=None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.outcome = outcome
+        self.cause = cause or message
+
+
+def with_words(cause, outcome):
+    """A write's failure as the reader sees it: what happened, then which of the three cases it is."""
+    return f"{cause.rstrip('.')}: {OUTCOME_WORDS[outcome]}" if outcome else cause
 
 
 class ApiError(Fail):
-    def __init__(self, status, code, message, body, path):
+    def __init__(self, status, code, message, body, path, outcome=None):
         self.status, self.api_code, self.api_message, self.body, self.path = status, code, message, body, path
-        super().__init__(USAGE if status == 400 else REFUSED, f'Notion answered {status} {code} on {path}: {message}')
+        cause = f'Notion answered {status} {code} on {path}: {message}'
+        super().__init__(USAGE if status == 400 else REFUSED, with_words(cause, outcome), outcome, cause)
 
 
 class WriteInDoubt(Fail):
-    """A write that ended in 502/503/504 or a timeout: Notion may have applied it."""
+    """A write whose request left and that no answer settles (any 5xx, a timeout, a connection lost after
+    it was established): Notion may have applied it."""
 
-    def __init__(self, status, path, body=None):
-        self.status, self.path, self.body = status, path, body or {}
-        super().__init__(REFUSED, f'Notion answered {status} on {path}: the write may have been applied; '
-                                  'read the object back before sending it again')
+    def __init__(self, what, path, body=None, status=None):
+        self.what, self.status, self.path, self.body = what, status, path, body or {}
+        cause = f'{what} on {path}'
+        super().__init__(REFUSED, with_words(cause, IN_DOUBT), IN_DOUBT, cause)
 
 
 class CreateInDoubt(Fail):
     """A create that ended in doubt and whose page was not found afterwards: it was not sent again."""
 
-    def __init__(self, status, title, lookup=None):
+    def __init__(self, doubt, title, where, lookup=None):
+        name = repr(title or '(untitled)')
         if lookup is not None:
-            self.reason = (f'Notion answered {status} to the create of {title!r}, and looking for the page failed '
-                           f'({lookup.message}); it was not sent again')
+            cause = f'{doubt.what}; the page could not be looked for ({lookup.cause}); it was not sent again'
         else:
-            self.reason = (f'Notion answered {status} to the create of {title!r} and no page with that title, besides '
-                           'the ones this command already reported, was found from this integration since the minute '
-                           'the command started; it was not sent again')
-        super().__init__(REFUSED, self.reason + '. Run the command again')
+            cause = (f'{doubt.what}; no page with that title, besides the ones this command already reported, was '
+                     'found from this integration since the minute the command started; it was not sent again')
+        self.advice = (f'it may have been created and may still appear, so look for a page titled {name} in {where} '
+                       'before creating it again')
+        super().__init__(REFUSED, f'In doubt: the create of {name} ({cause}): {self.advice}', IN_DOUBT, cause)
+
+
+class Unsent(ConnectionError):
+    """The connection to the API could not be established: the request never left this machine."""
+
+
+def write_outcome(status=None, error=None):
+    """What a write that did not come back with a success did, decided here and nowhere else.
+
+    NOT_SENT: the connection could not be established (urllib's Unsent, a refused connection); nothing
+    reached Notion. REFUSED_WRITE: Notion answered 4xx (a 429 once its retries are used up); nothing
+    changed. IN_DOUBT: the request left and no answer says what happened - any 5xx, a timeout, a connection
+    lost after it was established, or any error that does not say whether the request left."""
+    if error is not None:
+        return NOT_SENT if isinstance(error, (Unsent, ConnectionRefusedError)) else IN_DOUBT
+    if status is not None and 400 <= status < 500:
+        return REFUSED_WRITE
+    return IN_DOUBT
+
+
+def is_write(method, path):
+    return method != 'GET' and not path.endswith('/query') and path != '/v1/search'
 
 
 # ---------------------------------------------------------------------------------------------
@@ -139,6 +185,15 @@ class SameHostRedirects(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(SameHostRedirects())
 
 
+def never_left(reason):
+    """Whether urllib's reason proves the request never left: the name did not resolve, the connection was
+    refused, no route reached the host, or the certificate was refused before anything was sent. A reset,
+    any other TLS or socket error, or a timeout may have come after the request left."""
+    if isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)):
+        return True
+    return isinstance(reason, OSError) and reason.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH)
+
+
 def urllib_transport(method, url, headers, body=None, timeout=60):
     request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     try:
@@ -146,12 +201,16 @@ def urllib_transport(method, url, headers, body=None, timeout=60):
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as error:
         return error.code, dict((error.headers or {}).items()), error.read()
-    except (socket.timeout, TimeoutError) as error:
-        raise TimeoutError(str(error))
-    except urllib.error.URLError as error:
+    except urllib.error.URLError as error:  # raised while connecting or sending the request
         if isinstance(error.reason, (socket.timeout, TimeoutError)):
             raise TimeoutError(str(error.reason))
+        if never_left(error.reason):
+            raise Unsent(str(error.reason))
         raise ConnectionError(str(error.reason))
+    except (socket.timeout, TimeoutError) as error:
+        raise TimeoutError(str(error))
+    except http.client.HTTPException as error:  # the server closed or broke its answer after the request left
+        raise ConnectionError(f'{type(error).__name__}: {error}')
 
 
 TRANSPORT = urllib_transport
@@ -411,9 +470,29 @@ class Notion:
 
     # -- HTTP -----------------------------------------------------------------------------
 
+    def write_failed(self, path, status=None, parsed=None, error=None, retries=None):
+        """The failure of a write that did not come back with a success, in the case write_outcome gives it:
+        never sent, refused (an ApiError for a 4xx) or in doubt (WriteInDoubt)."""
+        outcome = write_outcome(status, error)
+        if outcome == NOT_SENT:
+            cause = f'could not connect to api.notion.com ({error})'
+            return Fail(REFUSED, with_words(cause, outcome), outcome, cause)
+        if error is not None:
+            what = ('api.notion.com did not answer in time' if isinstance(error, TimeoutError)
+                    else f'the connection failed after the request may have left ({error})')
+            return WriteInDoubt(what, path)
+        if retries is not None:
+            cause = f'Notion kept answering {status} (rate limited) on {path} after {retries} retries'
+            if outcome == IN_DOUBT:
+                return WriteInDoubt(f'Notion kept answering {status} after {retries} retries', path, parsed, status)
+            return Fail(REFUSED, with_words(cause, outcome) + '; wait a minute and run it again', outcome, cause)
+        if outcome == IN_DOUBT:
+            return WriteInDoubt(f'Notion answered {status}', path, parsed, status)
+        return ApiError(status, parsed.get('code', ''), parsed.get('message', ''), parsed, path, outcome)
+
     def send(self, method, path, body=None, query=None, raw=None, content_type=None, write=None):
-        """(status, json) after the retry rules. Raises Fail(3) on 401 and WriteInDoubt on a write
-        that timed out or ended in 502/503/504. The token only ever goes to api.notion.com/v1/."""
+        """(status, json) after the retry rules. Raises Fail(3) on 401, and on a write whose answer is not a
+        success and not a 4xx, the failure write_failed gives. The token only ever goes to api.notion.com/v1/."""
         if not path.startswith('/v1/'):
             raise Fail(USAGE, f'not an API path: {path}')
         url = API_ROOT + path
@@ -429,27 +508,31 @@ class Notion:
         elif raw is not None:
             headers['Content-Type'] = content_type or 'application/octet-stream'
         if write is None:
-            write = method != 'GET' and not path.endswith('/query') and path != '/v1/search'
+            write = is_write(method, path)
         limited = server = 0
         while True:
             try:
                 status, answer_headers, payload = TRANSPORT(method, url, headers, data, 60)
-            except TimeoutError:
+            except TimeoutError as error:
                 if write:
-                    raise WriteInDoubt('a timeout', path)
+                    raise self.write_failed(path, error=error)
                 if server < 2:
                     server += 1
                     SLEEP(server)
                     continue
                 raise Fail(REFUSED, f'api.notion.com did not answer {method} {path} in time')
             except ConnectionError as error:
+                if write:
+                    raise self.write_failed(path, error=error)
                 raise Fail(REFUSED, f'could not reach api.notion.com: {error}')
             parsed = self.parse(payload)
             if status in (429, 529):
                 reason = (parsed.get('additional_data') or {}).get('rate_limit_reason', '')
                 if limited >= MAX_RETRIES or reason == 'public_api_request_blocked':
-                    raise Fail(REFUSED, f'Notion kept answering {status} (rate limited) on {path} after '
-                                        f'{limited} retries; wait a minute and run the command again')
+                    if write:
+                        raise self.write_failed(path, status, parsed, retries=limited)
+                    cause = f'Notion kept answering {status} (rate limited) on {path} after {limited} retries'
+                    raise Fail(REFUSED, cause + '; wait a minute and run the command again', cause=cause)
                 limited += 1
                 SLEEP(self.retry_after(answer_headers, parsed, limited))
                 continue
@@ -459,9 +542,9 @@ class Notion:
                 continue
             if status == 401:
                 raise Fail(NO_TOKEN, f'Notion rejected the token from {self.source} (401 unauthorized: revoked, '
-                                     f'expired or mistyped): {LOGIN_HINT} again')
-            if write and status in WRITE_TIMEOUTS:
-                raise WriteInDoubt(status, path, parsed)
+                                     f'expired or mistyped): {LOGIN_HINT} again', write_outcome(401) if write else None)
+            if write and not 200 <= status < 300 and write_outcome(status) == IN_DOUBT:
+                raise self.write_failed(path, status, parsed)
             return status, parsed
 
     @staticmethod
@@ -492,6 +575,9 @@ class Notion:
         status, parsed = self.send(method, path, body, query, **extra)
         if 200 <= status < 300:
             return parsed
+        write = extra.get('write')
+        if write if write is not None else is_write(method, path):
+            raise self.write_failed(path, status, parsed)
         raise ApiError(status, parsed.get('code', ''), parsed.get('message', ''), parsed, path)
 
     def pages_of(self, method, path, body=None, query=None, max_items=None):
@@ -1184,23 +1270,46 @@ def cmd_update(client, args):
             if not landed:
                 raise
             rest = [name for name, _ in steps[number + 1:]]
-            if isinstance(failure, WriteInDoubt):
-                failed = (f'In doubt: {label} ({failure.message}): it may have been applied, so fetch the page and '
-                          'check it before running that part again')
-                again = 'Rerun only what was not sent' if rest else ''
-            else:
-                failed = f'Not written: {label} ({failure.message}): Notion refused it and nothing changed'
-                again = 'Rerun only what was not written' + (' or not sent' if rest else '')
-            raise Fail(PARTIAL, f"done in part on {page.get('url')}: written: {'; '.join(landed)}. {failed}"
-                       + (f"; not sent: {'; '.join(rest)}" if rest else '')
-                       + (f"; edits that did not apply: {'; '.join(misses)}" if misses else '')
-                       + (f'. {again}' if again else ''))
+            raise report_writes('update', landed, label, failure, rest, where=page.get('url'), misses=misses)
         if not landed and not (properties or args.icon):
             client.say(f"updated {page.get('url')}")  # only once a write has landed (write_properties says it itself)
         landed.append(label)
     if misses:
         raise Fail(PARTIAL, 'done in part; not applied: ' + '; '.join(misses))
     return DONE
+
+
+def report_writes(kind, done, label, failure, rest, total=None, where='', misses=()):
+    """The one report of a command with several writes - the steps of `update`, the pages of `create`: what
+    was written or created, the write that stopped the command in the case write_outcome gave it (refused,
+    never sent, or in doubt), and what was never sent. Exit 4 once something was written, else the code of
+    the failure itself."""
+    create = kind == 'create'
+    outcome = failure.outcome or IN_DOUBT  # a failure that does not say what became of the write
+    nothing = 'nothing was made' if create else 'nothing changed'
+    if outcome == REFUSED_WRITE:
+        failed = f"Not {'created' if create else 'written'}: {label} ({failure.cause}): Notion refused it and {nothing}"
+        again = ('Rerun with only the pages that were not created' if create
+                 else 'Rerun only what was not written') + (' or not sent' if rest else '')
+    elif outcome == NOT_SENT:
+        failed = f'Not sent: {label} ({failure.cause}): the request never left this machine, so {nothing}'
+        again = 'Rerun with only the pages not sent' if create else 'Rerun only what was not sent'
+    else:
+        advice = (f'it may have been created and may still appear, so look for a page titled {label} in {where} '
+                  'before creating it again' if create
+                  else 'it may have been applied, so fetch the page and check it before running that part again')
+        failed = f'In doubt: {label} ({failure.cause}): {advice}'
+        again = ('Rerun with only the pages not sent' if create else 'Rerun only what was not sent') if rest else ''
+    head = ''
+    if done:
+        head = (f"done in part: created {len(done)} of {total}: {', '.join(done)}. " if create
+                else f"done in part on {where}: written: {'; '.join(done)}. ")
+    elif not rest:
+        again = ''
+    message = (head + failed + (f"; not sent: {(', ' if create else '; ').join(rest)}" if rest else '')
+               + (f"; edits that did not apply: {'; '.join(misses)}" if misses else '')
+               + (f'. {again}' if again else ''))
+    return Fail(PARTIAL if done else failure.code, message, outcome, failure.cause)
 
 
 def write_properties(client, page, properties, icon_text):
@@ -1300,8 +1409,10 @@ def cmd_create(client, args):
         drafts = [(args.set or [], read_file(args.body_file) if args.body_file else None, args.icon)]
     if kind == 'data_source':
         target, page_schema = {'data_source_id': parent['id']}, parent
+        where = f"data source {plain(parent.get('title')) or parent['id']} ({COLLECTION}{parent['id']})"
     else:
         target, page_schema = {'page_id': parent['id']}, client.schema_for({'parent': {}})
+        where = f"page {page_link(parent['id'])}"
     payloads = []
     for number, (assignments, content, icon) in enumerate(drafts, 1):
         try:
@@ -1324,28 +1435,19 @@ def cmd_create(client, args):
     created, seen = [], set()  # urls reported, and the ids of the pages this run created or found
     for number, (payload, title) in enumerate(payloads):
         try:
-            page = create_one(client, kind, parent, payload, title, started, seen)
+            page = create_one(client, kind, parent, payload, title, started, seen, where)
         except Fail as failure:
             if not created:
                 raise
             rest = [repr(t or '(untitled)') for _, t in payloads[number + 1:]]
-            name = repr(title or '(untitled)')
-            if isinstance(failure, CreateInDoubt):
-                failed = (f'In doubt: {name} ({failure.reason}): it may still appear, so look for it in Notion '
-                          'before creating it again')
-                again = 'Rerun with only the pages not sent' if rest else ''
-            else:
-                failed = f'Not created: {name} ({failure.message}): Notion refused it and nothing was made'
-                again = 'Rerun with only the pages that were not created' + (' or not sent' if rest else '')
-            raise Fail(PARTIAL, f"done in part: created {len(created)} of {len(payloads)}: {', '.join(created)}. "
-                                + failed + (f"; not sent: {', '.join(rest)}" if rest else '')
-                                + (f'. {again}' if again else ''))
+            raise report_writes('create', created, repr(title or '(untitled)'), failure, rest, total=len(payloads),
+                                where=where)
         seen.add(page.get('id'))
         created.append(page.get('url') or page.get('id', ''))
     return DONE
 
 
-def create_one(client, kind, parent, payload, title, started, seen=()):
+def create_one(client, kind, parent, payload, title, started, seen=(), where=''):
     try:
         page = client.call('POST', '/v1/pages', payload)
         note = ''
@@ -1353,10 +1455,10 @@ def create_one(client, kind, parent, payload, title, started, seen=()):
         try:
             page = find_created(client, kind, parent, title, started, doubt, seen)
         except ApiError as lookup:
-            raise CreateInDoubt(doubt.status, title, lookup)
+            raise CreateInDoubt(doubt, title, where, lookup)
         if page is None:
-            raise CreateInDoubt(doubt.status, title)
-        note = (f' (Notion answered {doubt.status}; not sent again: found by its title among the pages this '
+            raise CreateInDoubt(doubt, title, where)
+        note = (f' ({doubt.what}; not sent again: found by its title among the pages this '
                 'integration made since the minute the command started; check it is the new page)')
     client.say(f"created {page.get('url')} {client.key_of(page)}".rstrip() + note)
     return page
@@ -1978,13 +2080,18 @@ def cmd_upload(client, args):
         raise Fail(REFUSED, f'{path.name} has {size} bytes; one upload takes at most 20 MB '
                             '(larger files need the multi-part upload through `notion api`)')
     mime = mimetypes.guess_type(path.name)[0] or 'application/octet-stream'
-    created = client.call('POST', '/v1/file_uploads', {'filename': path.name, 'content_type': mime})
     boundary = uuid.uuid4().hex
     safe_name = path.name.replace('"', '')
     data = (f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{safe_name}"\r\n'
             f'Content-Type: {mime}\r\n\r\n').encode('utf-8') + path.read_bytes() + f'\r\n--{boundary}--\r\n'.encode('utf-8')
-    sent = client.call('POST', f"/v1/file_uploads/{created['id']}/send", raw=data,
-                       content_type=f'multipart/form-data; boundary={boundary}')
+    try:
+        created = client.call('POST', '/v1/file_uploads', {'filename': path.name, 'content_type': mime})
+        sent = client.call('POST', f"/v1/file_uploads/{created['id']}/send", raw=data,
+                           content_type=f'multipart/form-data; boundary={boundary}')
+    except ApiError as error:
+        if error.status == 400:
+            error.code = REFUSED  # the plan's Surface: a file the API refuses exits 1
+        raise
     reference = f"file-upload://{created['id']}"
     client.say(f"uploaded {path.name} ({sent.get('status', 'sent')}): attach it within one hour")
     if mime.startswith('image/'):
@@ -2275,10 +2382,17 @@ def cmd_api(client, args):
             status, answer = client.send(method, path, body, query)
             if not 200 <= status < 300:
                 client.say(json.dumps(answer, ensure_ascii=False, indent=2))
-                raise Fail(REFUSED, f'Notion answered {status} {answer.get("code", "")}')
+                outcome = write_outcome(status) if is_write(method, path) else None
+                cause = f'Notion answered {status} {answer.get("code", "")}'.strip()
+                raise Fail(REFUSED, with_words(cause, outcome), outcome, cause)
     except ApiError as error:
         client.say(json.dumps(error.body, ensure_ascii=False, indent=2))
-        raise Fail(REFUSED, f'Notion answered {error.status} {error.api_code}')
+        cause = f'Notion answered {error.status} {error.api_code}'.strip()
+        raise Fail(REFUSED, with_words(cause, error.outcome), error.outcome, cause)
+    except WriteInDoubt as doubt:
+        if doubt.body:
+            client.say(json.dumps(doubt.body, ensure_ascii=False, indent=2))
+        raise
     client.say(json.dumps(answer, ensure_ascii=False, indent=2))
     return DONE
 

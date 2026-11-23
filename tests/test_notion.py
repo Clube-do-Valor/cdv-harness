@@ -1151,6 +1151,184 @@ class CreateTest(ClientTestCase):
         self.assertIn("Never arrived", err)
 
 
+WRITE_OUTCOMES = {  # how a write's request ends -> which of the three cases the client must say it is
+    "400": "refused", "429": "refused", "500": "in doubt", "502": "in doubt", "503": "in doubt",
+    "504": "in doubt", "timeout": "in doubt", "reset": "in doubt", "unreachable": "not sent",
+}
+
+
+def ends_in(outcome):
+    """A fake answer for a write: a status, a timeout, a reset after the request left, or no connection."""
+    def handler(r):
+        if outcome == "timeout":
+            raise TimeoutError("timed out")
+        if outcome == "reset":
+            raise ConnectionResetError(104, "Connection reset by peer")
+        if outcome == "unreachable":
+            raise ConnectionRefusedError(111, "Connection refused")
+        status = int(outcome)
+        if status == 429:
+            return 429, {"object": "error", "status": 429, "code": "rate_limited", "message": "slow down"}, {"Retry-After": "0"}
+        return error(status, "synthetic_failure", "Synthetic failure.")
+    return handler
+
+
+class WriteOutcomeTest(ClientTestCase):
+    """One rule for every write that does not come back with a success: refused, not sent or in doubt."""
+
+    def assert_case(self, case, err):
+        if case == "refused":
+            self.assertRegex(err, r"Notion refused it and nothing (changed|was made)")
+            self.assertNotRegex(err, r"(?i)in doubt|may have been|never left")
+        elif case == "not sent":
+            self.assertRegex(err, r"the request never left this machine, so nothing (changed|was made)")
+            self.assertNotRegex(err, r"(?i)in doubt|may have been|refused it")
+        else:
+            self.assertRegex(err, r"(?i)\bin doubt\b")
+            self.assertRegex(err, r"may have been (applied|created)")
+            self.assertNotRegex(err, r"(?i)nothing changed|nothing was made|not written|not created|refused it|never left")
+
+    def test_every_write_verb_says_refused_not_sent_or_in_doubt(self):
+        self.settings(me="ana@example.com")
+        mine = {"object": "comment", "id": uid(0xCB), "discussion_id": uid(0xCA),
+                "created_by": {"object": "user", "id": BOT}, "rich_text": text("Mine")}
+        self.fake.comments[PAGE] = [mine]
+        shot = self.tmp / "screen.png"
+        shot.write_bytes(b"\x89PNG\r\n\x1a\nfake image")
+        pages = self.tmp / "pages.json"
+        pages.write_text(json.dumps([{"properties": {"Task name": "Outcome first"}},
+                                     {"properties": {"Task name": "Outcome second"}}]))
+        verbs = [  # name, arguments, the write that fails, its exit code on 400 (else 1)
+            ("update", ("update", PAGE, "--set", "Status=Rollout"), "PATCH", rf"/v1/pages/{PAGE}", 2),
+            ("create", ("create", "--parent", COLLECTION + DS_TASKS, "--set", "Task name=Outcome card"),
+             "POST", r"/v1/pages", 2),
+            ("create --pages-file", ("create", "--parent", COLLECTION + DS_TASKS, "--pages-file", pages),
+             "POST", r"/v1/pages", 4),
+            ("comments add", ("comments", "add", PAGE, "--body", "Ready"), "POST", r"/v1/comments", 2),
+            ("comments reply", ("comments", "reply", mine["discussion_id"], "--body", "Ready"), "POST", r"/v1/comments", 2),
+            ("comments edit", ("comments", "edit", mine["id"], "--body", "Changed"), "PATCH", rf"/v1/comments/{mine['id']}", 2),
+            ("upload", ("upload", shot), "POST", r"/v1/file_uploads", 1),
+            ("trash", ("trash", PAGE, "--confirm"), "PATCH", rf"/v1/pages/{PAGE}", 2),
+            ("api", ("api", "POST", "/v1/comments", "--data", json.dumps({"parent": {"page_id": PAGE}, "markdown": "x"})),
+             "POST", r"/v1/comments", 1),
+        ]
+        for name, args, method, path, on_400 in verbs:
+            for outcome, case in WRITE_OUTCOMES.items():
+                with self.subTest(verb=name, outcome=outcome):
+                    self.fake.overrides.clear()
+                    self.fake.calls.clear()
+                    failing = ends_in(outcome)
+                    sends = []
+
+                    def fail(r, name=name, failing=failing):
+                        sends.append(r)
+                        if name == "create --pages-file" and len(self.fake.sent("POST", r"/v1/pages")) == 1:
+                            return None  # the first page lands, the second fails
+                        return failing(r)
+
+                    self.fake.on(method, path, fail)
+                    code, out, err = self.run_cli(*args)
+                    expected = 4 if name == "create --pages-file" else (on_400 if outcome == "400" else 1)
+                    self.assertEqual(code, expected, err)
+                    self.assert_case(case, err)
+                    first = 1 if name == "create --pages-file" else 0
+                    self.assertEqual(len(sends), first + (6 if outcome == "429" else 1), "a write is never resent blindly")
+        for doc in ("SKILL.md", "references/api-limits.md"):
+            with self.subTest(doc=doc):
+                said = " ".join((SKILL_DIR / doc).read_text(encoding="utf-8").split())
+                for words in ("Notion refused it and nothing changed" if doc == "SKILL.md" else "refused",
+                              "never left", "in doubt", "any 5xx", "a timeout", "after the request left"):
+                    self.assertIn(words.casefold(), said.casefold())
+
+    def test_the_real_transport_tells_a_lost_connection_from_one_never_made(self):
+        import socket
+
+        def closes_after_reading():
+            listener = socket.socket()
+            listener.bind(("127.0.0.1", 0))
+            listener.listen(1)
+            self.addCleanup(listener.close)
+
+            def serve():
+                conn, _ = listener.accept()
+                conn.recv(65536)  # the request left and arrived; the server closes without answering
+                conn.close()
+            threading.Thread(target=serve, daemon=True).start()
+            return listener.getsockname()[1]
+
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        refused_port = closed.getsockname()[1]
+        closed.close()  # nobody listens there: the connection is refused before anything is sent
+        bypass = mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"})
+        bypass.start()
+        self.addCleanup(bypass.stop)
+        self.settings(me="ana@example.com")
+        for port, case in ((closes_after_reading(), "in doubt"), (refused_port, "not sent")):
+            with self.subTest(case=case):
+                local = f"http://127.0.0.1:{port}"
+
+                def transport(method, url, headers, body=None, timeout=None, local=local):
+                    if method == "POST" and urlsplit(url).path == "/v1/comments":
+                        return self.n.urllib_transport(method, url.replace(API, local), headers, body, 5)
+                    return self.fake(method, url, headers, body, timeout)
+
+                self.n.TRANSPORT = transport
+                code, out, err = self.run_cli("comments", "add", PAGE, "--body", "Ready")
+                self.assertEqual(code, 1, err)
+                self.assert_case(case, err)
+
+    def test_a_lost_connection_after_a_write_left_is_in_doubt(self):
+        note = self.tmp / "note.md"
+        note.write_text("Shipped.\n")
+
+        def applied_then_reset(r):
+            self.fake.patch_markdown(PAGE, r.json)
+            raise ConnectionResetError(104, "Connection reset by peer")
+
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", applied_then_reset)
+        code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--append-file", note)
+        self.assertEqual(code, 4, err)
+        self.assertIn("Shipped.", self.fake.markdown[PAGE])
+        self.assertEqual(len(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}/markdown")), 1)
+        self.assertRegex(err, r"written: properties Status\b")
+        self.assertIn("In doubt: body added at the end", err)
+        self.assertNotIn("Not written", err)
+        self.assertNotIn("nothing changed", err)
+
+        pages = self.tmp / "pages.json"
+        for landed in (True, False):
+            with self.subTest(second_page_landed=landed):
+                self.fake.overrides.clear()
+                self.fake.calls.clear()
+                title = f"Reset landed {landed}"
+                pages.write_text(json.dumps([{"properties": {"Task name": title}}] * 3))
+
+                def reset_on_second(r, landed=landed):
+                    if len(self.fake.sent("POST", r"/v1/pages")) != 2:
+                        return None
+                    if landed:
+                        self.fake.create_page(r.json)
+                    raise ConnectionResetError(104, "Connection reset by peer")
+
+                self.fake.on("POST", r"/v1/pages", reset_on_second)
+                code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--pages-file", pages)
+                made = [pg for pg in self.fake.pages.values() if self.fake.title_of(pg) == title]
+                self.assertNotIn("Not created", err)
+                self.assertNotIn("nothing was made", err)
+                if landed:  # found by its title, not sent again, and the third page goes on
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 3)
+                    self.assertEqual(len(made), 3)
+                    self.assertIn("found by its title", out)
+                else:
+                    self.assertEqual(code, 4, err)
+                    self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 2)
+                    self.assertEqual(len(made), 1)
+                    self.assertIn(f"In doubt: {title!r}", err)
+                    self.assertIn(f"not sent: {title!r}", err)
+
+
 class TransportTest(ClientTestCase):
     def test_429_waits_retry_after_then_succeeds(self):
         answers = [(429, {"object": "error", "status": 429, "code": "rate_limited", "message": "slow down"}, {"Retry-After": "2"}),
