@@ -9,7 +9,8 @@ from pathlib import Path
 
 import probe_hooks_headless as probe
 
-FAKE_CLAUDE = "#!{python}\nimport json, sys\nprint(json.dumps({{'argv': sys.argv[1:]}}))\n"
+FAKE_CLAUDE = ("#!{python}\nimport json, os, sys\n"
+               "print(json.dumps({{'argv': sys.argv[1:], 'memory': os.environ.get('CLAUDE_CODE_DISABLE_AUTO_MEMORY')}}))\n")
 
 
 class ProbeSessionTest(unittest.TestCase):
@@ -27,6 +28,8 @@ class ProbeSessionTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--setting-sources") + 1], "project,local")
         self.assertEqual(argv[-1], "--include-hook-events")
         self.assertEqual(argv.count("--setting-sources"), 1)
+        # Without it the CLI still makes the project's auto-memory folder under the config dir
+        self.assertEqual(events[0]["memory"], "1")
 
 
 if __name__ == "__main__":

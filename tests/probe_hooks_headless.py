@@ -158,13 +158,15 @@ def judge_card(events):
 
 def session(claude, repo, prompt, model, *flags):
     """One `claude -p` session in the consumer. It saves no session under the config dir (the probe
-    reads the stream and never resumes), and loads the consumer's settings only: a hook in the user's
-    own settings (a user-level card-check with the real client and token) cannot fire inside it."""
+    reads the stream and never resumes; auto-memory off, or the CLI still makes the project's memory
+    folder there), and loads the consumer's settings only: a hook in the user's own settings (a
+    user-level card-check with the real client and token) cannot fire inside it."""
     proc = subprocess.run(
         [claude, "-p", prompt, "--model", model, "--permission-mode", "bypassPermissions",
          "--output-format", "stream-json", "--verbose", "--max-turns", "4",
          "--no-session-persistence", "--setting-sources", "project,local", *flags],
         cwd=str(repo), capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL,
+        env=dict(os.environ, CLAUDE_CODE_DISABLE_AUTO_MEMORY="1"),
     )
     events = []
     for line in proc.stdout.splitlines():
