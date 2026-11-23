@@ -1006,6 +1006,75 @@ class CreateTest(ClientTestCase):
                     self.assertIn({"timestamp": "created_time", "created_time": {"on_or_after": "2026-11-22T09:30:00.000Z"}},
                                   lookups[-1]["filter"]["and"])
 
+    def test_pages_file_with_a_repeated_title_never_takes_a_page_of_this_run(self):
+        pages = self.tmp / "pages.json"
+        parents = ((COLLECTION + DS_TASKS, "Task name"), (page_url(PROJECT), "title"))
+
+        def titled(title):
+            return [pg for pg in self.fake.pages.values() if self.fake.title_of(pg) == title]
+
+        for parent, title_key in parents:
+            for status in (503, 504):
+                for repeats in (2, 3):
+                    title = f"Same {title_key} {status} x{repeats}"
+                    with self.subTest(parent=parent, status=status, repeats=repeats, landed=False):
+                        self.fake.overrides.clear()
+                        posts = []
+
+                        def doubt_on_second(r, status=status):
+                            posts.append(r)
+                            return error(status, "service_unavailable", "Try again later.") if len(posts) == 2 else None
+
+                        self.fake.on("POST", r"/v1/pages", doubt_on_second)
+                        pages.write_text(json.dumps([{"properties": {title_key: title}}] * repeats))
+                        code, out, err = self.run_cli("create", "--parent", parent, "--pages-file", pages)
+                        self.assertEqual(code, 4, out + err)
+                        self.assertEqual(len(posts), 2)  # the one in doubt is not sent again, the rest not at all
+                        created = titled(title)
+                        self.assertEqual(len(created), 1)
+                        self.assertEqual(out.count(created[0]["url"]), 1, out)
+                        self.assertEqual(err.count(created[0]["url"]), 1, err)
+                        self.assertIn(f"created 1 of {repeats}: " + created[0]["url"], err)
+                        self.assertIn(f"In doubt: {title!r}", err)
+                        self.assertNotIn("Not created", err)
+                        if repeats == 3:
+                            self.assertIn(f"not sent: {title!r}", err)
+
+                    title = f"Same {title_key} {status} landed x{repeats}"
+                    with self.subTest(parent=parent, status=status, repeats=repeats, landed=True):
+                        self.fake.overrides.clear()
+                        posts = []
+
+                        def lands_then_doubt(r, status=status):
+                            posts.append(r)
+                            if len(posts) == 2:
+                                self.fake.create_page(r.json)
+                                return error(status, "service_unavailable", "Try again later.")
+                            return None
+
+                        self.fake.on("POST", r"/v1/pages", lands_then_doubt)
+                        pages.write_text(json.dumps([{"properties": {title_key: title}}] * repeats))
+                        code, out, err = self.run_cli("create", "--parent", parent, "--pages-file", pages)
+                        self.assertEqual(code, 0, out + err)
+                        self.assertEqual(len(posts), repeats)
+                        created = titled(title)
+                        self.assertEqual(len(created), repeats)
+                        lines = [line for line in out.splitlines() if line.startswith("created ")]
+                        self.assertEqual(len(lines), repeats)
+                        for page, line in zip(created, lines):
+                            self.assertEqual(out.count(page["url"]), 1, out)
+                            self.assertTrue(line.startswith("created " + page["url"]), line)
+                        self.assertIn(str(status), lines[1])
+
+        self.fake.overrides.clear()
+        self.fake.on("POST", r"/v1/pages", lambda r: error(503, "service_unavailable", "Try again later."))
+        pages.write_text(json.dumps([{"properties": {"Task name": "Same first"}}] * 2))
+        self.fake.calls.clear()
+        code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--pages-file", pages)
+        self.assertEqual(code, 1, out + err)  # the first page in doubt: what a single page gives
+        self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+        self.assertNotIn("created ", out)
+
     def test_create_after_timeout_without_page_exits_1_sent_once(self):
         def timeout(r):
             raise TimeoutError("timed out")

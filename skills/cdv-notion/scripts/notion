@@ -104,6 +104,20 @@ class WriteInDoubt(Fail):
                                   'read the object back before sending it again')
 
 
+class CreateInDoubt(Fail):
+    """A create that ended in doubt and whose page was not found afterwards: it was not sent again."""
+
+    def __init__(self, status, title, lookup=None):
+        if lookup is not None:
+            self.reason = (f'Notion answered {status} to the create of {title!r}, and looking for the page failed '
+                           f'({lookup.message}); it was not sent again')
+        else:
+            self.reason = (f'Notion answered {status} to the create of {title!r} and no page with that title, besides '
+                           'the ones this command already reported, was found from this integration since the minute '
+                           'the command started; it was not sent again')
+        super().__init__(REFUSED, self.reason + '. Run the command again')
+
+
 # ---------------------------------------------------------------------------------------------
 # The machine: transport, token, settings, cache. Tests replace TRANSPORT, SLEEP, secret_tool,
 # git_email, STDIN_IS_TTY, GETPASS and NOW.
@@ -1291,40 +1305,50 @@ def cmd_create(client, args):
             if page_schema['properties'][name].get('type') == 'title':
                 title = ''.join(part['text']['content'] for part in value['title'])
         payloads.append((payload, title))
-    created = []
+    created, seen = [], set()  # urls reported, and the ids of the pages this run created or found
     for number, (payload, title) in enumerate(payloads):
         try:
-            page = create_one(client, kind, parent, payload, title, started)
+            page = create_one(client, kind, parent, payload, title, started, seen)
         except Fail as failure:
             if not created:
                 raise
             rest = [repr(t or '(untitled)') for _, t in payloads[number + 1:]]
+            name = repr(title or '(untitled)')
+            if isinstance(failure, CreateInDoubt):
+                failed = (f'In doubt: {name} ({failure.reason}): it may still appear, so look for it in Notion '
+                          'before creating it again')
+                again = 'Rerun with only the pages not sent' if rest else ''
+            else:
+                failed = f'Not created: {name} ({failure.message}): Notion refused it and nothing was made'
+                again = 'Rerun with only the pages that were not created' + (' or not sent' if rest else '')
             raise Fail(PARTIAL, f"done in part: created {len(created)} of {len(payloads)}: {', '.join(created)}. "
-                                f"Not created: {title or '(untitled)'!r} ({failure.message})"
-                       + (f"; not sent: {', '.join(rest)}" if rest else '')
-                       + '. Rerun with only the pages that were not created')
+                                + failed + (f"; not sent: {', '.join(rest)}" if rest else '')
+                                + (f'. {again}' if again else ''))
+        seen.add(page.get('id'))
         created.append(page.get('url') or page.get('id', ''))
     return DONE
 
 
-def create_one(client, kind, parent, payload, title, started):
+def create_one(client, kind, parent, payload, title, started, seen=()):
     try:
         page = client.call('POST', '/v1/pages', payload)
         note = ''
     except WriteInDoubt as doubt:
-        page = find_created(client, kind, parent, title, started, doubt)
+        try:
+            page = find_created(client, kind, parent, title, started, doubt, seen)
+        except ApiError as lookup:
+            raise CreateInDoubt(doubt.status, title, lookup)
         if page is None:
-            raise Fail(REFUSED, f'Notion answered {doubt.status} to the create of {title!r} and no page with that title '
-                                'was created by this integration since the command started; nothing was sent '
-                                'again. Run the command again')
+            raise CreateInDoubt(doubt.status, title)
         note = f' (Notion answered {doubt.status}, but the page was created; not sent again)'
     client.say(f"created {page.get('url')} {client.key_of(page)}".rstrip() + note)
     return page
 
 
-def find_created(client, kind, parent, title, started, doubt):
+def find_created(client, kind, parent, title, started, doubt, seen=()):
+    """The page a create in doubt may have made: never one this run already created or found (`seen`)."""
     committed = (doubt.body.get('additional_data') or {}).get('committed_resource_id')
-    if committed:
+    if committed and committed not in seen:
         try:
             return client.call('GET', f'/v1/pages/{committed}')
         except ApiError:
@@ -1345,6 +1369,8 @@ def find_created(client, kind, parent, title, started, doubt):
             if p.get('parent', {}).get('page_id') == parent['id']]
     # The filter is not trusted alone: each candidate is checked here too, its creator and its time.
     for candidate in candidates:
+        if candidate.get('id') in seen:
+            continue  # a page this run created or already took for another create in doubt
         if ((candidate.get('created_by') or {}).get('id') == bot and client.title_of(candidate) == title
                 and created_at_or_after(candidate, started)):
             return candidate
