@@ -232,6 +232,19 @@ class UserHookTest(HarnessTestCase):
         self.assertEqual((self.config / "settings.json").read_text(), "{ not json")
         self.assertEqual(sorted(p.name for p in self.config.iterdir()), ["settings.json"])
 
+    def test_wrong_shaped_hooks_exit_1_and_nothing_is_written(self):
+        for text, said in (('{"hooks": {"PostToolUse": "x"}}', "hooks.PostToolUse must be a list"),
+                           ('{"hooks": []}', "hooks must be an object")):
+            with self.subTest(settings=text):
+                self.write_settings(text)
+                result = self.sync_user()
+                self.assertEqual(result.returncode, 1)
+                self.assertIn(said, result.stderr)
+                self.assertEqual((self.config / "settings.json").read_text(), text)
+                self.assertEqual(sorted(p.name for p in self.config.iterdir()), ["settings.json"])
+        self.write_settings("{}")
+        self.assertEqual(self.sync_user().returncode, 0)
+
     def test_config_dir_from_the_flag_the_variable_or_home(self):
         flag, variable = self.tmp / "x", self.tmp / "y"
         self.assertEqual(self.sync_user("v0.1.0", "--config-dir", str(flag)).returncode, 0)

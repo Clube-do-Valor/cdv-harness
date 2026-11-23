@@ -1041,6 +1041,14 @@ def sync_user(tag, from_=None, source=None, config_dir=None):
         hook_files = [f"hooks/{name}" for name in hook_names]
         if hook_files and tree.has("hooks/harness_hook.py"):
             hook_files.append("hooks/harness_hook.py")
+        # The settings are merged before anything is removed or written: a `hooks` of the wrong shape
+        # fails here, with the config dir as it was.
+        merged_settings = None
+        if settings is not None or any(hook_entries.values()):
+            merged_settings = copy.deepcopy(settings) if settings is not None else {}
+            merge_hooks(merged_settings, hook_entries, previous_hooks_of(previous), str(settings_path))
+            if settings is not None and json.dumps(merged_settings, sort_keys=True) == json.dumps(settings, sort_keys=True):
+                merged_settings = None
         refused = []
         targets = [(f"skills/{name}", config / "skills" / name) for name in user_skills]
         if hook_files:
@@ -1070,13 +1078,8 @@ def sync_user(tag, from_=None, source=None, config_dir=None):
             data = blobs[path]
             write_file(config / "harness" / path, data, tree.entries[path][0] == "100755")
             files[f"harness/{path}"] = sha256_bytes(data)
-        previous_entries = previous_hooks_of(previous)
-        if settings is not None or any(hook_entries.values()):
-            data = settings if settings is not None else {}
-            before = json.dumps(data, sort_keys=True)
-            merge_hooks(data, hook_entries, previous_entries, str(settings_path))
-            if settings is None or json.dumps(data, sort_keys=True) != before:
-                write_file(settings_path, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
+        if merged_settings is not None:
+            write_file(settings_path, (json.dumps(merged_settings, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
         paths = [f"skills/{name}" for name in user_skills] + (["harness/hooks"] if hook_files else [])
         write_file(
             lock_path,
