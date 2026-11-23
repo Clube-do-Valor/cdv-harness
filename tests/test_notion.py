@@ -1873,6 +1873,20 @@ class FilesTest(ClientTestCase):
         code, out, err = self.run_cli("download", url, "-o", out_dir)
         self.assertEqual(code, 0, err)
 
+    def test_download_never_replaces_a_file_of_the_same_name(self):
+        url = "https://files.example.com/signed/README.md?X-Signature=abc"
+        self.fake.files[url] = b"bytes from the attachment"
+        out_dir = self.tmp / "work"
+        out_dir.mkdir()
+        (out_dir / "README.md").write_text("my local work")
+        for wanted in ("README (1).md", "README (2).md"):
+            with self.subTest(wanted=wanted):
+                code, out, err = self.run_cli("download", url, "-o", out_dir)
+                self.assertEqual(code, 0, err)
+                self.assertEqual((out_dir / "README.md").read_text(), "my local work")
+                self.assertEqual((out_dir / wanted).read_bytes(), b"bytes from the attachment")
+                self.assertIn(str(out_dir / wanted), out)
+
 
 class PeopleTest(ClientTestCase):
     def test_users_find_includes_people_seen_in_rows(self):

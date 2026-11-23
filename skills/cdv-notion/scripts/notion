@@ -2237,9 +2237,16 @@ def cmd_download(client, args):
         raise Fail(REFUSED, f'the file host answered {status} for {name} (signed urls expire after an hour: fetch the page again)')
     folder = Path(args.output or '.')
     folder.mkdir(parents=True, exist_ok=True)
-    saved = folder / name
-    saved.write_bytes(data)
-    client.say(str(saved.resolve()))
+    path, number = folder / name, 0
+    while True:  # never replace a file that is already there: 'xb' fails instead of clobbering, then the next name
+        try:
+            with open(path, 'xb') as saved:
+                saved.write(data)
+            break
+        except FileExistsError:
+            number += 1
+            path = folder / f'{Path(name).stem} ({number}){Path(name).suffix}'
+    client.say(str(path.resolve()))
     return DONE
 
 
