@@ -2,9 +2,12 @@
 """PostToolUse and PostToolUseFailure hook: a Notion card written in this session is checked against
 the card contract before the agent's next step.
 
-It fires after every `Bash` call and every connector page write. When the call wrote a page - the
-cdv-notion client's `update <ref>` or `create` (a failed call only when it exited 4, done in part),
-or the connector's `notion-update-page` or `notion-create-pages` under any server prefix - it runs
+It fires after every `Bash` call and every connector page write. When the call wrote a page - a
+command that names the cdv-notion client and whose output holds the client's own write lines
+(`updated <url>`, `created <url> <key>`), whatever the shell shape; with no such line, the client's
+`update <ref>` in the command as far as it parses (a failed call checks the pages its output shows
+as written, and on exit 4, done in part, also the page of the command); or the connector's
+`notion-update-page` or `notion-create-pages` under any server prefix - it runs
 `card_contract.py check <ref>` (with `--body-replaced` after a whole-body replace) and, on findings,
 exits 2 with them on stderr, which the host shows the model beside the tool result. A client
 `fetch` pins the request zone from its own output, with no call to Notion.
@@ -83,72 +86,124 @@ def shown(ref):
 # ---------------------------------------------------------------------------------------------
 
 
-def simple_commands(command):
-    """The simple commands of a command line, quoted words kept whole (`--set 'Status=In progress'`)."""
-    try:
-        words = h._lex(command)
-    except ValueError:
-        return []
+# The command names the client: a word `notion`, or a path ending in `/notion` (`N=<path>/notion`).
+NAMES_CLIENT = re.compile(r"(?:^|[\s/'\"=;&|(`])notion(?=$|[\s'\";&|)`])")
+# The lines the client prints for a write, on stdout: `updated <url>` and `created <url> <key>`.
+WRITE_LINE = re.compile(r"^\s*(updated|created) (https?://\S+)")
+# A done-in-part update names its page: `done in part on <url>: written: ...`.
+PARTIAL_ON = re.compile(r"done in part on (https?://\S+?):(?:\s|$)")
+SHELLS = {"bash", "sh", "zsh", "dash"}
+# Words before the program that only change how it runs.
+WRAPPERS = {"do", "then", "else", "time", "exec", "command", "nohup", "!"}
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def simple_commands(command, depth=0):
+    """The simple commands of a command line, quoted words kept whole (`--set 'Status=In progress'`),
+    in order, the command string of a `bash -c` opened up after the command that runs it. A command
+    the shell splitter cannot parse is split at whitespace and operators (harness_hook.lex)."""
     out, current = [], []
-    for word in words:
-        if word in h.OPERATORS or set(word) <= set(";&|()"):
+    for word in h.lex(command) + [";"]:
+        if word in h.OPERATORS or (word and set(word) <= set(";&|()")):
             if current:
                 out.append(current)
+                words = h.command_words(current)
+                if depth < 3 and words and os.path.basename(words[0]) in SHELLS:
+                    for index in range(1, len(words) - 1):
+                        if re.fullmatch(r"-[a-z]*c", words[index]):
+                            out += simple_commands(words[index + 1], depth + 1)
+                            break
             current = []
         else:
             current.append(word)
-    if current:
-        out.append(current)
     return out
 
 
+def program(words):
+    """The words from the program on: `env` with its options and assignments, `timeout <n>`, `nice`
+    and the other wrappers skipped, and `python3 <client>` read as the client."""
+    index = 0
+    while index < len(words):
+        word, base = words[index], os.path.basename(words[index])
+        if word in WRAPPERS or ASSIGNMENT.match(word):
+            index += 1
+        elif base in ("env", "nice", "timeout"):
+            index += 1
+            while index < len(words) and words[index].startswith("-"):  # env's VAR= words: the loop above
+                takes_value = words[index] in ("-u", "-n", "-s", "-k", "--signal", "--kill-after", "--unset", "--adjustment")
+                index += 2 if takes_value else 1
+            if base == "timeout" and index < len(words):
+                index += 1  # the duration
+        else:
+            break
+    words = words[index:]
+    if words and os.path.basename(words[0]).startswith("python") and len(words) > 1:
+        words = words[1:]
+    return words
+
+
 def client_calls(command):
-    """(verb, arguments) of each simple command that runs the cdv-notion client."""
-    found = []
+    """(verb, arguments) of each simple command that runs the cdv-notion client, in order. The client
+    held in a variable assigned earlier in the same command (`N=<path>; $N update ...`) is the client."""
+    found, assigned = [], {}
     for segment in simple_commands(command):
-        words = h.command_words(segment)
-        if words and os.path.basename(words[0]).startswith("python") and len(words) > 1:
-            words = words[1:]
+        if not h.command_words(segment):
+            assigned.update(word.split("=", 1) for word in segment)
+            continue
+        words = program(segment)
+        if words:
+            variable = re.fullmatch(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", words[0])
+            if variable and variable.group(1) in assigned:
+                words = [assigned[variable.group(1)]] + words[1:]
         if len(words) >= 2 and os.path.basename(words[0]) == "notion":
             found.append((words[1], words[2:]))
     return found
 
 
 def update_ref(arguments):
+    """The page an `update` names; None when it names none or only a variable (`$k`)."""
     index = 0
     while index < len(arguments):
         word = arguments[index]
         if word.startswith("--"):
             index += 1 + (0 if "=" in word else VALUE_FLAGS.get(word, 0))
             continue
-        return word
+        return None if word[:1] in "$<>&|" else word
     return None
 
 
-def created_urls(output):
-    urls = []
-    for line in output.splitlines():
-        if re.search(r"\bcreated\b", line):
-            after = line[re.search(r"\bcreated\b", line).end():]
-            for cut in ("Not created", "In doubt", "not sent"):
-                after = after.split(cut, 1)[0]
-            urls += [u.rstrip(".;:") for u in URL.findall(after)]
-    return urls
+def written_lines(output):
+    """[(verb, url)] of the client's write lines in the call's output."""
+    found = []
+    for line in (output or "").splitlines():
+        match = WRITE_LINE.match(line)
+        if match:
+            found.append((match.group(1), match.group(2).rstrip(".;:,")))
+    return found
 
 
-def bash_targets(command, output):
-    """[(ref, body replaced)] of the pages the client wrote, and whether it fetched a page."""
-    targets, fetched = [], False
-    for verb, arguments in client_calls(command):
-        if verb == "update":
-            ref = update_ref(arguments)
-            if ref:
-                targets.append((ref, "--replace-file" in arguments or any(a.startswith("--replace-file=") for a in arguments)))
-        elif verb == "create":
-            targets += [(url, False) for url in created_urls(output)]
-        elif verb == "fetch":
-            fetched = True
-    return targets, fetched
+def bash_targets(command, output, code):
+    """[(ref, body replaced)] of the pages the client wrote, and whether it fetched a page.
+
+    The pages are the client's own write lines in the output, whatever the shell shape; when the
+    output holds none, the client's `update` in the command, as far as it can be parsed. A call
+    that exited 4 (done in part) also checks the page of the command. When the command's updates
+    and the output's `updated` lines are as many, each page is named by the command's ref (its key)."""
+    replaced = bool(re.search(r"--replace-file\b", command))
+    calls = client_calls(command)
+    refs = [ref for verb, arguments in calls if verb == "update" for ref in [update_ref(arguments)] if ref]
+    lines = written_lines(output)
+    updated = [url for verb, url in lines if verb == "updated"]
+    if lines:
+        named = iter(refs if len(refs) == len(updated) else updated)
+        pages = [next(named) if verb == "updated" else url for verb, url in lines]
+    else:
+        pages = list(refs) if code == 0 else []
+    if code == 4:
+        partial = [m.group(1) for m in PARTIAL_ON.finditer(output or "")]
+        pages += partial or ([] if updated else refs)
+    fetched = any(verb == "fetch" for verb, _ in calls)
+    return [(page, replaced) for page in pages], fetched
 
 
 def connector_targets(tool, tool_input, response):
@@ -176,14 +231,15 @@ def connector_targets(tool, tool_input, response):
 
 
 def output_of(event):
-    """(exit code or None, the text the call printed)."""
+    """(exit code or None, the text the call printed): on PostToolUse the call's stdout, after a
+    failure the host's `error` text, which starts `Exit code <n>`."""
     if "error" in event and event.get("hook_event_name") != "PostToolUse":
         error = str(event.get("error") or "")
         match = re.match(r"\s*Exit code (\d+)", error)
         return (int(match.group(1)) if match else None), error
     response = event.get("tool_response")
     if isinstance(response, dict):
-        return 0, "\n".join(str(response.get(k) or "") for k in ("stdout", "stderr"))
+        return 0, str(response.get("stdout") or "")
     return 0, str(response or "")
 
 
@@ -254,11 +310,9 @@ def main():
     fetched = False
     if tool == "Bash":
         command = tool_input.get("command")
-        if not isinstance(command, str) or "notion" not in command:
+        if not isinstance(command, str) or not NAMES_CLIENT.search(command):
             return SILENT, ""
-        if code not in (0, 4):
-            return SILENT, ""
-        targets, fetched = bash_targets(command, output)
+        targets, fetched = bash_targets(command, output, code)
         fetched = fetched and code == 0
     elif CONNECTOR.match(tool):
         if code != 0:

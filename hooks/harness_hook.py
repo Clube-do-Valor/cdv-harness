@@ -117,13 +117,20 @@ def _lex(command):
     return list(lexer)
 
 
+def lex(command):
+    """The words of a shell command with operators as their own tokens, quoted words kept whole. A
+    command shlex cannot split (an unbalanced quote, an apostrophe in a heredoc body) is split at
+    whitespace and operators instead."""
+    try:
+        return _lex(command)
+    except ValueError:
+        return re.findall(r"[;&|()]+|[^\s;&|()]+", command)
+
+
 def tokens(command, depth=0):
     """The words of a shell command with operators as their own tokens. A quoted word that holds a
     command of its own (`bash -c "..."`) is opened up, so what it runs is seen too."""
-    try:
-        words = _lex(command)
-    except ValueError:
-        words = re.findall(r"[;&|()]+|[^\s;&|()]+", command)
+    words = lex(command)
     out = []
     for word in words:
         if depth < 3 and re.search(r"\s", word):

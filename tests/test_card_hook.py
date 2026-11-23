@@ -119,6 +119,51 @@ class CardHookTest(HookCase):
         self.assertSays(self.hook(spaced), cf.key(1))
         self.assertTrue(bad)
 
+    def test_a_client_write_is_found_in_any_shell_shape(self):
+        first = self.add(cf.task(1, ""))
+        second = self.add(cf.task(2, ""))
+        theirs = self.add(cf.task(3, "", assignee=(BRUNO,)))
+        one, two = cf.key(1), cf.key(2)
+        printed = f"updated {first['url']}\n"
+        shapes = {
+            "variable": f"N={CLIENT_CMD}; $N update {one} --set 'Status=Done'",
+            "bash -c": f"bash -c \"{CLIENT_CMD} update {one} --set 'Status=Done'\"",
+            "timeout": f"timeout 60 {CLIENT_CMD} update {one} --set 'Status=Done'",
+            "timeout with options": f"timeout -k 5 60 {CLIENT_CMD} update {one} --set 'Status=Done'",
+            "env": f"env X=1 {CLIENT_CMD} update {one} --set 'Status=Done'",
+            "loop body": f"for i in 1; do {CLIENT_CMD} update {one} --set 'Status=Done'; done",
+        }
+        def bash(command, stdout=""):  # a session of its own: page 1 is written more than 3 times here
+            return self.bash(command, stdout=stdout, session="s-" + uuid.uuid4().hex[:8])
+
+        for name, command in shapes.items():
+            with self.subTest(shape=name, output="the client's line"):
+                self.assertSays(self.hook(bash(command, stdout=printed)), "request-zone:")
+            with self.subTest(shape=name, output="none"):
+                self.assertSays(self.hook(bash(command + " > /dev/null")), "request-zone:")
+        loop = bash(f"for k in {one} {two}; do {CLIENT_CMD} update $k --set 'Status=Done'; done",
+                    stdout=printed + f"updated {second['url']}\n")
+        proc = self.hook(loop)
+        self.assertSays(proc, first["url"], second["url"])
+        self.assertEqual(proc.stderr.count("request-zone:"), 2)
+        single = bash(f"for k in {one}; do {CLIENT_CMD} update $k --set 'Status=Done'; done", stdout=printed)
+        self.assertSays(self.hook(single), first["url"], "request-zone:")
+        heredoc = bash(f"cat > b.md <<'EOF'\nIt's the card.\nEOF\n{CLIENT_CMD} update {cf.key(3)} --replace-file b.md",
+                       stdout=f"updated {theirs['url']}\n")
+        self.assertSays(self.hook(heredoc), "request-zone:")
+        quiet = bash(f"{CLIENT_CMD} update {one} --set 'Status=Done' > /dev/null")
+        self.assertSays(self.hook(quiet), one, "request-zone:")
+        # On PostToolUse the output is the call's stdout: a write line on stderr is not the client's
+        on_stderr = self.event("Bash", {"command": f"{CLIENT_CMD} create --parent Tasks --set 'Task name=y' > /dev/null"},
+                               {"stdout": "", "stderr": f"created {second['url']} {two}\n", "interrupted": False,
+                                "isImage": False}, session="s-" + uuid.uuid4().hex[:8])
+        self.assertSilent(self.hook(on_stderr))
+        self.clear_calls()
+        self.assertSilent(self.hook(bash("cat notes.txt", stdout=printed)))
+        self.assertSilent(self.hook(bash("cat notion-log.txt", stdout=printed)))
+        self.assertSilent(self.hook(bash(f"echo notion update {one}", stdout=f"notion update {one}\n")))
+        self.assertEqual(self.calls(), [])
+
     def test_a_failed_client_call_is_checked_only_on_exit_4(self):
         self.add(cf.task(1, ""))
         command = {"command": f"{CLIENT_CMD} update {cf.key(1)} --set 'Status=Done' --append-file f.md"}
@@ -129,6 +174,16 @@ class CardHookTest(HookCase):
             with self.subTest(code=code):
                 self.assertSilent(self.hook(self.event("Bash", command, error=f"Exit code {code}\nrefused")))
         self.assertEqual(self.calls(), [])
+
+    def test_a_failed_call_checks_the_pages_its_output_shows_as_written(self):
+        first = self.add(cf.task(1, ""))
+        self.add(cf.task(2, ""))
+        both = {"command": f"{CLIENT_CMD} update {cf.key(1)} --set 'Status=Done' && "
+                           f"{CLIENT_CMD} update {cf.key(2)} --set 'Status=Nope'"}
+        proc = self.hook(self.event("Bash", both, error=f"Exit code 1\nupdated {first['url']}\nStatus has no option Nope"))
+        self.assertSays(proc, first["url"], "request-zone:")
+        self.assertNotIn(cf.key(2), proc.stderr)
+        self.assertEqual(proc.stderr.count("request-zone:"), 1)
 
     def test_connector_page_writes_are_checked_under_any_server_prefix(self):
         bad = self.add(cf.task(1, ""))
