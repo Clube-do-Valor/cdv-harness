@@ -208,4 +208,6 @@ request toggle of a project) as a digest under the client's cache directory, nev
 change is the finding `request-changed`: the zone is restored, not rewritten, unless who asked
 changed it, and then `card_contract.py accept-request <ref>` pins the new text. The digest is taken
 over the words of the request, with only their formatting dropped (bold, italics, colour): the text
-inside a code fence, the target of every link and mention and the day of a date are kept.
+inside a code fence, the target of every link and mention and the day of a date are kept. Of a picture
+or a file it keeps the caption and the address without its query string, whose signed part changes at
+every read.

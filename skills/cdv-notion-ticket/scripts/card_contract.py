@@ -162,7 +162,9 @@ REQUEST_TOKEN = re.compile(
     + r"|(?P<tag><(?P<closing>/?)(?P<name>[A-Za-z][\w-]*)"
       r"(?P<attributes>(?:\s+[\w:-]+(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'<>=`]+))?)*)\s*/?>)"
     + r"|(?P<bare>https?://[^\s<>\[\]()\\*`]*[^\s<>\[\]()\\*`_~])"
+    + r"|(?P<open>!?\[)"
     + r"|\]\((?P<address>(?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*\))*)(?P<rest>(?:\s+(?:\"[^\"]*\"|'[^']*'))?)\)"
+    + r"|(?P<close>\])"
 )
 ATTRIBUTE = re.compile(r"([\w:-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'<>=`]+))")
 # Tags that only format the words inside them; tags that lay blocks out, read as a space; and tags that
@@ -171,6 +173,7 @@ FORMAT_TAGS = {"b", "strong", "i", "em", "s", "del", "strike", "u", "ins", "span
 BLOCK_TAGS = {"p", "br", "empty-block", "callout", "toggle", "quote", "columns", "column", "table", "thead", "tbody",
               "colgroup", "col", "tr", "page", "database", "bookmark", "embed", "unknown", "file", "pdf", "audio",
               "video", "image", "img"}
+FILE_TAGS, PLAYED_TAGS = {"file", "pdf", "image", "img"}, {"audio", "video"}
 CELL_TAGS = {"td", "th"}
 WORD_TAGS = {"a", "mention", "date"}
 TARGET_ATTRIBUTES = {"url", "href", "source", "src"}
@@ -184,6 +187,17 @@ EMPHASIS = [re.compile(pattern) for pattern in (
 def address_of(text):
     """The address a link or a tag holds, escapes undone."""
     return html.unescape(ESCAPE.sub(r"\1", text))
+
+
+def unsigned(address):
+    """The address of a picture or a file without its query string: the signed part changes at every read."""
+    return re.sub(r"\?[^#]*", "", address, count=1)
+
+
+def is_file(name, address):
+    """True for the tag of a picture or a file; a video or an audio whose address names no file (a
+    player's page) is a link, and its query string says which one it is."""
+    return name in FILE_TAGS or (name in PLAYED_TAGS and re.search(r"\.\w{2,5}$", re.split(r"[?#]", address)[0]))
 
 
 def tag_words(match):
@@ -200,7 +214,7 @@ def tag_words(match):
     for key, *values in ATTRIBUTE.findall(match.group("attributes")):
         key, value = key.lower().replace("_", "-"), address_of("".join(values))
         if key in TARGET_ATTRIBUTES:
-            said.append(f"<{value}>")
+            said.append(f"<{unsigned(value) if is_file(name, value) else value}>")
         elif key in CAPTION_ATTRIBUTES or (name == "date" and key in DATE_ATTRIBUTES):
             said.append(f"<{key}={value}>")
     space = " " if name in BLOCK_TAGS else ""
@@ -210,8 +224,8 @@ def tag_words(match):
 def request_words(line):
     """The words of one line of the request with only their formatting dropped (bold, italics, colour,
     inline code marks, escapes): the target of every link and mention, the days and hours of a date and
-    the text of inline code stay. `plain`, which labels and titles are compared with, drops every tag."""
-    kept, out, last = [], [], 0
+    the text of inline code stay, and of a picture or a file its caption and its unsigned address. `plain`, which labels and titles are compared with, drops every tag."""
+    kept, out, last, brackets = [], [], 0, []
 
     def hold(text):
         kept.append(text)
@@ -229,8 +243,16 @@ def request_words(line):
             out.append(hold(said) if said.strip() else said)
         elif match.group("bare"):
             out.append(hold(address_of(match.group("bare"))))
+        elif match.group("open"):
+            brackets.append(match.group("open"))
+            out.append(match.group("open"))
         else:
-            out.append("]" + hold(f"({address_of(match.group('address'))}){match.group('rest')}"))
+            opened = brackets.pop() if brackets else ""
+            if match.group("close"):
+                out.append("]")
+                continue
+            address = address_of(match.group("address"))
+            out.append("]" + hold(f"({unsigned(address) if opened == '![' else address}){match.group('rest')}"))
     text = "".join(out) + line[last:]
     for pattern in EMPHASIS:
         text = pattern.sub(r"\1", text)

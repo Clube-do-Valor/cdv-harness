@@ -545,6 +545,38 @@ class RequestPinTest(CardCase):
         page = self.add(cf.task(9, "## Pedido\n\nO pedido.\n\n" + entrega().replace("**Objetivo:**", '<a href="https://x">**Objetivo:**</a>')))
         self.assertClean(page)  # labels are compared as plain text, every tag dropped
 
+    def test_a_picture_or_file_read_again_with_another_signature_is_the_same_request(self):
+        signed = "https://files.example.com/space/tela.png?X-Sig=111&X-Date=1"
+        again = "https://files.example.com/space/tela.png?X-Sig=222&amp;X-Date=2"
+        held = {
+            "a picture": "![tela do boleto]({})",
+            "a picture with no caption": "![]({})",
+            "a picture with a title": '![tela]({} "Tela")',
+            "a picture in a list": "- veja ![tela]({}) aqui",
+            "brackets in the caption": "![tela \\[1\\] do [boleto]]({})",
+            "a picture inside a link": "[![tela]({})](https://example.com/y?id=1)",
+            "a picture tag": '<image source="{}">tela</image>',
+            "an img tag": '<img src="{}" alt="tela" />',
+            "a file": '<file source="{}">tela.png</file>',
+            "a pdf": '<pdf source="{}">tela</pdf>',
+            "an audio": '<audio source="{}">tela</audio>',
+            "a video": '<video source="{}">tela</video>',
+        }
+        self.assertRequest([(name, text.format(signed), text.format(again)) for name, text in held.items()], [])
+        self.assertRequest([(name + ", another address", text.format(signed), text.format(signed.replace("tela.png", "nota.png")))
+                            for name, text in held.items()], ["request-changed"])
+        self.assertRequest([
+            ("the caption", f"![tela do boleto]({signed})", f"![tela do extrato]({signed})"),
+            ("the caption of a file", f'<file source="{signed}">boleto</file>', f'<file source="{signed}">extrato</file>'),
+            ("the link around a picture", f"[![tela]({signed})](https://example.com/y?id=1)", f"[![tela]({signed})](https://example.com/y?id=2)"),
+            ("a link after a picture", f"![tela]({signed}) [x](https://example.com/y?id=1)", f"![tela]({signed}) [x](https://example.com/y?id=2)"),
+            ("a link after a loose mark", "ok![ e [x](https://example.com/y?id=1)", "ok![ e [x](https://example.com/y?id=2)"),
+            ("the page of a pdf", f'<pdf source="{signed}#page=2">x</pdf>', f'<pdf source="{signed}#page=3">x</pdf>'),
+            ("a video on a player's page", '<video source="https://video.example.com/watch?v=1">x</video>',
+             '<video source="https://video.example.com/watch?v=2">x</video>'),
+            ("a picture taken out", f"antes ![tela]({signed})", "antes"),
+        ], ["request-changed"])
+
 
 class FailureTest(CardCase):
     def test_no_token_exits_3_and_an_unreadable_page_exits_4_with_the_client_message(self):
