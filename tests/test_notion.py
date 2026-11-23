@@ -20,7 +20,6 @@ import sys
 import tempfile
 import threading
 import unittest
-import urllib.request
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -1075,7 +1074,10 @@ class RedirectTest(ClientTestCase):
 
         api_host, api_seen = self.serve(api)
         self.n.API_HOST, self.n.API_ROOT = api_host, f"http://{api_host}"
-        self.n._OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), self.n.SameHostRedirects())
+        # The module's own _OPENER, untouched: only the environment keeps a proxy away from 127.0.0.1.
+        bypass = mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"})
+        bypass.start()
+        self.addCleanup(bypass.stop)
         self.n.TRANSPORT = self.n.urllib_transport
         code, out, err = self.run_cli("api", "GET", "/v1/users/me")
         self.assertEqual(code, 0, err)
