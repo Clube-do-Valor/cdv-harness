@@ -272,19 +272,28 @@ def cache_dir():
     return home() / '.cache' / 'cdv-notion'
 
 
+def well_formed(token, source):
+    """The token, or Fail(NO_TOKEN) naming the source (never the value) when it holds whitespace or a control
+    character: such a value would reach the Authorization header, and the error the HTTP layer raises prints it."""
+    if re.search(r'[\s\x00-\x1f\x7f]', token):
+        raise Fail(NO_TOKEN, f'the token from {source} is malformed (it holds a space or a line break); '
+                             f'store it again: {LOGIN_HINT}')
+    return token, source
+
+
 def find_token():
     from_env = os.environ.get(TOKEN_ENV, '').strip()
     if from_env:
-        return from_env, f'${TOKEN_ENV}'
+        return well_formed(from_env, f'${TOKEN_ENV}')
     found = secret_tool('lookup', *KEYRING)
     if found and found.returncode == 0 and found.stdout.strip():
-        return found.stdout.strip(), 'the keyring'
+        return well_formed(found.stdout.strip(), 'the keyring')
     path = credentials_path()
     if path.is_file():
         for line in path.read_text(encoding='utf-8').splitlines():
             line = line.strip()
             if line and not line.startswith('#'):
-                return line, str(path)
+                return well_formed(line, str(path))
     return '', ''
 
 
@@ -2555,6 +2564,9 @@ def main(argv=None):
             client.warn(failure.message)
         return failure.code
     except KeyboardInterrupt:
+        return REFUSED
+    except Exception as error:  # last resort: Python's own handler would print the text raw, token included
+        client.warn(f'{type(error).__name__}: {error}')
         return REFUSED
 
 

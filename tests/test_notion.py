@@ -2129,6 +2129,41 @@ class TokenTest(ClientTestCase):
         self.assertNotIn(TOKEN, joined)
         self.assertNotIn(TOKEN[4:20], joined)
 
+    def test_token_with_a_line_break_inside_exits_3_and_is_never_printed(self):
+        credentials = self.home / ".config" / "notion" / "credentials"
+        credentials.parent.mkdir(parents=True)
+        credentials.write_text(TOKEN + " " + TOKEN + "\n")
+        credentials.chmod(0o600)
+        for source in ("env", "keyring", "file"):
+            with self.subTest(source=source):
+                os.environ.pop("NOTION_API_TOKEN", None)
+                self.keyring = None
+                # the real transport refuses a line break in the header before any connection is made; the
+                # fake one stands in where a space would be a legal header and the request must never be built
+                self.n.TRANSPORT = self.n.urllib_transport if source != "file" else self.fake
+                self.fake.calls.clear()
+                if source == "env":
+                    os.environ["NOTION_API_TOKEN"] = TOKEN + "\n" + TOKEN
+                elif source == "keyring":
+                    self.keyring = TOKEN + "\n" + TOKEN + "\n"
+                code, out, err = self.run_cli("fetch", PAGE)
+                self.assertEqual(code, 3, err)
+                self.assertIn("malformed", err)
+                self.assertIn("notion auth login", err)
+                self.assertNotIn("ntn_", out + err)
+                self.assertNotIn(TOKEN[4:20], out + err)
+                self.assertEqual(self.fake.calls, [])
+
+    def test_an_uncaught_error_prints_its_name_and_never_the_token(self):
+        def boom(client, args):
+            raise ValueError("Invalid header value b'Bearer " + TOKEN + "'")
+
+        self.n.cmd_whoami = boom
+        code, out, err = self.run_cli("whoami")
+        self.assertEqual(code, 1)
+        self.assertIn("ValueError", err)
+        self.assertNotIn(TOKEN, out + err)
+
     def test_no_token_or_401_exits_3_for_every_verb(self):
         upload = self.tmp / "a.txt"
         upload.write_text("x")
