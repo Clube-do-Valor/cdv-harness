@@ -5,15 +5,20 @@ A temporary `.claude/` holds the real hook, the real checker and, at the client'
 cdv-notion client: the real client over a fake Notion kept in a JSON state file, whose requests are
 logged beside it. There is no profile.yaml anywhere: the hook needs none."""
 
+import importlib.machinery
+import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
 
 import card_fixtures as cf
 from card_fixtures import ANA, BRUNO, ME, TOKEN, uid
@@ -200,6 +205,49 @@ class CardHookTest(HookCase):
         self.assertSays(proc, cf.hex32(bad["id"]))
         self.assertNotIn(cf.hex32(other["id"]), proc.stderr)
         self.assertSilent(self.hook(self.event("mcp__claude_ai_Notion__notion-search", {"query": "x"}, {"ok": True})))
+
+    def test_a_write_of_more_pages_than_the_time_budget_says_how_many_were_not_checked(self):
+        pages = [self.add(cf.task(n, "")) for n in range(1, 13)]
+        result = {"content": [{"type": "text", "text": json.dumps({"pages": [{"id": p["id"]} for p in pages]})}]}
+        create = self.event("mcp__claude_ai_Notion__notion-create-pages", {"parent": {"data_source_id": cf.DS_TASKS},
+                                                                            "pages": [{}] * 12}, result)
+        env = dict(self.env, CARD_CHECK_BUDGET="3")
+        started = time.monotonic()
+        proc = self.hook(create, env=env)
+        took = time.monotonic() - started
+        self.assertEqual(proc.returncode, 2, proc.stderr)
+        checked = proc.stderr.count("request-zone:")
+        last = proc.stderr.strip().splitlines()[-1]
+        match = re.fullmatch(r"card-check: (\d+) more pages? this call wrote (?:was|were) not checked inside the hook's "
+                             r"time budget of 3s; run `card_contract\.py check <ref>` on each\.", last)
+        self.assertIsNotNone(match, last)
+        self.assertGreaterEqual(checked, 1)
+        self.assertEqual(checked + int(match.group(1)), 12)
+        self.assertLess(took, 3 + 2)
+        self.assertEqual(proc.stderr.count("time budget"), 1)
+        everything = self.hook(self.event("mcp__claude_ai_Notion__notion-create-pages", {"pages": [{}] * 2},
+                                          {"pages": [{"id": p["id"]} for p in pages[:2]]}))
+        self.assertEqual(everything.stderr.count("request-zone:"), 2)
+        self.assertNotIn("time budget", everything.stderr)
+        # A check that hangs (Notion slow to answer) is cut at the budget, and said as not checked
+        wrapper = self.client.read_text()
+        self.assertIn("def main(argv=None):\n", wrapper)
+        self.client.write_text(wrapper.replace("def main(argv=None):\n", "def main(argv=None):\n    import time\n"
+                                                                         "    time.sleep(60)\n"))
+        started = time.monotonic()
+        slow = self.hook(self.update(cf.key(1), session="slow"), env=env)
+        self.assertLess(time.monotonic() - started, 3 + 2)
+        self.assertEqual(slow.returncode, 2, slow.stderr)
+        self.assertIn("card-check: 1 more page this call wrote was not checked inside the hook's time budget of 3s",
+                      slow.stderr)
+        # The budget is the host's timeout of door 3 less a margin, and a setting can only lower it
+        loader = importlib.machinery.SourceFileLoader("card_check_hook", str(self.hooks / "card-check"))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        for value, expected in (("999", 25.0), ("not a number", 25.0), ("3", 3.0), ("", 25.0)):
+            with self.subTest(budget=value), mock.patch.dict(os.environ, {"CARD_CHECK_BUDGET": value}):
+                self.assertEqual(module.budget(), expected)
+        self.assertLess(module.BUDGET_SECONDS, 30)
 
     def test_a_whole_body_replace_passes_body_replaced(self):
         theirs = self.add(cf.task(1, "", assignee=(BRUNO,)))

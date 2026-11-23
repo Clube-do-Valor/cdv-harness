@@ -14,6 +14,9 @@ exits 2 with them on stderr, which the host shows the model beside the tool resu
 pins the request zone from its own output, with no call to Notion; an output that may be cut (the
 client's truncation marker, a request zone that does not reach its end marker) pins nothing.
 
+The hook ends inside its time budget (25 s, before the host's timeout of 30 s) whatever the number
+of pages: the first pages are checked, and one line says how many were not.
+
 One check per tool call (the first entry to create the claim file named after `tool_use_id` wins),
 three failed checks in a row on one page say so once and then stay silent for that page in the
 session, and a machine with no token is told once per session. It fails open: anything unexpected
@@ -26,6 +29,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 sys.dont_write_bytecode = True
 from pathlib import Path  # noqa: E402
@@ -41,6 +45,11 @@ URL = re.compile(r"https?://[^\s\"'<>),]+")
 # update flags that take values; --edit takes two
 VALUE_FLAGS = {"--set": 1, "--edit": 2, "--replace-file": 1, "--append-file": 1, "--prepend-file": 1, "--icon": 1}
 CHECK_TIMEOUT = 25
+# The whole hook ends inside this many seconds, before the host's timeout of 30 (door 3), whatever the
+# number of pages a call wrote. CARD_CHECK_BUDGET can only lower it.
+BUDGET_SECONDS = 25.0
+MIN_CHECK_SECONDS = 1.0
+STARTED = time.monotonic()
 LOOP_LIMIT = 3
 
 
@@ -299,11 +308,24 @@ def claim(root, tool_use_id):
         return True
 
 
-def check(ref, replaced):
+def budget():
+    try:
+        wanted = float(os.environ.get("CARD_CHECK_BUDGET") or BUDGET_SECONDS)
+    except ValueError:
+        wanted = BUDGET_SECONDS
+    return max(0.0, min(wanted, BUDGET_SECONDS))
+
+
+TIMED_OUT = "timed out"
+
+
+def check(ref, replaced, timeout=CHECK_TIMEOUT):
     argv = [sys.executable, str(checker_path()), "check", ref] + (["--body-replaced"] if replaced else [])
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True, timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.TimeoutExpired):
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return TIMED_OUT, ""
+    except OSError:
         return None, ""
     return proc.returncode, proc.stdout.strip()
 
@@ -347,7 +369,7 @@ def main():
         except Exception:
             pass
     session = Session(root, str(event.get("session_id") or ""))
-    said, seen = [], set()
+    said, seen, unchecked, limit = [], set(), 0, budget()
     for ref, replaced in targets:
         key = page_key(ref)
         if key in seen or key in session.data["silent"]:
@@ -355,7 +377,14 @@ def main():
         seen.add(key)
         if session.data.get("no_token"):
             break
-        result, text = check(ref, replaced)
+        left = limit - (time.monotonic() - STARTED)
+        if left < MIN_CHECK_SECONDS:
+            unchecked += 1
+            continue
+        result, text = check(ref, replaced, min(CHECK_TIMEOUT, left))
+        if result == TIMED_OUT:
+            unchecked += 1
+            continue
         if result == 3:
             session.data["no_token"] = True
             said.append(NO_TOKEN)
@@ -372,6 +401,10 @@ def main():
             said.append(message)
         elif result == 0:
             session.data["fails"].pop(key, None)
+    if unchecked:
+        said.append(f"card-check: {unchecked} more {'page' if unchecked == 1 else 'pages'} this call wrote "
+                    f"{'was' if unchecked == 1 else 'were'} not checked inside the hook's time budget of "
+                    f"{limit:g}s; run `card_contract.py check <ref>` on each.")
     session.save()
     return (SAY, "\n".join(said)) if said else (SILENT, "")
 
