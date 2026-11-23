@@ -1955,6 +1955,35 @@ class PeopleTest(ClientTestCase):
         self.assertEqual(code, 0, err)
         self.assertIn("Bruno Costa", out)
 
+    def test_me_names_the_reason_when_the_user_list_cannot_be_read(self):
+        self.settings(me="bruno@example.com")  # right, but Bruno is in no row read, so only the list knows him
+        for status in (500, 403):
+            with self.subTest(status=status):
+                self.fake.users_status = status
+                self.fake.calls.clear()
+                for args in (("whoami",), ("update", PAGE, "--set", "Assignee=me")):
+                    code, out, err = self.run_cli(*args)
+                    self.assertEqual(code, 1, err)
+                    for words in (f"{status} restricted_resource", "Insufficient permissions for this endpoint.",
+                                  "could not be read", "bruno@example.com", "config.json"):
+                        self.assertIn(words, err)
+                    self.assertNotIn("nobody the integration can see", err)
+                self.assertEqual(self.writes(), [])
+                code, out, err = self.run_cli("comments", "add", PAGE, "--body", "Ready")
+                self.assertEqual(code, 0, err)
+                self.assertIn("shown as the integration", err)
+                self.assertIn(f"{status} restricted_resource", err)
+        self.fake.users_status = 200
+        self.settings(me="nobody@example.com")
+        code, out, err = self.run_cli("whoami")
+        self.assertEqual(code, 1)
+        self.assertIn("nobody the integration can see has the e-mail nobody@example.com", err)
+        self.assertNotIn("could not be read", err)
+        self.settings(me="bruno@example.com")
+        code, out, err = self.run_cli("whoami")
+        self.assertEqual(code, 0, err)
+        self.assertIn("Bruno Costa", out)
+
     def test_whoami_nobody_exits_1(self):
         self.n.git_email = lambda: "nobody@example.com"
         code, out, err = self.run_cli("whoami")

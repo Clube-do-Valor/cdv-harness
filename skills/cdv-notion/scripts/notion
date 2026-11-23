@@ -428,6 +428,7 @@ class Notion:
         self._listed = None
         self._warned_unlisted = False
         self._list_stopped_at = 0  # the page of GET /v1/users that failed, 0 while none did
+        self.me_unresolved = ''  # why `me` could not be resolved, once me() has tried
         self._settings = None
         self._schemas = {}
 
@@ -702,13 +703,24 @@ class Notion:
         if wanted.startswith('user://'):
             identifier = hyphenate(wanted)
             return {'id': identifier, 'name': self.user_name(identifier) or wanted, 'email': ''}
+        reason = None
         for pass_ in (0, 1):
-            people = self.people() if pass_ == 0 else self.list_users()[0]
+            if pass_ == 0:
+                people = self.people()
+            else:
+                people, reason = self.everyone()
             for identifier, person in people.items():
                 if fold(person.get('email', '')) == fold(wanted):
                     return dict(person, id=identifier)
+        if reason:  # the setting may be right: say why the person could not be looked up
+            stopped = 'could not be read' if self._list_stopped_at <= 1 else 'is incomplete'
+            self.me_unresolved = (f'the person with the e-mail {wanted} could not be found because the list of users '
+                                  f'{stopped} (GET /v1/users failed: {reason}); "me" is set in {config_path()} '
+                                  '(else `git config user.email`)')
+        else:
+            self.me_unresolved = f'nobody the integration can see has the e-mail {wanted}: {how}'
         if required:
-            raise Fail(REFUSED, f'nobody the integration can see has the e-mail {wanted}: {how}')
+            raise Fail(REFUSED, self.me_unresolved)
         return None
 
     def person_ref(self, user):
@@ -2028,8 +2040,8 @@ def display_name(client):
         return None
     person = client.me(required=False)
     if not person:
-        client.warn('the comment is shown as the integration: set "me" in '
-                    f'{config_path()} to sign it with your name')
+        why = client.me_unresolved or f'set "me" in {config_path()} to sign it with your name'
+        client.warn(f'the comment is shown as the integration: {why}')
         return None
     return {'type': 'custom', 'custom': {'name': person['name']}}
 
