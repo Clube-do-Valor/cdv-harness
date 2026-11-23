@@ -198,21 +198,23 @@ def bash_targets(command, output, code):
 
     The pages are the client's own write lines in the output, whatever the shell shape; when the
     output holds none, the client's `update` in the command, as far as it can be parsed. A call
-    that exited 4 (done in part) also checks the page of the command. When the command's updates
-    and the output's `updated` lines are as many, each page is named by the command's ref (its key)."""
+    that exited 4 (done in part) also checks the page of the command: the one its message names
+    (`done in part on <url>`), and the command's refs when the output shows fewer pages than the
+    command has updates."""
     replaced = bool(re.search(r"--replace-file\b", command))
     calls = client_calls(command)
-    refs = [ref for verb, arguments in calls if verb == "update" for ref in [update_ref(arguments)] if ref]
+    updates = [update_ref(arguments) for verb, arguments in calls if verb == "update"]
+    refs = [ref for ref in updates if ref]
     lines = written_lines(output)
-    updated = [url for verb, url in lines if verb == "updated"]
-    if lines:
-        named = iter(refs if len(refs) == len(updated) else updated)
-        pages = [next(named) if verb == "updated" else url for verb, url in lines]
-    else:
-        pages = list(refs) if code == 0 else []
+    pages = [url for _, url in lines]
+    if not lines and code == 0:
+        pages = list(refs)
     if code == 4:
         partial = [m.group(1) for m in PARTIAL_ON.finditer(output or "")]
-        pages += partial or ([] if updated else refs)
+        pages += partial
+        shown_pages = {page_key(url) for url in [u for verb, u in lines if verb == "updated"] + partial}
+        if len(shown_pages) < len(updates):
+            pages += refs
     return [(page, replaced) for page in pages], whole_fetch(command, calls)
 
 

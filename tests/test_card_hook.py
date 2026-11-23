@@ -94,7 +94,16 @@ class HookCase(unittest.TestCase):
                           {"stdout": stdout, "stderr": "", "interrupted": False, "isImage": False}, **extra)
 
     def update(self, ref, *flags, **extra):
-        return self.bash(f"{CLIENT_CMD} update {ref} " + " ".join(flags), stdout=f"updated https://www.notion.so/x\n", **extra)
+        url = self.url(ref)
+        return self.bash(f"{CLIENT_CMD} update {ref} " + " ".join(flags), stdout=f"updated {url}\n" if url else "", **extra)
+
+    def url(self, ref):
+        """The url the client prints for a page of the fake, by id or key; None when it has none."""
+        for page in self.fake.pages.values():
+            number = (page["properties"].get("Task ID") or {}).get("unique_id", {}).get("number")
+            if ref == page["id"] or ref == cf.key(number):
+                return page["url"]
+        return None
 
     def assertSays(self, proc, *needles):
         self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
@@ -110,7 +119,7 @@ class CardHookTest(HookCase):
     def test_client_update_and_create_are_checked_and_other_verbs_are_not(self):
         bad = self.add(cf.task(1, ""))
         created = self.add(cf.task(2, ""))
-        self.assertSays(self.hook(self.update(cf.key(1), "--set", "'Status=Done'")), cf.key(1), "request-zone:")
+        self.assertSays(self.hook(self.update(cf.key(1), "--set", "'Status=Done'")), bad["url"], "request-zone:")
         create = self.bash("cd x && notion create --parent Tasks --set 'Task name=y'",
                            stdout=f"created {created['url']} {cf.key(2)}\n")
         self.assertSays(self.hook(create), created["url"], "request-zone:")
@@ -151,6 +160,9 @@ class CardHookTest(HookCase):
         proc = self.hook(loop)
         self.assertSays(proc, first["url"], second["url"])
         self.assertEqual(proc.stderr.count("request-zone:"), 2)
+        mixed = bash(f"{CLIENT_CMD} update {one} --set 'Status=Done' > /dev/null; K={two}; {CLIENT_CMD} update $K --set 'Status=Done'",
+                     stdout=f"updated {second['url']}\n")
+        self.assertSays(self.hook(mixed), second["url"], "request-zone:")  # the line decides, not the command
         single = bash(f"for k in {one}; do {CLIENT_CMD} update $k --set 'Status=Done'; done", stdout=printed)
         self.assertSays(self.hook(single), first["url"], "request-zone:")
         heredoc = bash(f"cat > b.md <<'EOF'\nIt's the card.\nEOF\n{CLIENT_CMD} update {cf.key(3)} --replace-file b.md",
@@ -189,6 +201,18 @@ class CardHookTest(HookCase):
         self.assertSays(proc, first["url"], "request-zone:")
         self.assertNotIn(cf.key(2), proc.stderr)
         self.assertEqual(proc.stderr.count("request-zone:"), 1)
+        # Exit 4: the second update is done in part and prints no line of its own, so the command names it
+        proc = self.hook(self.event("Bash", both, error=f"Exit code 4\nupdated {first['url']}\ndone in part; not applied: x"))
+        self.assertSays(proc, first["url"], cf.key(2))
+        single = {"command": f"{CLIENT_CMD} update {cf.key(1)} --set 'Status=Done' --append-file f.md"}
+        proc = self.hook(self.event("Bash", single, session="partial", error=(
+            f"Exit code 4\nupdated {first['url']}\ndone in part on {first['url']}: written: properties. Not written: body")))
+        self.assertSays(proc, first["url"])
+        self.assertEqual(proc.stderr.count("request-zone:"), 1)  # one page, checked once
+        loop = {"command": f"for k in {cf.key(1)}; do {CLIENT_CMD} update $k --append-file f.md; done"}
+        proc = self.hook(self.event("Bash", loop, session="named", error=(
+            f"Exit code 4\ndone in part on {first['url']}: written: properties. Not written: body")))
+        self.assertSays(proc, first["url"], "request-zone:")
 
     def test_connector_page_writes_are_checked_under_any_server_prefix(self):
         bad = self.add(cf.task(1, ""))
@@ -229,6 +253,10 @@ class CardHookTest(HookCase):
                                           {"pages": [{"id": p["id"]} for p in pages[:2]]}))
         self.assertEqual(everything.stderr.count("request-zone:"), 2)
         self.assertNotIn("time budget", everything.stderr)
+        # Less than a second left: no check is started
+        none = self.hook(self.update(cf.key(1), session="late"), env=dict(self.env, CARD_CHECK_BUDGET="0.95"))
+        self.assertIn("card-check: 1 more page this call wrote was not checked", none.stderr)
+        self.assertNotIn("request-zone:", none.stderr)
         # A check that hangs (Notion slow to answer) is cut at the budget, and said as not checked
         wrapper = self.client.read_text()
         self.assertIn("def main(argv=None):\n", wrapper)
@@ -262,7 +290,7 @@ class CardHookTest(HookCase):
         self.add(cf.task(1, "Status: Done\n"))
         self.add(cf.task(2, GOOD))
         proc = self.hook(self.update(cf.key(1), "--set", "'Status=In progress'"))
-        self.assertSays(proc, cf.key(1), "status-in-body: ", "request-zone: ", "delivery-zone: ")
+        self.assertSays(proc, self.url(cf.key(1)), "status-in-body: ", "request-zone: ", "delivery-zone: ")
         self.assertSilent(self.hook(self.update(cf.key(2), "--set", "'Status=In progress'")))
 
     def test_three_failed_checks_in_a_row_are_said_once_then_silence(self):
