@@ -50,7 +50,7 @@ Write a multi-line `OLD` or `NEW` from a file: `--edit "$(cat old.md)" "$(cat ne
 ## Rules
 
 - **Fetch before you change.** Read the page (and the data source schema, `notion fetch collection://<uuid>`, before the first write to a data source) and write property and option names exactly as the schema has them. Never guess a column name; an unknown name or option exits `2` with the nearest names, and nothing is sent.
-- **The smallest edit.** Prefer `--edit OLD NEW` with `OLD` copied from the current body; it must match exactly one place. `--replace-file` rewrites the whole body and loses what the markdown does not carry; use it for a body that is being replaced on purpose (a card created by this session, a seed), never to change a sentence.
+- **The smallest edit.** Prefer `--edit OLD NEW` with `OLD` copied from the current body; it must match exactly one place. When no `--edit` matched, the client exits `1` and nothing is changed; when some `--edit` matched and some did not, it exits `4` naming the ones that did not. `--replace-file` rewrites the whole body and loses what the markdown does not carry; use it for a body that is being replaced on purpose (a card created by this session, a seed), never to change a sentence.
 - **Child pages and databases live in the body.** Keep their `<page url="…">` and `<database url="…">` tags when rewriting; the client refuses a rewrite that drops one. Never pass `--allow-deleting-content` without the user confirming the list it printed.
 - **A list replaces, it does not add.** `--set 'Tags=A,B'` makes the tags exactly A and B, the same for people, relations and files: read the current value and include what stays.
 - **Status moves by event only.** Change a status when the user asks or a skill step says so; a status change can fire the data source's automations (dates stamped, notifications). Never trash, never resolve, never delete without an explicit request.
@@ -65,7 +65,7 @@ Write a multi-line `OLD` or `NEW` from a file: `--edit "$(cat old.md)" "$(cat ne
 | Code | Meaning | What to do |
 |---|---|---|
 | `0` | done | — |
-| `1` | Notion refused or could not be reached; on 403/404 the message names the page to connect | connect the integration to the page (menu → Connections) or report it |
+| `1` | Notion refused or could not be reached; on 403/404 the message names the page to connect; no `--edit` matched (nothing changed) | connect the integration to the page (menu → Connections) or report it; for edits, re-fetch and copy `OLD` as the body has it now |
 | `2` | the command is wrong: unknown property or option (nearest names listed), a condition that does not compile, a refused path | fix the command; nothing was sent |
 | `3` | no usable token (missing, revoked, mistyped) | the user runs `notion auth login` in a terminal |
 | `4` | done in part: some `--edit` did not match, or a later write was refused after an earlier one landed (the properties set, the pages created, by url) | report what was written and what was not; re-fetch and rerun only what was not written, never the whole command |

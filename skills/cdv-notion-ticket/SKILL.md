@@ -43,7 +43,7 @@ Per the format file. `notion fetch <card>` first: an existing note is rewritten 
 
 ### Step 3 — Show and confirm
 
-Inside a `cdv-kickoff` run, skip the question: write the note as below and put the draft in the final report. Otherwise print the draft in the chat and ask once: *"Escrevo essa nota no card <KEY>?"*. On a yes, write it with the client: `notion update <card> --replace-file <note.md>` for a card whose body is all being replaced, `--edit '<old text>' '<new text>'` for an existing note, `--prepend-file <note.md>` otherwise; set the icon the extension names with `--icon`, and report the card link. An `--edit` that did not match (exit `4`) is re-read and retried once, never forced with a rewrite. On a no, the draft stays in the chat for the user to adjust.
+Inside a `cdv-kickoff` run, skip the question: write the note as below and put the draft in the final report. Otherwise print the draft in the chat and ask once: *"Escrevo essa nota no card <KEY>?"*. On a yes, write it with the client: `notion update <card> --replace-file <note.md>` for a card whose body is all being replaced, `--edit '<old text>' '<new text>'` for an existing note, `--prepend-file <note.md>` otherwise; set the icon the extension names with `--icon`, and report the card link. When no `--edit` matched, the client exits `1` and nothing is changed; when some `--edit` matched and some did not, it exits `4` naming the ones that did not. Either way the card is re-read and the missed edits retried once, never forced with a rewrite. On a no, the draft stays in the chat for the user to adjust.
 
 ### Step 4 — After the pull request exists
 

@@ -1744,6 +1744,17 @@ class CoreSkillsTest(unittest.TestCase):
                 self.assertIn("cdv-notion", body)
                 self.assertRegex(body, r"`notion (fetch|update|create|search|query|comments)")
 
+    def test_edit_exit_codes_are_stated_as_the_plan_says(self):
+        none_matched = r"no `--edit` matched[^.]*exits `1`[^.]*nothing (is |was )?changed"
+        some_missed = r"some `--edit` matched and some did not[^.]*exits `4`"
+        for path in (CORE_FILES["cdv-notion-ticket"], SKILL_DIR / "SKILL.md"):
+            with self.subTest(file=path.parent.name):
+                body = path.read_text(encoding="utf-8")
+                self.assertRegex(body, none_matched)
+                self.assertRegex(body, some_missed)
+                self.assertNotRegex(body, r"`--edit` that did not match \(exit `4`\)")
+                self.assertNotRegex(body, r"`4` \| done in part \(some edits did not match\)")
+
     def test_ticket_references_use_the_skill_markdown(self):
         reference = (SKILL_DIR / "references" / "notion-markdown.md").read_text(encoding="utf-8")
         for name in ("ticket-format.md", "notion-ticket-template.md"):
