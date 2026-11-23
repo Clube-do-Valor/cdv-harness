@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""PostToolUse and PostToolUseFailure hook: a Notion card written in this session is checked against
+the card contract before the agent's next step.
+
+It fires after every `Bash` call and every connector page write. When the call wrote a page - the
+cdv-notion client's `update <ref>` or `create` (a failed call only when it exited 4, done in part),
+or the connector's `notion-update-page` or `notion-create-pages` under any server prefix - it runs
+`card_contract.py check <ref>` (with `--body-replaced` after a whole-body replace) and, on findings,
+exits 2 with them on stderr, which the host shows the model beside the tool result. A client
+`fetch` pins the request zone from its own output, with no call to Notion.
+
+One check per tool call (the first entry to create the claim file named after `tool_use_id` wins),
+three failed checks in a row on one page say so once and then stay silent for that page in the
+session, and a machine with no token is told once per session. It fails open: anything unexpected
+exits 0 with nothing printed. It needs no harness profile: the checker and the client are found
+beside it, in `<.claude or config dir>/skills/`.
+"""
+
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.dont_write_bytecode = True
+from pathlib import Path  # noqa: E402
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import harness_hook as h  # noqa: E402
+
+SILENT, SAY = 0, 2
+CONNECTOR = re.compile(r"^mcp__.+__notion-(update-page|create-pages)$")
+UUID = re.compile(r"(?<![0-9a-fA-F])([0-9a-fA-F]{8})-?([0-9a-fA-F]{4})-?([0-9a-fA-F]{4})-?([0-9a-fA-F]{4})-?"
+                  r"([0-9a-fA-F]{12})(?![0-9a-fA-F])")
+URL = re.compile(r"https?://[^\s\"'<>),]+")
+# update flags that take values; --edit takes two
+VALUE_FLAGS = {"--set": 1, "--edit": 2, "--replace-file": 1, "--append-file": 1, "--prepend-file": 1, "--icon": 1}
+CHECK_TIMEOUT = 25
+LOOP_LIMIT = 3
+
+
+def skills_dir():
+    return h.harness_dir().parent / "skills"
+
+
+def checker_path():
+    return skills_dir() / "cdv-notion-ticket" / "scripts" / "card_contract.py"
+
+
+def client_path():
+    return skills_dir() / "cdv-notion" / "scripts" / "notion"
+
+
+def load_checker():
+    import importlib.machinery
+    import importlib.util
+
+    loader = importlib.machinery.SourceFileLoader("card_contract_for_hook", str(checker_path()))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def hyphenated(text):
+    match = UUID.search(text or "")
+    return "-".join(match.groups()).lower() if match else None
+
+
+def page_key(ref):
+    return hyphenated(ref) or ref.strip().upper()
+
+
+def shown(ref):
+    """The page as the developer reads it: a key or a url as given, a bare id as its url."""
+    if UUID.fullmatch(ref.strip()):
+        return "https://app.notion.com/p/" + hyphenated(ref).replace("-", "")
+    return ref
+
+
+# ---------------------------------------------------------------------------------------------
+# What the call wrote
+# ---------------------------------------------------------------------------------------------
+
+
+def simple_commands(command):
+    """The simple commands of a command line, quoted words kept whole (`--set 'Status=In progress'`)."""
+    try:
+        words = h._lex(command)
+    except ValueError:
+        return []
+    out, current = [], []
+    for word in words:
+        if word in h.OPERATORS or set(word) <= set(";&|()"):
+            if current:
+                out.append(current)
+            current = []
+        else:
+            current.append(word)
+    if current:
+        out.append(current)
+    return out
+
+
+def client_calls(command):
+    """(verb, arguments) of each simple command that runs the cdv-notion client."""
+    found = []
+    for segment in simple_commands(command):
+        words = h.command_words(segment)
+        if words and os.path.basename(words[0]).startswith("python") and len(words) > 1:
+            words = words[1:]
+        if len(words) >= 2 and os.path.basename(words[0]) == "notion":
+            found.append((words[1], words[2:]))
+    return found
+
+
+def update_ref(arguments):
+    index = 0
+    while index < len(arguments):
+        word = arguments[index]
+        if word.startswith("--"):
+            index += 1 + (0 if "=" in word else VALUE_FLAGS.get(word, 0))
+            continue
+        return word
+    return None
+
+
+def created_urls(output):
+    urls = []
+    for line in output.splitlines():
+        if re.search(r"\bcreated\b", line):
+            after = line[re.search(r"\bcreated\b", line).end():]
+            for cut in ("Not created", "In doubt", "not sent"):
+                after = after.split(cut, 1)[0]
+            urls += [u.rstrip(".;:") for u in URL.findall(after)]
+    return urls
+
+
+def bash_targets(command, output):
+    """[(ref, body replaced)] of the pages the client wrote, and whether it fetched a page."""
+    targets, fetched = [], False
+    for verb, arguments in client_calls(command):
+        if verb == "update":
+            ref = update_ref(arguments)
+            if ref:
+                targets.append((ref, "--replace-file" in arguments or any(a.startswith("--replace-file=") for a in arguments)))
+        elif verb == "create":
+            targets += [(url, False) for url in created_urls(output)]
+        elif verb == "fetch":
+            fetched = True
+    return targets, fetched
+
+
+def connector_targets(tool, tool_input, response):
+    targets = []
+    if tool.endswith("notion-update-page"):
+        page = tool_input.get("page_id")
+        if isinstance(page, str) and page.strip():
+            targets.append((page.strip(), tool_input.get("command") == "replace_content"))
+        return targets
+    parent = json.dumps(tool_input.get("parent"))
+    excluded = {hyphenated(m.group(0)) for m in UUID.finditer(parent)}
+    seen = set()
+    blob = response if isinstance(response, str) else json.dumps(response)
+    for url in URL.findall(blob):
+        identifier = hyphenated(url)
+        if identifier and identifier not in excluded and identifier not in seen:
+            seen.add(identifier)
+            targets.append((url, False))
+    for match in UUID.finditer(blob):
+        identifier = hyphenated(match.group(0))
+        if identifier not in excluded and identifier not in seen:
+            seen.add(identifier)
+            targets.append((identifier, False))
+    return targets
+
+
+def output_of(event):
+    """(exit code or None, the text the call printed)."""
+    if "error" in event and event.get("hook_event_name") != "PostToolUse":
+        error = str(event.get("error") or "")
+        match = re.match(r"\s*Exit code (\d+)", error)
+        return (int(match.group(1)) if match else None), error
+    response = event.get("tool_response")
+    if isinstance(response, dict):
+        return 0, "\n".join(str(response.get(k) or "") for k in ("stdout", "stderr"))
+    return 0, str(response or "")
+
+
+# ---------------------------------------------------------------------------------------------
+# Session state, under the client's cache directory
+# ---------------------------------------------------------------------------------------------
+
+
+class Session:
+    def __init__(self, root, session_id):
+        safe = re.sub(r"[^A-Za-z0-9._-]", "_", session_id or "no-session")[:120]
+        self.path = root / "sessions" / f"{safe}.json"
+        try:
+            self.data = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            self.data = {}
+        self.data.setdefault("fails", {})
+        self.data.setdefault("silent", [])
+
+    def save(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            scratch = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+            scratch.write_text(json.dumps(self.data), encoding="utf-8")
+            os.replace(scratch, self.path)
+        except OSError:
+            pass
+
+
+def claim(root, tool_use_id):
+    """True for the first entry of the hook that fires for this tool call."""
+    if not tool_use_id:
+        return True
+    folder = root / "claims"
+    try:
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        handle = os.open(str(folder / re.sub(r"[^A-Za-z0-9._-]", "_", tool_use_id)[:120]),
+                         os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(handle)
+        return True
+    except FileExistsError:
+        return False
+    except OSError:
+        return True
+
+
+def check(ref, replaced):
+    argv = [sys.executable, str(checker_path()), "check", ref] + (["--body-replaced"] if replaced else [])
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=CHECK_TIMEOUT, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+    return proc.returncode, proc.stdout.strip()
+
+
+NO_TOKEN = ("card-check: cards are not being checked on this machine: the cdv-notion client has no usable Notion "
+            "token. Run `notion auth login` in a terminal (the cdv-notion skill, references/setup.md, says where "
+            "the token comes from).")
+
+
+def main():
+    event = h.read_event()
+    if not event:
+        return SILENT, ""
+    tool = str(event.get("tool_name") or "")
+    tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
+    code, output = output_of(event)
+    fetched = False
+    if tool == "Bash":
+        command = tool_input.get("command")
+        if not isinstance(command, str) or "notion" not in command:
+            return SILENT, ""
+        if code not in (0, 4):
+            return SILENT, ""
+        targets, fetched = bash_targets(command, output)
+        fetched = fetched and code == 0
+    elif CONNECTOR.match(tool):
+        if code != 0:
+            return SILENT, ""
+        targets = connector_targets(tool, tool_input, event.get("tool_response"))
+    else:
+        return SILENT, ""
+    if not targets and not fetched:
+        return SILENT, ""
+    if not checker_path().is_file() or not client_path().is_file():
+        return SILENT, ""
+    checker = load_checker()
+    root = Path(checker.client().cache_dir()) / "card-check"
+    if not claim(root, str(event.get("tool_use_id") or "")):
+        return SILENT, ""
+    if fetched:
+        try:
+            checker.pin_from_fetch_output(output)
+        except Exception:
+            pass
+    session = Session(root, str(event.get("session_id") or ""))
+    said, seen = [], set()
+    for ref, replaced in targets:
+        key = page_key(ref)
+        if key in seen or key in session.data["silent"]:
+            continue
+        seen.add(key)
+        if session.data.get("no_token"):
+            break
+        result, text = check(ref, replaced)
+        if result == 3:
+            session.data["no_token"] = True
+            said.append(NO_TOKEN)
+            break
+        if result == 1 and text:
+            fails = session.data["fails"].get(key, 0) + 1
+            session.data["fails"][key] = fails
+            message = f"card-check: {shown(ref)} is outside the card contract (card_contract.py check {ref}):\n{text}"
+            if fails >= LOOP_LIMIT:
+                session.data["silent"].append(key)
+                message += (f"\ncard-check: {shown(ref)} failed {fails} checks in a row in this session; the card is "
+                            "still outside the contract, and the developer decides what to do with it. card-check "
+                            "says nothing more about this page in this session.")
+            said.append(message)
+        elif result == 0:
+            session.data["fails"].pop(key, None)
+    session.save()
+    return (SAY, "\n".join(said)) if said else (SILENT, "")
+
+
+def run():
+    try:
+        code, message = main()
+    except Exception:  # a broken hook must never stop a session
+        return SILENT
+    if code == SAY and message:
+        print(message, file=sys.stderr)
+        return SAY
+    return SILENT
+
+
+if __name__ == "__main__":
+    sys.exit(run())

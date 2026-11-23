@@ -1,12 +1,14 @@
-"""Shared helpers of the cdv-harness PreToolUse hooks.
+"""Shared helpers of the cdv-harness hooks.
 
-A hook reads the tool call as JSON on stdin, exits 0 to let it run and 2 to block it; what it
-prints on stderr reaches the model as the reason. Every hook fails open: a missing profile, input
-that is not JSON or any unexpected error lets the call run, because a broken hook must never stop
-a session.
+A PreToolUse hook reads the tool call as JSON on stdin, exits 0 to let it run and 2 to block it;
+what it prints on stderr reaches the model as the reason. A PostToolUse hook (card-check) runs after
+the call, so its exit 2 cannot undo it: the stderr reaches the model beside the tool result. Every
+hook fails open: a missing profile, input that is not JSON or any unexpected error lets the call
+run, because a broken hook must never stop a session.
 
 Vendored by `harness sync` to `.claude/harness/hooks/`, beside the repository profile one level
-up (`.claude/harness/profile.yaml`). Standard library only.
+up (`.claude/harness/profile.yaml`), and by `harness sync --user` to `<config dir>/harness/hooks/`,
+where there is no profile. Standard library only.
 """
 
 import json
@@ -85,13 +87,21 @@ def setting(profile, key):
     return value.strip()
 
 
-def read_call():
-    """(tool_name, tool_input) from stdin, or None when stdin is not a JSON tool call."""
+def read_event():
+    """The whole hook input from stdin as a dict, or None when stdin is not a JSON object. A
+    PostToolUse hook needs more than the call: `tool_response` (or `error` after a failure),
+    `tool_use_id` and `session_id`."""
     try:
         data = json.loads(sys.stdin.read())
     except ValueError:
         return None
-    if not isinstance(data, dict):
+    return data if isinstance(data, dict) else None
+
+
+def read_call():
+    """(tool_name, tool_input) from stdin, or None when stdin is not a JSON tool call."""
+    data = read_event()
+    if data is None:
         return None
     tool_input = data.get("tool_input")
     return str(data.get("tool_name") or ""), tool_input if isinstance(tool_input, dict) else {}
