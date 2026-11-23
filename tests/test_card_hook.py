@@ -965,7 +965,7 @@ class CardHookTest(HookCase):
                         f"if true; then {fetch}; fi", f"for i in 1; do {fetch}; done", f"({fetch})", f"{{ {fetch}; }}", f"! {fetch}",
                         f"bash -c '{fetch}'", f"OUT=$({fetch})", f"echo \"$({fetch})\"", f"{fetch} &", f"{fetch} | cat", f"{fetch} > f.md",
                         f"> f.md {fetch}", f"{fetch} 2>&1", f"{fetch} < /dev/null", f"{fetch}; cd x", f"{fetch} && {fetch}",
-                        f"X=$({fetch}); {fetch}", f"{fetch}; echo it's", "N=$(which notion) fetch"):
+                        f"X=$({fetch}); {fetch}", f"{fetch}; echo it's", f"{fetch} > it's.md", "N=$(which notion) fetch"):
             with self.subTest(nothing=command):
                 self.assertEqual(pinned(command), [])
         for command in (fetch, f"cd x && {fetch}", f"cd x; {fetch}", f"cd x\n{fetch}\n", f"cd \"$(git rev-parse --show-toplevel)\" &&\n  {fetch}",
