@@ -520,6 +520,16 @@ class Card:
                 return f"{unique['prefix']}-{unique['number']}"
         return ""
 
+    def named_by(self, ref):
+        """True when a reference (a key, a url, an id), read as the client reads it, names this page."""
+        try:
+            found = client().parse_ref(ref)
+        except Exception:  # the client's Fail: not a reference
+            return False
+        if found.kind == "key":
+            return f"{found.prefix}-{found.number}".lower() == self.key.lower()
+        return found.kind == "id" and found.value.lower() == self.id.lower()
+
 
 def source_title(page):
     parent = page.get("parent") or {}
@@ -972,7 +982,8 @@ def cmd_check(args):
         print(f"page: {card.id} {card.key}".rstrip())
     if card is None or card.kind is None:
         items = []
-    elif not args.body_replaced and (before_since(card) or someone_elses(card)):
+    elif not (args.body_replaced or any(card.named_by(ref) for ref in args.body_replaced_of)) \
+            and (before_since(card) or someone_elses(card)):
         items = []
     else:
         items = judge(card)
@@ -1016,8 +1027,9 @@ def build_parser():
     check.add_argument("--body-replaced", action="store_true", help="the write replaced the whole body")
     check.add_argument("--json", action="store_true", help="the findings as a list of {rule, message, fix}")
     # for the card-check hook: the first line is the id and the key of the page read, so one page named
-    # by its key, its url and its id is one page
+    # by its key, its url and its id is one page; and a page the call replaced, whichever page is read
     check.add_argument("--page-id", action="store_true", help=argparse.SUPPRESS)
+    check.add_argument("--body-replaced-of", action="append", default=[], metavar="REF", help=argparse.SUPPRESS)
     check.set_defaults(func=cmd_check)
     accept = sub.add_parser("accept-request", help="pin the request zone as it now stands")
     accept.add_argument("ref")

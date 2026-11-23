@@ -123,7 +123,7 @@ class HookCase(unittest.TestCase):
         order: the hook's main() with the checker replaced by a record of the calls it gets."""
         module, found = self.hook_module(), []
 
-        def check(ref, *flags, **timeout):
+        def check(ref, flags, timeout=None):
             for page in self.fake.pages.values():
                 number = page["properties"]["Task ID"]["unique_id"]["number"]
                 if ref.upper() == cf.key(number) or cf.hex32(page["id"]) in ref.replace("-", ""):
@@ -136,7 +136,16 @@ class HookCase(unittest.TestCase):
         return found
 
     def replaced(self, number, page, flags):
-        return flags[0]
+        """Whether the checker, given these flags, judges this page as replaced."""
+        named = [ref for flag, ref in zip(flags, flags[1:]) if flag == "--body-replaced-of"]
+        return "--body-replaced" in flags or any(
+            ref.upper() == cf.key(number) or cf.hex32(page["id"]) in ref.replace("-", "") for ref in named)
+
+    def marked(self, command, stdout="", error=None):
+        """The task numbers a Bash call checks as replaced, and every one it checks."""
+        payload = self.bash(command, stdout=stdout) if error is None else self.event("Bash", {"command": command}, error=error)
+        found = self.checks(payload)
+        return [number for number, replaced in found if replaced], [number for number, _ in found]
 
     def pages(self, command, stdout="", error=None):
         """The task numbers a Bash call checks, in order."""
@@ -608,6 +617,77 @@ class CardHookTest(HookCase):
         self.assertSilent(self.hook(self.event(tool, {"page_id": theirs["id"], "command": "update_content"}, {})))
         self.assertSays(self.hook(self.event(tool, {"page_id": theirs["id"], "command": "replace_content"}, {})),
                         "request-zone:")
+
+    def test_the_whole_body_flag_belongs_to_one_page(self):
+        mine = self.add(cf.task(1, ""))
+        theirs = self.add(cf.task(2, "", assignee=(BRUNO,)))
+        old = self.add(cf.task(3, "", created="2026-10-01T10:00:00.000Z"))
+        one, two, three = (cf.key(n) for n in (1, 2, 3))
+        lines = [f"updated {page['url']}\n" for page in (mine, theirs, old)]
+        replace, change = f"{CLIENT_CMD} update {one} --replace-file f.md", f"{CLIENT_CMD} update {two} --set 'Status=Done'"
+
+        # As the host runs it: the other person's card is judged only when its own write replaced it
+        for session, command in enumerate((f"{replace} && {change}", f"{change} && {replace}",
+                                           f"{CLIENT_CMD} update {mine['url']} --replace-file f.md && {change}",
+                                           f"{change}; echo --replace-file; {replace}")):
+            with self.subTest(command=command):
+                proc = self.hook(self.bash(command, stdout=lines[0] + lines[1], session=f"flag-{session}"))
+                self.assertSays(proc, mine["url"])
+                self.assertNotIn(theirs["url"], proc.stderr)
+        self.assertSays(self.hook(self.bash(f"for k in -h {two}; do {CLIENT_CMD} update $k --replace-file f.md; done", stdout=lines[1])),
+                        theirs["url"])
+        for session, ref in enumerate((two, two.lower(), two.replace("-", "-0"), theirs["url"], theirs["id"], cf.hex32(theirs["id"]))):
+            with self.subTest(named=ref):
+                proc = self.hook(self.bash(f"{CLIENT_CMD} update {one} --set 'Status=Done'; {CLIENT_CMD} update {ref} --replace-file f.md",
+                                           stdout=lines[0] + lines[1], session=f"named-{session}"))
+                self.assertSays(proc, mine["url"], theirs["url"])
+        proc = self.hook(self.bash(f"{CLIENT_CMD} update {three} --set 'Status=Done' && {replace}", stdout=lines[2] + lines[0]))
+        self.assertNotIn(old["url"], proc.stderr)  # nor a card older than the pattern
+
+        through = f"{CLIENT_CMD} update $K"
+        cases = {  # command, output, the pages checked as replaced
+            "one page": (replace, lines[0], [1]),
+            "one page, no output": (f"{replace} > /dev/null", "", [1]),
+            "the value glued": (f"{CLIENT_CMD} update {one} --replace-file=f.md", lines[0], [1]),
+            "the flag cut short": (f"{CLIENT_CMD} update --rep f.md {one}", lines[0], [1]),
+            "one of two": (f"{replace} && {change}", lines[0] + lines[1], [1]),
+            "one of two, hidden": (f"{replace} > /dev/null && {change}", lines[1], [1]),
+            "both": (f"{replace}; {CLIENT_CMD} update {two} --replace-file g.md", lines[0] + lines[1], [1, 2]),
+            "written twice, replaced once": (f"{CLIENT_CMD} update {one} --set 'Status=Done'; {replace}", lines[0] * 2, [1]),
+            "a loop that names its pages": (f"for k in {one} {two}; do {CLIENT_CMD} update $k --replace-file f; done", lines[0] + lines[1], [1, 2]),
+            "the page in a variable of the command": (f"K={one}; {through} --replace-file f; {change}", lines[0] + lines[1], [1]),
+            "an unknown page, one written": (f"{through} --replace-file f.md", lines[1], [2]),
+            "an unknown page after a fetch, one written": (f"{CLIENT_CMD} fetch {one} > x; {through} --replace-file f.md", lines[1], [2]),
+            "an unknown loop, one written": (f"while read K; do {through} --replace-file f.md; done < l", lines[1], [2]),
+            "an unknown loop, two written": (f"while read K; do {through} --replace-file f.md; done < l", lines[0] + lines[1], []),
+            "two unknown pages, one replaced": (f"{through} --replace-file f; {CLIENT_CMD} update $J --set a=b", lines[0] + lines[1], []),
+            "an unknown page beside a known one": (f"{change}; {through} --replace-file f.md", lines[1] + lines[0], []),
+            "a known page replaced beside an unknown one": (f"{replace}; {through} --set a=b", lines[0] + lines[1], [1]),
+            "one page created, an unknown one replaced": (
+                f"{CLIENT_CMD} create --parent T --set a=b; {through} --replace-file f.md || true", f"created {theirs['url']} {two}\n", []),
+            "a comment": (f"{change} # not --replace-file f.md", lines[1], []),
+            "a comment on a line of its own": (f"# notion update {two} --replace-file f.md\n{change}", lines[1], []),
+            "an echo": (f"echo notion update {two} --replace-file f.md; {change}", lines[1], []),
+            "a heredoc": (f"cat > n.md <<'EOF'\nnotion update {two} --replace-file f.md\nEOF\n{change}", lines[1], []),
+            "a value": (f"{CLIENT_CMD} update {two} --set 'Resumo=use --replace-file' --edit a '--replace-file b'", lines[1], []),
+            "another program": (f"./tool update {two} --replace-file f.md; {change}", lines[1], []),
+            "a shape the reading does not open": (f"xargs {CLIENT_CMD} update --replace-file f.md", lines[1], []),
+            "append is not replace": (f"{CLIENT_CMD} update {two} --append-file f.md", lines[1], []),
+            "a quote left open, one write": (f"{replace}; echo it's", lines[0], [1]),
+            "a quote left open, one write after a fetch": (f"{CLIENT_CMD} fetch {two} > x; {replace}; echo it's", lines[0], [1]),
+            "a quote left open, several writes": (f"{replace}; {change}; echo it's", lines[0] + lines[1], []),
+        }
+        for name, (command, stdout, expected) in cases.items():
+            with self.subTest(case=name):
+                marked, checked = self.marked(command, stdout=stdout)
+                self.assertEqual(marked, expected)
+                self.assertTrue(checked)
+        # A call that failed: the page the output shows takes the flag of its own call
+        for command, shown, expected in ((f"{replace} && {change}", lines[0], [1]), (f"{change} && {replace}", lines[1], []),
+                                         (f"{change} && {through} --replace-file f.md", lines[1], []),
+                                         (f"{through} --replace-file f.md && false", lines[1], [2])):
+            with self.subTest(failed=command):
+                self.assertEqual(self.marked(command, error="Exit code 2\n" + shown)[0], expected)
 
     def test_findings_exit_2_on_stderr_with_the_page_and_a_clean_card_is_silent(self):
         self.add(cf.task(1, "Status: Done\n"))

@@ -10,7 +10,7 @@ write whose output is hidden inside a shape the reading does not open is not see
 the pages its output shows as written, and on exit 4, done in part, also the pages of the command; a write the client reports as
 in doubt is checked like one that landed, on the page its message names, and a write refused or
 never sent is not); or the connector's `notion-update-page` or `notion-create-pages` under any server
-prefix - it runs `card_contract.py check <ref>` (with `--body-replaced` after a whole-body replace)
+prefix - it runs `card_contract.py check <ref>` (as a whole-body replace for the page that had one, and only for it)
 and, on findings, exits 2 with them on stderr, which the host shows the model beside the tool result. A client
 `fetch`, when it is the command's one client call with nothing piped, redirected or run after it,
 pins the request zone from its own output, with no call to Notion; an output that may be cut (the
@@ -324,13 +324,15 @@ def read_commands(command):
 
 
 def every_command(command, depth=0):
-    """The simple commands a command line runs, in order: what its substitutions run before the command
-    that holds them, and the command string (or the heredoc) a shell is given after the shell."""
+    """(simple command, whether its reading is whole) of each one a command line runs, in order: what its
+    substitutions run before the command that holds them, and the command string (or the heredoc) a
+    shell is given after the shell."""
+    read, whole = read_commands(command)
 
     def walk(commands):
         for one in commands:
             yield from walk(one.inside)
-            yield one
+            yield one, whole
             words = program(one.words)
             if depth < MAX_DEPTH and words and os.path.basename(words[0]) in SHELLS:
                 index, letters = options(words, 1, *SHELL_OPTIONS)
@@ -340,7 +342,7 @@ def every_command(command, depth=0):
                     for body in one.heredocs:
                         yield from every_command(body, depth + 1)
 
-    yield from walk(read_commands(command)[0])
+    yield from walk(read)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -471,24 +473,26 @@ def client_words(words, variables):
 
 class Call:
     """One call of the client: its verb, and for an `update` the pages it names (None: one it names by
-    something the command does not tell)."""
+    something the command does not tell) and whether it replaces their whole body."""
 
-    def __init__(self, words, variables):
-        self.verb, self.refs = words[1], []
+    def __init__(self, words, variables, whole):
+        self.verb, self.refs, self.replaces, self.whole = words[1], [], False, whole
         if self.verb == "update":
-            ref = update_ref(words[2:])
-            self.refs = variables.values(ref) if ref else [None]
+            ref, flags = update_arguments(words[2:])
+            values = variables.values(ref) if ref else [None]
+            self.refs = [None if value is None or value.startswith("-") else value for value in values]
+            self.replaces = "--replace-file" in flags
 
 
 def client_calls(command):
     """The calls of the cdv-notion client in a command line, in order."""
     found, variables = [], Variables()
-    for one in every_command(command):
+    for one, whole in every_command(command):
         if not one.words or variables.run(one.words):
             continue
         words = client_words(one.words, variables)
         if len(words) >= 2:
-            found.append(Call(words, variables))
+            found.append(Call(words, variables, whole))
     return found
 
 
@@ -499,15 +503,19 @@ def update_flag(word):
     return found[0] if len(found) == 1 else None
 
 
-def update_ref(arguments):
-    """The word that is the page of an `update`, or None."""
-    index = 0
+def update_arguments(arguments):
+    """(the word that is the page of an `update` or None, its flags); the value of a flag is neither."""
+    ref, flags, index = None, set(), 0
     while index < len(arguments):
         word = arguments[index]
-        if not word.startswith("--"):
-            return word
-        index += 1 + (0 if "=" in word else UPDATE_FLAGS.get(update_flag(word), 0))
-    return None
+        index += 1
+        if word.startswith("--"):
+            flag = update_flag(word)
+            flags.add(flag)
+            index += 0 if "=" in word else UPDATE_FLAGS.get(flag, 0)
+        else:
+            ref = ref or word
+    return ref, flags
 
 
 def is_notion_page(url):
@@ -527,25 +535,45 @@ def pages_in_doubt(text):
 
 
 def bash_targets(command, output, code, errors=""):
-    """[(ref, body replaced)] of the pages the client wrote, and whether it fetched a page.
+    """[(ref, the checker's flags)] of the pages the client wrote, and whether it fetched a page.
 
     The pages are those of the client's own write lines, wherever they sit in the output, and, on a call
     that ended well or exited 4 (done in part), those the client's `update` calls name, as far as the
     command can be read. A call that exited 4 also checks the page its message names (`done in part on
     <url>`). A write in doubt is said on stderr (`errors` when the call succeeded). One page may come
     under several names: main() checks it once."""
-    replaced = bool(re.search(r"--replace-file\b", command))
     try:
         calls = client_calls(command)
     except (IndexError, RecursionError):  # a command nested past reading: the output still names its pages
         calls = []
-    pages = [url for _, url in written_lines(output)] + pages_in_doubt(f"{output}\n{errors}")
+    lines = written_lines(output)
+    pages = [url for _, url in lines] + pages_in_doubt(f"{output}\n{errors}")
     if code == 4:
         pages += [m.group(1) for m in PARTIAL_ON.finditer(output or "")]
+    created = {hyphenated(url) for verb, url in lines if verb == "created"}
+    flags = replaced_flags(calls, {hyphenated(page) for page in pages}, created)
     # a loop that failed does not tell which of its pages it reached: the output does
     for call in calls if code == 0 else [call for call in calls if code == 4 and len(call.refs) == 1]:
         pages += [ref for ref in call.refs if ref]
-    return [(page, replaced) for page in pages], whole_fetch(command, calls)
+    return [(page, flags) for page in pages], whole_fetch(command, calls)
+
+
+def replaced_flags(calls, shown_pages, created):
+    """What tells the checker which page had its whole body replaced, and that page only.
+
+    A call that names its page is paired with it by the page itself: the checker compares the page it
+    read with the one named. A replace whose page the command does not tell (or a command whose reading
+    is not whole) can be paired with no call: the page takes it when it is the only one the call wrote,
+    and several take none. A card left unmarked by mistake costs one judgement; a card marked by mistake
+    gets someone else's card rewritten."""
+    flags = [word for call in calls if call.replaces and call.whole for ref in call.refs if ref
+             for word in ("--body-replaced-of", ref)]
+    unpaired = [call for call in calls if call.replaces and (not call.whole or None in call.refs)]
+    writes = [call for call in calls if call.verb in ("update", "create")]
+    named = {ref for call in writes for ref in call.refs if ref}
+    if unpaired and len(shown_pages) <= 1 and not shown_pages & created and (len(writes) == 1 or not named):
+        flags.append("--body-replaced")
+    return flags
 
 
 def whole_fetch(command, calls):
@@ -565,7 +593,8 @@ def connector_targets(tool, tool_input, response):
     if tool.endswith("notion-update-page"):
         page = tool_input.get("page_id")
         if isinstance(page, str) and page.strip():
-            targets.append((page.strip(), tool_input.get("command") == "replace_content"))
+            replaced = tool_input.get("command") == "replace_content"
+            targets.append((page.strip(), ["--body-replaced"] if replaced else []))
         return targets
     parent = json.dumps(tool_input.get("parent"))
     excluded = {hyphenated(m.group(0)) for m in UUID.finditer(parent)}
@@ -575,12 +604,12 @@ def connector_targets(tool, tool_input, response):
         identifier = hyphenated(url)
         if identifier and identifier not in excluded and identifier not in seen:
             seen.add(identifier)
-            targets.append((url, False))
+            targets.append((url, []))
     for match in UUID.finditer(blob):
         identifier = hyphenated(match.group(0))
         if identifier not in excluded and identifier not in seen:
             seen.add(identifier)
-            targets.append((identifier, False))
+            targets.append((identifier, []))
     return targets
 
 
@@ -653,9 +682,9 @@ TIMED_OUT = "timed out"
 PAGE_READ = re.compile(r"page: (\S+)(?: (\S+))?(?:\n|$)")
 
 
-def check(ref, replaced, timeout=CHECK_TIMEOUT):
+def check(ref, flags, timeout=CHECK_TIMEOUT):
     """(exit code, the findings, the id of the page read, its key) of `card_contract.py check`."""
-    argv = [sys.executable, str(checker_path()), "check", "--page-id", ref] + (["--body-replaced"] if replaced else [])
+    argv = [sys.executable, str(checker_path()), "check", "--page-id", ref, *flags]
     try:
         proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
@@ -709,7 +738,7 @@ def main():
     said, seen, limit = [], set(), budget()
     silent, pages = session.data["silent"], session.data["pages"]
     late = {"id": 0, "key": 0}  # pages not checked, by what names them
-    for ref, replaced in targets:
+    for ref, flags in targets:
         # One page is one page whatever names it: its id, which a url holds, the session knows for a key
         # it has seen, and the checker says once it has read the page.
         named = named_page(checker, ref)
@@ -722,7 +751,7 @@ def main():
         left = limit - (time.monotonic() - STARTED)
         result = TIMED_OUT
         if left >= MIN_CHECK_SECONDS:
-            result, text, read, read_key = check(ref, replaced, min(CHECK_TIMEOUT, left))
+            result, text, read, read_key = check(ref, flags, min(CHECK_TIMEOUT, left))
         if result == TIMED_OUT:
             late["id" if named else "key"] += 1
             continue
