@@ -18,7 +18,7 @@ metadata:
 
 # Debug
 
-Read-only bug investigation lane for the backend of the repository (`profile.repo_name`). Drives a fixed sequential path from a trigger (log, Sentry, or human report) to a root-cause report with verified evidence — and optionally renders the paste-ready Análise técnica block for the ticket.
+Read-only bug investigation lane for the backend of the repository (`profile.repo_name`). Drives a fixed sequential path from a trigger (log, Sentry, or human report) to a root-cause report with verified evidence. The report stays in the chat; the card the bug came from is `cdv-notion-ticket`'s.
 
 ## Step 0 — Load the profile and the extension
 1. Read `.claude/harness/profile.yaml` and, when present, `.claude/harness/profile.local.yaml` (its keys win). If `profile.yaml` is missing, stop and say so: this skill needs the repository's cdv-harness profile, and it never guesses the values.
@@ -27,12 +27,12 @@ Below, `profile.<key>` is a value from the profile. A key that is missing or `no
 
 ## Operating principles
 
-- **Read-only by default.** Never edit DB rows, never commit, never close a ticket. The investigation's only outputs are the report and, on request, the paste-ready Análise técnica block (Step 8).
+- **Read-only by default.** Never edit DB rows, never commit, never close a ticket. The investigation's only output is the report, which stays in the chat (or in a file the developer asks for); this skill writes no analysis block on the card.
 - **PII discipline (hard rule).** PII columns (national-id numbers, phone, address, birth dates; the extension lists the column names and any other sensitive fields of this repository) are off-limits in queries unless the symptom is specifically about them. When a PII value must appear in the report or the chat, mask it, keeping at most the last digits (`<masked>`, `***-1234`; the extension gives the masks of this repository's formats). **E-mail is NOT in this list**: it is a work identifier (house rule) — query it and show it in clear. Minimum-column SELECTs are already the rule; this extends it — prefer ids + first names + e-mail, never dump full rows of the people tables into the transcript.
 - **Evidence over hypothesis.** Every claim in the final report must be backed by a file read, a REPL query, an external API call, or a git log entry. Zero invention.
 - **Ground in the area card.** The area card (`profile.area_cards_glob`) loads with the area's files; it carries the external contracts and invariants (each with its test) the code should keep. A doc is intent, not fact: when card and code diverge, the code wins, and the divergence itself becomes evidence in the report — plus a card-fix candidate.
 - **Competing hypotheses, held open.** Before the first SELECT (Step 3), write 2–4 candidate causes, each with the query or code path that would confirm or discard it. Update the block after each evidence step: strike the discarded, refine the survivors, add new ones. Do not collapse to a single hypothesis until the data forces it — the final report marks each as confirmada / descartada / inconclusiva, with the evidence.
-- **Two lanes when fix intent appears.** This skill stops at the root-cause report. The moment the user signals intent to fix (see Step 9 triggers), size the fix: a fix on the **small** track (≤ ~3 files, no migration, no new screen) is offered as *fix direto* here — fix + regression test + `cdv-finalize` in modo expresso; a fix larger than small, or the user's choice, hands off to `cdv-kickoff` with the report as Shared Understanding context. Never produce a multi-phase fix plan here; producing one is a hard error.
+- **Two lanes when fix intent appears.** This skill stops at the root-cause report. The moment the user signals intent to fix (see Step 8 triggers), size the fix: a fix on the **small** track (≤ ~3 files, no migration, no new screen) is offered as *fix direto* here — fix + regression test + `cdv-finalize` in modo expresso; a fix larger than small, or the user's choice, hands off to `cdv-kickoff` with the report as Shared Understanding context. Never produce a multi-phase fix plan here; producing one is a hard error.
 - **No frontend authoring or review here.** This skill investigates backend bugs; frontend-only bugs are explicitly out of scope. Frontend conventions are owned by `cdv-frontend` — a UI fix is routed through `cdv-kickoff` (its builder loads it). Do not restate UI rules in this skill.
 
 ## Workflow
@@ -43,7 +43,7 @@ Detect which entry point the user provided:
 
 - **Laravel log file** (`<profile.app_dir>/storage/logs/laravel-YYYY-MM-DD.log` or pasted excerpt): proceed to Step 2.
 - **Sentry URL**: ask the user to paste the stack trace and the top-level exception message if the Sentry MCP is not connected. If connected, fetch via MCP.
-- **Human bug report** (someone reported error Y for entity Z): collect at minimum: the reporter's e-mail, the affected entity's identifier (e-mail/name/id), the symptom, the approximate timestamp. If date is missing, default to today.
+- **Human bug report** (someone reported error Y for entity Z): collect at minimum: the reporter's e-mail, the affected entity's identifier (e-mail/name/id), the symptom, the approximate timestamp. If date is missing, default to today. When the report came as a card, read it with the `cdv-notion` client (`notion fetch <card> --discussions`): a form ticket's sections are the report, as the requester wrote them.
 - **Integration trigger** (a workflow-automation execution link, or a "the bot didn't send it" report): the extension may list integration playbooks (`<profile.extension_dir>/cdv-debug/`); load the one that matches — it holds the workflow map, the execution URL format, the batching/abort mechanics and the read-only MCP recipe. When the automation platform's MCP is connected, search and read executions yourself before asking the user for anything.
 
 If essential context is missing (no stack trace, no entity to query), ask exactly one clarifying question before proceeding. Do not guess.
@@ -125,13 +125,11 @@ Follow [references/report-template.md](references/report-template.md). The repor
 
 Keep tables tight.
 
-### Step 8 — (Optional) Render the Análise técnica block for the ticket
+The report stays in the chat, or in a file the developer asks for; nothing of it is written on the card. Cause, diagnosis and test live in the pull request when a fix follows.
 
-Only triggered when `profile.ticket_system` is `notion` and the user wants the analysis on a ticket card. Otherwise stop after Step 7.
+### Step 8 — Two lanes when fix intent appears: fix direto or `cdv-kickoff`
 
-Follow [references/notion-ticket-template.md](references/notion-ticket-template.md) for the exact "Análise técnica" structure and render the block as paste-ready text in the chat (or as ephemeral `analise-<slug>.md` at the repo root when the user prefers a file). When the `cdv-notion` client has a token (`.claude/skills/cdv-notion/scripts/notion auth status` exits `0`) and the user confirms the draft, the block is appended below the card's original description with `notion update <card> --append-file analise-<slug>.md` (or the anchored `--edit` the template describes); otherwise the user pastes it into the card. Do not restate the card's title, status or properties in the block.
-
-### Step 9 — Two lanes when fix intent appears: fix direto or `cdv-kickoff`
+With fix intent, when the bug came from a card or a form ticket, hand its triage and its closing to `cdv-notion-ticket` (the form ticket is picked up, then closed with the summary and the pull request), so the card is written by its owner and never by this skill.
 
 This skill is **debug-only**. The moment the user signals they want to move from "understand the bug" to "plan/implement the fix", stop investigating and pick the lane — with one question, never by assumption.
 
@@ -197,11 +195,11 @@ Solution: surface the recommendation in the report but require explicit confirma
 
 ### User pivots from "understand the bug" to "implement the fix"
 Cause: debug session concluded; user wants to plan/build the correction.
-Solution: **invoke `cdv-kickoff` via the `Skill` tool** with the Shared Understanding block from Step 9. Do not draft phases, file lists, or branch names from this skill. If you already started drafting a plan in chat, acknowledge the slip and hand off formally — the plan must live in `tlc-spec-lean` (started by `cdv-kickoff`), not here.
+Solution: **invoke `cdv-kickoff` via the `Skill` tool** with the Shared Understanding block from Step 8. Do not draft phases, file lists, or branch names from this skill. If you already started drafting a plan in chat, acknowledge the slip and hand off formally — the plan must live in `tlc-spec-lean` (started by `cdv-kickoff`), not here.
 
 ## Tools assumed available
 
-`Read`, `Bash` (REPL + git), `Grep`/`Glob`. Sentry MCP is optional — fall back to pasted stack traces when not connected. The `cdv-notion` client is optional too: without a Notion token the Análise técnica block leaves as paste-ready text (Step 8).
+`Read`, `Bash` (REPL + git), `Grep`/`Glob`. Sentry MCP is optional — fall back to pasted stack traces when not connected. The `cdv-notion` client is optional too: it reads the card a report came with (`notion fetch <card>`); without a Notion token the developer pastes the card's text.
 
 ## Bundled scripts
 
@@ -212,6 +210,4 @@ Solution: **invoke `cdv-kickoff` via the `Skill` tool** with the Shared Understa
 
 - Integration playbooks — `<profile.extension_dir>/cdv-debug/*.md`, listed by the extension. Load the one that matches when the trigger smells like that integration (a sync with a 404 on the external side, a webhook, duplicates, an automation that "didn't fire"). Each holds the known patterns with proof snippets and the read-only access recipe.
 - [references/report-template.md](references/report-template.md) — load before Step 7. Contains the exact section shape and a realistic example.
-- [references/notion-ticket-template.md](references/notion-ticket-template.md) — load only when a Notion ticket URL is in scope (Step 8).
-
 Do not load all of them upfront — each one only when its phase begins.

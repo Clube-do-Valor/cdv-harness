@@ -222,6 +222,21 @@ class HelpdeskTest(SentenceCase):
         self.assertSentence(self.text, r"form ticket is closed with no code change", r"fill the summary property",
                             r"no `## Fechamento` is owed")
 
+    def test_debug_writes_no_analysis_block_and_hands_the_card_to_ticket(self):
+        debug = skill("cdv-debug")
+        self.assertFalse((SKILLS / "cdv-debug" / "references" / "notion-ticket-template.md").exists())
+        for pattern in (r"Análise técnica", r"notion-ticket-template", r"`notion update", r"--append-file",
+                        r"Render the .* block for the ticket"):
+            self.assertNotRegex(debug, re.compile(pattern, re.I))
+        steps = re.findall(r"^### Step (\d+) — (.+)$", debug, re.M)
+        self.assertEqual(steps[-1][0], "8")
+        self.assertIn("Two lanes when fix intent appears", steps[-1][1])
+        self.assertSentence(debug, r"report stays in the chat", r"nothing of it is written on the card", where="cdv-debug")
+        self.assertSentence(debug, r"fix intent", r"card or a form ticket", r"triage and its closing",
+                            r"`cdv-notion-ticket`", where="cdv-debug")
+        for name, text in core_text_files():
+            self.assertFalse("notion-ticket-template" in text, f"{name} still names notion-ticket-template.md")
+
 
 if __name__ == "__main__":
     unittest.main()

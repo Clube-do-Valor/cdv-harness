@@ -48,7 +48,7 @@ Never pad: a branch with two real findings gets two blocks. Two honest findings 
 |---|---|---|
 | `cdv-code-review` | Every per-finding file (three layers, per `comment-format.md`) and the Step 10 chat presentation | `_summary.md`, `INDEX.md`, anchors, severity mapping |
 | `cdv-apply-review` | The Step 3 triage: each finding is presented as **O problema / Como ver na tela / Recomendação** before the verdict and the "aplico?" question | One commit per finding, the verdict table |
-| `cdv-debug` | A **Resumo para quem abriu o chamado** block at the top of the Step 7 report: problema, como ver na tela, desde quando, o que fazer agora, correção recomendada — ten lines, no jargon | The technical report below it; the Notion Análise técnica block |
+| `cdv-debug` | A **Resumo para quem abriu o chamado** block at the top of the Step 7 report: problema, como ver na tela, desde quando, o que fazer agora, correção recomendada — ten lines, no jargon | The technical report below it |
 | `tlc-spec-lean` Verifier | When it reports to the developer: one line naming itself (an independent verification by a child that did not write the code), then each open finding in prose (what is missing, what would break if it stays missing, the test that would cover it) | `verification.md` as `tlc-spec-lean` writes it |
 
 ## Worked example (condensed chat form)

@@ -15,7 +15,7 @@
       "owner": "augusto-henriques",
       "description": "Single-pass code review of a feature branch, emitting paste-ready inline-comment files under <profile.pr_review_dir_prefix>[TICKET]/ (prose in the repository's UI language, verified file:line anchors, _summary.md + INDEX.md). Triggers on 'revise esse PR', 'gera os comentários do code review', 'review my branch before I open the PR'. Read-only — never edits source, never posts. Do NOT use for the multi-agent protocol (\"review PR with subagents\" → cdv-pr-review), debugging (cdv-debug), planning (cdv-kickoff/cdv-grilling), or PR/commit generation (cdv-finalize).",
       "path": "skills/cdv-code-review",
-      "contentHash": "5af2a6fec57577cdbfc56cc693ba76e1acfdaa72724231f52403567e0597c40f"
+      "contentHash": "900f17d380512a115defbd0a85c5f18c828115bd8c633e53be51c5c349b1c57e"
     },
     {
       "name": "cdv-debug",
@@ -23,7 +23,7 @@
       "owner": "augusto-henriques",
       "description": "Read-only root-cause investigation for backend bugs (integrations and sync jobs especially), from a Laravel log, a Sentry issue, or a human report, ending in an evidence-backed report. Triggers on \"investigue esse erro\", \"olha esse log\", \"esse cliente reportou\", \"esse 404 da integração\", \"esse erro do workflow\", or a pasted stack trace. When the user signals fix intent (\"vamos consertar\", \"plano de fix\"), sizes the fix and asks: a small fix (≤ ~3 files, no migration, no new screen) can be done here as \"fix direto\" (fix + test + express finalize); anything larger than small hands off to `cdv-kickoff`. Never produces a multi-phase plan. Do NOT use for feature implementation, refactors, frontend-only bugs, or generic Laravel questions.",
       "path": "skills/cdv-debug",
-      "contentHash": "1a167ea55f1d5cc0aaf1dbe692adf60593afa5bcf2d44295bf7a5b059571b1b2"
+      "contentHash": "fe298569c3fd8bfe57ca27e1bc58fdef4a61ecb31a8481c76f8c7393ce267391"
     },
     {
       "name": "cdv-factory-finalize",
@@ -95,7 +95,7 @@
       "owner": "augusto-henriques",
       "description": "Read, query, create, edit and comment on Notion pages and data sources through the public REST API with the bundled `notion` client (one API token on the machine, no Notion MCP needed) — fetch a card by url, id or ticket key with its properties and body, query a data source with a readable condition and counts, search, change properties in the short format, edit the body in Notion-flavored Markdown, comment, upload and download files, find people. Triggers on any Notion request: \"lê o card\", \"busca no Notion\", \"atualiza o status do card\", \"move o card\", \"escreve no corpo do card\", \"comenta no card\", \"quantos cards\", \"lista as tasks do projeto\", \"fetch this Notion page\", a pasted notion.so or app.notion.com link, or a ticket key. The core skills that touch the card run their Notion steps through this client. Do NOT use to decide what a delivery note or a bug analysis says (cdv-notion-ticket and cdv-debug own the content), or for another ticket system.",
       "path": "skills/cdv-notion",
-      "contentHash": "53db87d5fb979613ac6a9da14e7665bccbd2de855435b2fafc16f36f8fe3032f"
+      "contentHash": "d066f66fa1c60b734c050b8e67b5c7d61f8bf8c4ae8b4f4cacf7d210bde3f65b"
     },
     {
       "name": "cdv-notion-ticket",

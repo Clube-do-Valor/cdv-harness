@@ -74,7 +74,7 @@ A rate limit (429) is waited out inside the client (`Retry-After`, at most 5 tim
 
 ## Composition
 
-- `cdv-notion-ticket` — the delivery note on the card: it decides the content, this client writes it.
+- `cdv-notion-ticket` — the task card and the form ticket at each moment, in the card contract: it decides the content, this client writes it.
 - `cdv-open-pr` — finds or creates the ticket and links the pull request with these commands.
-- `cdv-debug` — appends the Análise técnica block with `notion update <card> --append-file`.
+- `cdv-debug` — reads the card a bug report came with; it writes nothing on it.
 - `cdv-rollout`, `cdv-prod`, `cdv-kickoff` — status moves, one-line notes and plan pages on the card, through the same commands.

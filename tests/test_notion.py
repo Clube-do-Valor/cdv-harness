@@ -2499,7 +2499,6 @@ CORE_FILES = {
     "cdv-notion-ticket": REPO_ROOT / "skills" / "cdv-notion-ticket" / "SKILL.md",
     "cdv-open-pr": REPO_ROOT / "skills" / "cdv-open-pr" / "SKILL.md",
     "cdv-debug": REPO_ROOT / "skills" / "cdv-debug" / "SKILL.md",
-    "notion-ticket-template.md": REPO_ROOT / "skills" / "cdv-debug" / "references" / "notion-ticket-template.md",
 }
 
 MCP_TOOL_WORDS = [r"notion-fetch", r"notion-search", r"notion-update-page", r"notion-create-pages",
@@ -2509,7 +2508,7 @@ MCP_TOOL_WORDS = [r"notion-fetch", r"notion-search", r"notion-update-page", r"no
 
 class CoreSkillsTest(unittest.TestCase):
     def test_core_skills_name_no_mcp_tool_and_name_the_client(self):
-        self.assertEqual(len(CORE_FILES), 4)
+        self.assertEqual(len(CORE_FILES), 3)
         for name, path in CORE_FILES.items():
             with self.subTest(file=name):
                 body = path.read_text(encoding="utf-8")
@@ -2530,26 +2529,6 @@ class CoreSkillsTest(unittest.TestCase):
                 self.assertRegex(body, some_missed)
                 self.assertNotRegex(body, r"`--edit` that did not match \(exit `4`\)")
                 self.assertNotRegex(body, r"`4` \| done in part \(some edits did not match\)")
-
-    def test_ticket_references_use_the_skill_markdown(self):
-        reference = (SKILL_DIR / "references" / "notion-markdown.md").read_text(encoding="utf-8")
-        for name in ("notion-ticket-template.md",):
-            with self.subTest(file=name):
-                body = CORE_FILES[name].read_text(encoding="utf-8")
-                self.assertIn("cdv-notion/references/notion-markdown.md", body)
-                self.assertNotIn("enhanced markdown", body.lower())
-                self.assertIn("<table header-row=\"true\">", body.replace(" fit-page-width=\"true\"", ""))
-                self.assertIn("<tr><td>", body)
-                for form in ("<table header-row=\"true\">", "<tr><td>", "<toggle>"):
-                    self.assertIn(form, reference)
-        self.assertIn("<callout icon=", reference)
-        template = CORE_FILES["notion-ticket-template.md"].read_text(encoding="utf-8")
-        self.assertIn("<toggle>", template)
-
-    def test_the_anchored_append_writes_its_own_separator(self):
-        template = CORE_FILES["notion-ticket-template.md"].read_text(encoding="utf-8")
-        self.assertNotIn('"$(cat anchor.md analise-<slug>.md)"', template)
-        self.assertIn("""--edit "$(cat anchor.md)" "$(cat anchor.md; printf '\\n\\n'; cat analise-<slug>.md)\"""", template)
 
 
 if __name__ == "__main__":
