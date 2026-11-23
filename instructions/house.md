@@ -4,7 +4,7 @@ This block is written by `harness sync` from the cdv-harness core. Change it in 
 
 ### The vendored core
 
-- `.claude/skills/` (the house skills and the vendored third-party ones), `.claude/rules/core/`, `.claude/harness/bin/`, `.claude/harness/hooks/` and `.claude/harness/references/` are copies of the core, pinned by `.claude/harness.lock`, and the core hooks are wired in `.claude/settings.json` under `hooks.PreToolUse`. The CI gate (`sh .claude/harness/bin/verify.sh`) fails a pull request that edits them. A change to them goes to the core first: `harness propose`, then a new tag and `harness sync`. An emergency commit that must touch them carries a `Harness-skip: <reason>` trailer.
+- `.claude/skills/` (the house skills and the vendored third-party ones), `.claude/rules/core/`, `.claude/harness/bin/`, `.claude/harness/hooks/` and `.claude/harness/references/` are copies of the core, pinned by `.claude/harness.lock`, and the core hooks are wired in `.claude/settings.json` under `hooks.PreToolUse`, `hooks.PostToolUse` and `hooks.PostToolUseFailure`. The CI gate (`sh .claude/harness/bin/verify.sh`) fails a pull request that edits them. A change to them goes to the core first: `harness propose`, then a new tag and `harness sync`. An emergency commit that must touch them carries a `Harness-skip: <reason>` trailer.
 - A fact of this repository that a core skill needs goes to the profile or to that skill's extension (`<extension_dir>/cdv-<skill>.md`), never into the vendored copy.
 
 ### Load context before editing
@@ -24,6 +24,8 @@ The code is the source of truth. What it cannot hold — external contracts, agr
 **Search first, always.** Before a feature, search the docs (the profile's `docs_dirs`), `.claude/rules/`, `.claude/skills/` and `.claude/harness/references/` for documentation, a rule or a skill that covers it — without asking first.
 
 **Start a feature with `cdv-kickoff`.** It reads the request, proposes the run profile (track, mode, chain, roles) and runs the chain; small work gets one line and no question. **Plan with `tlc-spec-lean`** (`.specs/features/<slug>/`), vendored in `.claude/skills/`.
+
+**Cards:** every plan is a task card: the approved plan is a child page of the card, and the card follows the card contract that `cdv-notion-ticket` owns (`.claude/skills/cdv-notion-ticket/references/card-contract.md`; `cdv-notion-project` for a project page). The request zone (`## Pedido`, or a project's request toggle) holds the words of who asked and is never rewritten. A write to a card, by a skill or by a free request, is checked by the `card-check` hook, which puts its findings beside the tool result in the same turn.
 
 **Tests:**
 - Every change that introduces new behavior, wiring, validation rules, service logic, or API surface MUST ship with tests in the same PR.

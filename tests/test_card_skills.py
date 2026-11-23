@@ -346,5 +346,37 @@ class ProjectSkillTest(SentenceCase):
         self.sentence(r"fix made after the merge", r"log nothing")
 
 
+class HouseAndDocsTest(unittest.TestCase):
+    def test_house_block_states_the_card_rule_in_one_paragraph(self):
+        house = read(REPO_ROOT / "instructions" / "house.md")
+        paragraphs = [" ".join(p.split()) for p in re.split(r"\n\s*\n", house)]
+        rules = (r"every plan is a task card", r"card follows the card contract",
+                 r"request zone .{0,120}never rewritten", r"write to a card.{0,80}checked by the `card-check` hook")
+        found = [p for p in paragraphs if all(re.search(rule, p, re.I) for rule in rules)]
+        self.assertEqual(len(found), 1, "one paragraph of the house block holds the four card rules")
+
+    def test_changelog_and_readme_describe_the_change(self):
+        changelog = read(REPO_ROOT / "CHANGELOG.md")
+        unreleased = changelog.split("## Unreleased", 1)[1].split("\n## v", 1)[0]
+        bullets = [" ".join(b.split()) for b in re.split(r"\n(?=- )", unreleased) if b.strip().startswith("- ")]
+
+        def bullet(*patterns):
+            found = [b for b in bullets if all(re.search(p, b) for p in patterns)]
+            self.assertTrue(found, f"no bullet of ## Unreleased holds all of {patterns}")
+            return found[0]
+
+        bullet(r"New skill `cdv-notion-project`")
+        bullet(r"`card-check`", r"`PostToolUse`", r"`PostToolUseFailure`", r"A consumer")
+        bullet(r"`sync --user", r"`<config dir>/harness/hooks/`", r"settings\.json", r"runs it once per config dir")
+        bullet(r"ticket-format\.md", r"notion-ticket-template\.md", r"A consumer drops")
+        bullet(r"Removed profile keys", r"`ticket_status_pr_open`", r"`ticket_status_merged`",
+               r"`ticket_status_deployed`", r"A consumer deletes")
+        readme = " ".join(read(REPO_ROOT / "README.md").split())
+        for needle in ("PostToolUse", "PostToolUseFailure", "card-check", "<config dir>/harness/hooks/",
+                       "<config dir>/settings.json", "--config-dir", "$CLAUDE_CONFIG_DIR", "cdv-notion-project"):
+            self.assertIn(needle, readme)
+        self.assertNotIn("PreToolUse hook scripts (require-model, prod-ssh, suite-lock)", readme)
+
+
 if __name__ == "__main__":
     unittest.main()
