@@ -10,6 +10,9 @@ PROJECT_DIR_PREFIX = '"$CLAUDE_PROJECT_DIR"/.claude/harness/hooks/'
 PROD_HOST = "prod.example.invalid"
 OWN_BASH_HOOK = {"matcher": "Bash", "hooks": [{"type": "command", "command": "./scripts/own-check.sh"}]}
 OWN_POST_HOOK = {"matcher": "Edit", "hooks": [{"type": "command", "command": "./scripts/after-edit.sh"}]}
+CARD_CHECK = f"{PROJECT_DIR_PREFIX}card-check"
+POST_MATCHER = "^(Bash|mcp__.+__notion-(update-page|create-pages))$"
+POST_EVENTS = ["PostToolUse", "PostToolUseFailure"]
 
 
 def real_hooks_core():
@@ -241,14 +244,7 @@ class SyncHooksTest(HarnessTestCase):
                                       capture_output=True, cwd=str(repo / "sub"), env=env)
                 self.assertEqual(proc.returncode, 127, proc.stdout + proc.stderr)
 
-
-CARD_CHECK = f"{PROJECT_DIR_PREFIX}card-check"
-POST_MATCHER = "^(Bash|mcp__.+__notion-(update-page|create-pages))$"
-POST_EVENTS = ["PostToolUse", "PostToolUseFailure"]
-
-
-class SyncHookEventsTest(HarnessTestCase):
-    """Entries under PreToolUse, PostToolUse and PostToolUseFailure, and the lock of door 5."""
+    # Entries under PreToolUse, PostToolUse and PostToolUseFailure, and the lock of door 5.
 
     def add_doc(self, core, tag, doc, remove=()):
         files = hook_files()
@@ -256,16 +252,6 @@ class SyncHookEventsTest(HarnessTestCase):
             files.pop(relative, None)
         files["settings/hooks-core.json"] = json.dumps(doc, indent=2) + "\n"
         self.commit_core(core, files, message="feat: core hooks", tag=tag)
-
-    def settings(self, repo):
-        return json.loads((repo / ".claude/settings.json").read_text())
-
-    def consumer_with_own_hooks(self):
-        repo = self.make_consumer()
-        (repo / ".claude/settings.json").write_text(
-            json.dumps({"hooks": {"PreToolUse": [OWN_BASH_HOOK], "PostToolUse": [OWN_POST_HOOK]}}, indent=2) + "\n"
-        )
-        return repo
 
     def test_core_hooks_file_wires_card_check_under_both_events(self):
         doc = real_hooks_core()
