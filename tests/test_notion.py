@@ -1417,6 +1417,30 @@ class TokenTest(ClientTestCase):
         self.assertIn("credentials", out)
         self.assertEqual(self.bearer(), "Bearer ntn_file_value_00000000000000000000000")
 
+    def test_token_order_with_every_source_present(self):
+        keyring_token = "ntn_keyring_value_111111111111111111111"
+        file_token = "ntn_file_value_22222222222222222222222"
+        credentials = self.home / ".config" / "notion" / "credentials"
+        credentials.parent.mkdir(parents=True)
+        credentials.write_text(file_token + "\n")
+        credentials.chmod(0o600)
+        self.keyring = keyring_token
+        for env, wanted, source in ((TOKEN, TOKEN, "NOTION_API_TOKEN"), (None, keyring_token, "keyring")):
+            with self.subTest(env=bool(env)):
+                if env:
+                    os.environ["NOTION_API_TOKEN"] = env
+                else:
+                    os.environ.pop("NOTION_API_TOKEN", None)
+                code, out, err = self.run_cli("auth", "status")
+                self.assertEqual(code, 0, err)
+                self.assertIn(source, out)
+                self.assertEqual(self.bearer(), "Bearer " + wanted)
+        self.keyring = None
+        code, out, err = self.run_cli("auth", "status")
+        self.assertEqual(code, 0, err)
+        self.assertIn("credentials", out)
+        self.assertEqual(self.bearer(), "Bearer " + file_token)
+
     def test_token_never_printed(self):
         self.fake.on("GET", rf"/v1/pages/{PAGE}/markdown",
                      lambda r: error(400, "validation_error", "bad header " + r.headers["authorization"]))
