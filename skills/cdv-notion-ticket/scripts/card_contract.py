@@ -154,14 +154,98 @@ def fold(text):
     return " ".join(unicodedata.normalize("NFC", plain(text)).casefold().split())
 
 
+# A line of the request, read for its digest: an escaped character, inline code, a tag, a bare address,
+# and the brackets of a link or a picture with its address.
+REQUEST_TOKEN = re.compile(
+    ESCAPE.pattern.replace("(", "(?P<escaped>", 1)
+    + r"|(?P<ticks>`+)(?P<code>.+?)(?<!`)(?P=ticks)(?!`)"
+    + r"|(?P<tag><(?P<closing>/?)(?P<name>[A-Za-z][\w-]*)"
+      r"(?P<attributes>(?:\s+[\w:-]+(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'<>=`]+))?)*)\s*/?>)"
+    + r"|(?P<bare>https?://[^\s<>\[\]()\\*`]*[^\s<>\[\]()\\*`_~])"
+    + r"|\]\((?P<address>(?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*\))*)(?P<rest>(?:\s+(?:\"[^\"]*\"|'[^']*'))?)\)"
+)
+ATTRIBUTE = re.compile(r"([\w:-]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s\"'<>=`]+))")
+# Tags that only format the words inside them; tags that lay blocks out, read as a space; and tags that
+# carry words of their own. Any other tag is text (notion-markdown.md: it is saved as literal text).
+FORMAT_TAGS = {"b", "strong", "i", "em", "s", "del", "strike", "u", "ins", "span", "code"}
+BLOCK_TAGS = {"p", "br", "empty-block", "callout", "toggle", "quote", "columns", "column", "table", "thead", "tbody",
+              "colgroup", "col", "tr", "page", "database", "bookmark", "embed", "unknown", "file", "pdf", "audio",
+              "video", "image", "img"}
+CELL_TAGS = {"td", "th"}
+WORD_TAGS = {"a", "mention", "date"}
+TARGET_ATTRIBUTES = {"url", "href", "source", "src"}
+DATE_ATTRIBUTES = {"start", "end", "start-time", "end-time", "time-zone"}
+CAPTION_ATTRIBUTES = {"alt", "caption"}
+EMPHASIS = [re.compile(pattern) for pattern in (
+    r"\*\*(?=\S)(.+?)\*\*", r"(?<!\w)__(?=\S)(.+?)__(?!\w)", r"~~(?=\S)(.+?)~~",
+    r"(?<!\*)\*(?=\S)(.+?)(?<=\S)\*(?!\*)", r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)")]
+
+
+def address_of(text):
+    """The address a link or a tag holds, escapes undone."""
+    return html.unescape(ESCAPE.sub(r"\1", text))
+
+
+def tag_words(match):
+    """What a tag adds to the request's words: nothing for formatting, its target, the days and hours of
+    a date, its caption; a tag that is none of Notion's is text."""
+    name = match.group("name").lower()
+    if name in FORMAT_TAGS:
+        return ""
+    if name in CELL_TAGS:
+        return " " if match.group("closing") else " | "
+    if name not in BLOCK_TAGS and name not in WORD_TAGS:
+        return match.group("tag")
+    said = []
+    for key, *values in ATTRIBUTE.findall(match.group("attributes")):
+        key, value = key.lower().replace("_", "-"), address_of("".join(values))
+        if key in TARGET_ATTRIBUTES:
+            said.append(f"<{value}>")
+        elif key in CAPTION_ATTRIBUTES or (name == "date" and key in DATE_ATTRIBUTES):
+            said.append(f"<{key}={value}>")
+    space = " " if name in BLOCK_TAGS else ""
+    return space + "".join(sorted(said)) + space
+
+
+def request_words(line):
+    """The words of one line of the request with only their formatting dropped (bold, italics, colour,
+    inline code marks, escapes): the target of every link and mention, the days and hours of a date and
+    the text of inline code stay. `plain`, which labels and titles are compared with, drops every tag."""
+    kept, out, last = [], [], 0
+
+    def hold(text):
+        kept.append(text)
+        return f"\x00{len(kept) - 1}\x00"
+
+    for match in REQUEST_TOKEN.finditer(line):
+        out.append(line[last : match.start()])
+        last = match.end()
+        if match.group("escaped"):
+            out.append(hold(match.group("escaped")))
+        elif match.group("ticks"):
+            out.append(hold(match.group("code")))
+        elif match.group("tag"):
+            said = tag_words(match)
+            out.append(hold(said) if said.strip() else said)
+        elif match.group("bare"):
+            out.append(hold(address_of(match.group("bare"))))
+        else:
+            out.append("]" + hold(f"({address_of(match.group('address'))}){match.group('rest')}"))
+    text = "".join(out) + line[last:]
+    for pattern in EMPHASIS:
+        text = pattern.sub(r"\1", text)
+    text = html.unescape(text)
+    return re.sub(r"\x00(\d+)\x00", lambda m: kept[int(m.group(1))], text).replace("️", "")
+
+
 def digest(text):
-    """The sha256 of the request's words: each line as plain text, and what a code fence holds as it
-    is written (the fence's own marks and its language are formatting), whitespace collapsed."""
+    """The sha256 of the request's words: each line with its formatting dropped, and what a code fence
+    holds as it is written (the fence's own marks and its language are formatting), whitespace collapsed."""
     lines = text.splitlines()
     words = []
     for line, state in zip(lines, fences(lines)):
         if state is None:
-            words += "" if EMPTY_PARAGRAPH.match(line.strip()) else plain(line).split()
+            words += "" if EMPTY_PARAGRAPH.match(line.strip()) else request_words(line).split()
         elif state == INSIDE:
             words += line.split()
     return hashlib.sha256(" ".join(words).encode("utf-8")).hexdigest()

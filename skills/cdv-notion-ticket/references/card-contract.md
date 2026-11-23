@@ -207,5 +207,5 @@ The first check of a card pins its request zone (the text from `## Pedido` to `#
 request toggle of a project) as a digest under the client's cache directory, never as text. A later
 change is the finding `request-changed`: the zone is restored, not rewritten, unless who asked
 changed it, and then `card_contract.py accept-request <ref>` pins the new text. The digest is taken
-over the words of the request, with only their formatting dropped: the text inside a code fence is
-kept as it is written.
+over the words of the request, with only their formatting dropped (bold, italics, colour): the text
+inside a code fence, the target of every link and mention and the day of a date are kept.

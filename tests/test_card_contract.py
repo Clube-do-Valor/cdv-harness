@@ -481,6 +481,70 @@ class RequestPinTest(CardCase):
                 self.set_body(page, body(nested.replace("boleto 10", "boleto 99")))
                 self.assertEqual(self.rules(page), ["request-changed"])
 
+    def test_a_repointed_link_mention_or_date_in_the_request_is_reported(self):
+        one, two = "a" * 32, "b" * 32
+        repointed = {
+            "a mention of a page": '<mention url="https://app.notion.com/p/{}">Plano</mention>',
+            "a mention of a person": 'Com <mention url="user://{}">Ana Lima</mention>, hoje.',
+            "a mention with no text": '<mention url="https://app.notion.com/p/{}" />',
+            "single quotes": "<mention url='user://{}'>Ana</mention>",
+            "a mention inside bold": '**veja <mention url="user://{}">Ana</mention>**',
+            "a markdown link": "[o plano](https://app.notion.com/p/{})",
+            "a markdown link with a title": '[o plano](https://app.notion.com/p/{} "Plano")',
+            "a link tag": '<a href="https://example.com/{}">o plano</a>',
+            "underscores in a link": "[x](https://example.com/__{}__/y)",
+            "a bare address": "https://example.com/{}",
+            "the query of a link": "[x](https://example.com/y?id={})",
+            "the query of a bookmark": '<bookmark source="https://example.com/y?id={}" />',
+            "a child page": '<page url="https://app.notion.com/p/{}">Anexo</page>',
+            "a database": '<database url="https://app.notion.com/p/{}">Base</database>',
+            "an embed": '<embed source="https://example.com/{}" />',
+            "a file": '<file source="https://example.com/{}.txt">nota</file>',
+            "a block not loaded": '<unknown url="https://app.notion.com/p/{}" alt="x" />',
+        }
+        pairs = [(name, text.format(one), text.format(two)) for name, text in repointed.items()]
+        day = '<date start="2026-11-22" />'
+        pairs += [
+            ("the day of a date", "Até " + day, "Até " + day.replace("11-22", "12-30")),
+            ("the end of a date", '<date start="2026-11-22" end="2026-11-23" />', '<date start="2026-11-22" end="2026-11-24" />'),
+            ("the hour of a date", '<date start="2026-11-22" start-time="09:00" />', '<date start="2026-11-22" start-time="18:00" />'),
+            ("a mention taken out", f'<mention url="user://{one}">Ana</mention> pediu', "Ana pediu"),
+            ("a link taken out", f"[Ana](https://example.com/{one}) pediu", "Ana pediu"),
+            ("a word that only looks like a tag", "envie para <cliente> hoje", "envie para <fornecedor> hoje"),
+            ("a tag as text in inline code", "use `<b>` aqui", "use `<i>` aqui"),
+            ("an escaped tag", "use \\<b> aqui", "use \\<i> aqui"),
+            ("stars in inline code", "`**x**`", "`x`"),
+            ("stars typed by hand", "\\*x\\*", "x"),
+            ("underscores in a bare address", "https://example.com/_a_/y", "https://example.com/a/y"),
+            ("a caption in an attribute", '<img src="https://example.com/x.png" alt="boleto" />', '<img src="https://example.com/x.png" alt="extrato" />'),
+            ("a cell of a table", "<table>\n<tr><td>10</td><td>0</td></tr>\n</table>", "<table>\n<tr><td>1</td><td>00</td></tr>\n</table>"),
+            ("a caption", "![tela do boleto](https://example.com/x.png)", "![tela do extrato](https://example.com/x.png)"),
+        ]
+        self.assertRequest(pairs, ["request-changed"])
+        self.assertRequest([
+            ("bold", "o **pedido** chegou", "o pedido chegou"),
+            ("bold as a tag", "o pedido chegou", "o <b>pedido</b> chegou"),
+            ("bold around a space", "**Nota: **urgente", "<b>Nota: </b>urgente"),
+            ("italics", "o *pedido* e o _prazo_", "o <i>pedido</i> e o <em>prazo</em>"),
+            ("bold italics", "***pedido***", "pedido"),
+            ("strikethrough", "o ~~pedido~~", "o <s>pedido</s>"),
+            ("underline", "o <u>pedido</u>", "o pedido"),
+            ("colour", 'o <span color="red">pedido</span>', 'o <span color="blue_bg">pedido</span>'),
+            ("colour alone", 'o <span color="red">pedido</span>', "o pedido"),
+            ("the colour of a callout", '<callout icon="⚡" color="red">\nAviso\n</callout>', '<callout color="blue_bg">\nAviso\n</callout>'),
+            ("inline code as a tag", "a `SELECT * FROM x_y` b", "a <code>SELECT \\* FROM x\\_y</code> b"),
+            ("bold around a link", f"**[x](https://example.com/{one})**", f"<b>[x](https://example.com/{one})</b>"),
+            ("bold around an address", "**https://example.com/x**", "https://example.com/x"),
+            ("bold in the words of a mention", f'<mention url="user://{one}">**Ana**</mention>', f'<mention url="user://{one}">Ana</mention>'),
+            ("an entity in an address", "[x](https://example.com/y?a=1&b=2)", "[x](https://example.com/y?a=1&amp;b=2)"),
+            ("an entity in a tag", '<a href="https://example.com/y?a=1&b=2">x</a>', '<a href="https://example.com/y?a=1&amp;b=2">x</a>'),
+            ("an underscore escaped in a link", "[x](https://example.com/a_b)", "[x](https://example.com/a\\_b)"),
+            ("the order of a tag's attributes", '<date start="2026-11-22" end="2026-11-23" />', '<date end="2026-11-23" start="2026-11-22"/>'),
+            ("stars that are text", "2 * 3 e snake__case", "2 \\* 3 e snake\\_\\_case"),
+        ], [])
+        page = self.add(cf.task(9, "## Pedido\n\nO pedido.\n\n" + entrega().replace("**Objetivo:**", '<a href="https://x">**Objetivo:**</a>')))
+        self.assertClean(page)  # labels are compared as plain text, every tag dropped
+
 
 class FailureTest(CardCase):
     def test_no_token_exits_3_and_an_unreadable_page_exits_4_with_the_client_message(self):
