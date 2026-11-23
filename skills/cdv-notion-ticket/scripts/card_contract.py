@@ -30,6 +30,7 @@ import contextlib
 import copy
 import datetime
 import hashlib
+import html
 import importlib.machinery
 import importlib.util
 import io
@@ -124,13 +125,15 @@ def limits():
 # ---------------------------------------------------------------------------------------------
 
 ESCAPE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|<>$~])")
-FORMAT_TAGS = re.compile(r"</?(?:b|strong|i|em|u|s|code)>", re.I)
+INLINE_TAG = re.compile(r"</?[A-Za-z][\w-]*(?:\s[^<>]*)?/?>")
+EMPTY_PARAGRAPH = re.compile(r"^<(?:p|empty-block)\s*/>$")
 
 
 def plain(text):
-    """The words of a markdown line with inline formatting dropped: `**x**`, `__x__`, `<b>x</b>`,
-    `<strong>`, italics, inline code and backslash escapes all read as the bare text, so a card read
-    back from Notion (bold as `<b>`, `_` as `\\_`) compares equal to the form it was written in."""
+    """The words of a markdown line with inline formatting dropped: `**x**`, `__x__`, every inline tag
+    (`<b>x</b>`, `<strong>`, a coloured `<span color="blue">`), italics, inline code, backslash escapes
+    and entity escapes all read as the bare text, so a card read back from Notion (bold as `<b>`, `_`
+    as `\\_`, `&` as `&amp;`) compares equal to the form it was written in."""
     kept = []
 
     def hold(match):
@@ -138,9 +141,10 @@ def plain(text):
         return f"\x00{len(kept) - 1}\x00"
 
     text = ESCAPE.sub(hold, text)
-    text = FORMAT_TAGS.sub("", text)
+    text = INLINE_TAG.sub("", text)
     text = text.replace("**", "").replace("__", "").replace("`", "")
     text = re.sub(r"(?<![\w*])\*(?=\S)|(?<=\S)\*(?![\w*])", "", text)
+    text = html.unescape(text)
     text = re.sub(r"\x00(\d+)\x00", lambda m: kept[int(m.group(1))], text)
     return text.replace("️", "").strip()
 
@@ -171,7 +175,8 @@ BOLD_DATE = re.compile(
 
 
 def body_lines(markdown):
-    """The body's lines with fenced code blanked out, so nothing inside a fence is a heading."""
+    """The body's lines with fenced code blanked out, so nothing inside a fence is a heading, and an
+    empty paragraph as a fetch returns it (`<p />`, `<p/>`, `<empty-block/>`) read as a blank line."""
     out, fence = [], None
     for line in (markdown or "").splitlines():
         marker = line.lstrip()[:3]
@@ -179,7 +184,7 @@ def body_lines(markdown):
             fence = None if fence == marker else (fence or marker)
             out.append("")
             continue
-        out.append("" if fence else line)
+        out.append("" if fence or EMPTY_PARAGRAPH.match(line.strip()) else line)
     return out
 
 

@@ -78,7 +78,10 @@ body, `Pedido atendido em <key of the kept card>.`
 `card_contract.py skeleton <kind>` prints each of these, ready to paste. Text between `<` and `>` is
 filled per card; the titles, the labels and their order are fixed. Blank lines are not part of the
 contract, and neither is the way Notion writes inline formatting back (bold reads back as
-`<b>...</b>`, an underscore as `\_`): the checker compares titles, labels and dates as plain text.
+`<b>...</b>`, an underscore as `\_`, an ampersand as `&amp;`, a coloured label inside a `<span>`):
+the checker compares titles, labels and dates as plain text, with every inline tag dropped and
+backslash and entity escapes undone. An empty paragraph, which a fetch returns as a line holding
+only `<p />` or `<empty-block/>`, is a blank line.
 
 Task card, with a plan (`skeleton task`):
 

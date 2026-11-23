@@ -519,8 +519,12 @@ class ReadOnlyTest(CardCase):
                 self.assertFalse(call.path.startswith(("/v1/pages", "/v1/comments")), call.path)
 
 
+EMPTY_PARAGRAPHS = ("<p />", "<p/>", "<empty-block/>")
+
+
 class ReadBackTest(CardCase):
-    """Notion reads bold back as <b>...</b> and escapes an underscore: the same card, the same result."""
+    """Notion reads bold back as <b>...</b>, escapes an underscore and an ampersand, wraps a coloured
+    label in a span and writes an empty paragraph as a tag line: the same card, the same result."""
 
     @staticmethod
     def read_back(body):
@@ -549,14 +553,32 @@ class ReadBackTest(CardCase):
         self.assertEqual(self.rules(scope), [])
         status = self.add(cf.task(23, full_task() + "\n<b>Status:</b> Done\n"))
         self.assertEqual(self.rules(status), ["status-in-body"])
+        for offset, empty in enumerate(EMPTY_PARAGRAPHS):
+            with self.subTest(empty=empty):
+                body = full_task().replace("**Pronto quando:**\n\n", "**Pronto quando:**\n" + empty + "\n")
+                body = body.replace("## Entrega\n\n", "## Entrega\n" + empty + "\n")
+                page = self.add(cf.task(30 + offset, body, status="Rollout", pr=PR_URL, summary=SUMMARY))
+                self.assertEqual(self.rules(page), [])
+                log = self.add(cf.project(40 + offset, cf.project_body(current=CURRENT + empty + "\n")))
+                self.assertEqual(self.rules(log), [])
+        coloured = full_task().replace("**Objetivo:**", '<span color="blue"><b>Objetivo:</b></span>')
+        self.assertEqual(self.rules(self.add(cf.task(50, coloured, status="Rollout", pr=PR_URL, summary=SUMMARY))), [])
+        entity = cf.project_body(current=CURRENT).replace("Discovery & Define", "Discovery &amp; Define")
+        self.assertIn("Discovery &amp; Define", entity)
+        self.assertEqual(self.rules(self.add(cf.project(51, entity))), [])
 
     def test_the_request_digest_is_the_same_for_both_forms(self):
         written = "## Pedido\n\nO **time** de cobrança quer o arquivo faturas_do_mes.csv.\n\n"
         self.assertEqual(self.cc.digest(written), self.cc.digest(self.read_back(written)))
         self.assertNotEqual(self.cc.digest(written), self.cc.digest(written.replace("cobrança", "vendas")))
+        for empty in EMPTY_PARAGRAPHS:
+            self.assertEqual(self.cc.digest(written), self.cc.digest(written.replace("\n\nO ", "\n" + empty + "\nO ")))
+        self.assertEqual(self.cc.digest("Contas a pagar & receber."), self.cc.digest("Contas a pagar &amp; receber."))
         page = self.add(cf.task(1, written + entrega()))
         self.assertClean(page)
         self.set_body(page, self.read_back(written + entrega()))
+        self.assertClean(page)
+        self.set_body(page, self.read_back(written + "<empty-block/>\n" + entrega()))
         self.assertClean(page)
 
 
