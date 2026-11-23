@@ -453,6 +453,8 @@ class Notion:
         self.me_unresolved = ''  # why `me` could not be resolved, once me() has tried
         self._settings = None
         self._schemas = {}
+        self._fresh = set()  # data sources whose schema was read from the API in this command
+        self._list_fresh = False  # the data source list was read from the API in this command
 
     # -- secrets and output ---------------------------------------------------------------
 
@@ -762,13 +764,31 @@ class Notion:
         if cached is None:
             cached = self.call('GET', f'/v1/data_sources/{identifier}')
             self.cache.put(f'schema-{identifier}', cached)
+            self._fresh.add(identifier)
         self._schemas[identifier] = cached
         return cached
+
+    def refresh_schema(self, schema):
+        """Re-read a data source's schema from the API, at most once per command, and bring `schema` (the
+        caller's copy) up to date in place. False when there is nothing to re-read: no id, or already fresh."""
+        identifier = schema.get('id')
+        if not identifier or identifier in self._fresh:
+            return False
+        fresh = self.data_source(identifier, refresh=True)
+        if fresh is not schema:
+            schema.clear()
+            schema.update(fresh)
+        return True
+
+    def refresh_data_sources(self):
+        """The list of connected data sources re-read, at most once per command; None when it was already."""
+        return None if self._list_fresh else self.data_sources(refresh=True)
 
     def data_sources(self, refresh=False):
         listed = None if refresh else self.cache.get('data_sources')
         if listed is not None:
             return listed
+        self._list_fresh = True
         found, _ = self.pages_of('POST', '/v1/search', {'filter': {'property': 'object', 'value': 'data_source'}})
         listed = []
         for source in found:
@@ -777,6 +797,7 @@ class Notion:
             if source.get('properties'):
                 self.cache.put(f"schema-{source['id']}", source)
                 self._schemas[source['id']] = source
+                self._fresh.add(source['id'])
                 schema = source
             else:
                 schema = self.data_source(source['id'], refresh=True)
@@ -850,6 +871,7 @@ class Notion:
                 return 'page', found
             if kind == 'data_source':
                 self._schemas[identifier] = found
+                self._fresh.add(identifier)
                 self.cache.put(f'schema-{identifier}', found)
                 return 'data_source', found
             sources = found.get('data_sources') or []
@@ -868,10 +890,13 @@ class Notion:
             raise
 
     def data_source_titled(self, text):
-        for source in self.data_sources():
-            if fold(source['title']) == fold(text):
-                return self.get_data_source(source['id'])
-        return None
+        def find(listed):
+            return next((s for s in listed if fold(s['title']) == fold(text)), None)
+
+        found = find(self.data_sources())
+        if found is None:  # a data source connected after the list was cached
+            found = find(self.refresh_data_sources() or [])
+        return self.get_data_source(found['id']) if found else None
 
     def page(self, text):
         kind, found = self.resolve(text)
@@ -1231,6 +1256,7 @@ def schema_lines(client, schema, budget=SCHEMA_BUDGET):
 def cmd_fetch(client, args):
     kind, found = client.resolve(args.ref)
     if kind == 'data_source':
+        client.refresh_schema(found)  # the schema a write is built from is read from the API, whatever the reference form
         if args.json:
             client.say(json.dumps(found, ensure_ascii=False, indent=2))
         else:
@@ -1773,7 +1799,7 @@ def compile_node(client, node, schema, sources):
     return compiled
 
 
-def where_property(schema, name):
+def where_property(schema, name, client=None):
     properties = schema['properties']
     if name in properties:
         return name, properties[name]
@@ -1790,13 +1816,15 @@ def where_property(schema, name):
             for candidate, prop in properties.items():
                 if prop.get('type') == kind:
                     return candidate, prop
+    if client is not None and client.refresh_schema(schema):  # the cached schema may be stale: look once more
+        return where_property(schema, name, client)
     close = nearest(name, list(properties))
     hint = f"did you mean {' or '.join(close)}?" if close else f"properties: {', '.join(properties)}"
     raise Fail(USAGE, f'unknown property {name!r} in the condition; {hint}')
 
 
 def compile_condition(client, schema, name, operator, values):
-    prop_name, prop = where_property(schema, name)
+    prop_name, prop = where_property(schema, name, client)
     kind = prop.get('type')
     head = {'timestamp': prop_name} if kind == 'timestamp' else {'property': prop_name}
     key = prop_name if kind == 'timestamp' else kind
@@ -1885,14 +1913,14 @@ def compile_condition(client, schema, name, operator, values):
                       'use `notion api POST /v1/data_sources/<id>/query --data <filter>`')
 
 
-def parse_order(schema, text):
+def parse_order(schema, text, client=None):
     sorts = []
     for part in [p.strip() for p in text.split(',') if p.strip()]:
         words = part.rsplit(None, 1)
         direction = 'ascending'
         if len(words) == 2 and words[1].lower() in ('asc', 'desc', 'ascending', 'descending'):
             part, direction = words[0], 'descending' if words[1].lower().startswith('desc') else 'ascending'
-        name, prop = where_property(schema, part.strip().strip('"`'))
+        name, prop = where_property(schema, part.strip().strip('"`'), client)
         if prop.get('type') in ('timestamp', 'created_time', 'last_edited_time'):
             sorts.append({'timestamp': name if prop.get('type') == 'timestamp' else prop['type'], 'direction': direction})
         else:
@@ -1918,11 +1946,11 @@ def cmd_query(client, args):
     if args.where:
         body['filter'] = compile_where(client, args.where, schema)
     if args.order:
-        body['sorts'] = parse_order(schema, args.order)
+        body['sorts'] = parse_order(schema, args.order, client)
     columns = None
     if args.select:
-        columns = [where_property(schema, c.strip().strip('"`'))[0] for c in args.select.split(',') if c.strip()]
-    group = where_property(schema, args.group_by)[0] if args.group_by else None
+        columns = [where_property(schema, c.strip().strip('"`'), client)[0] for c in args.select.split(',') if c.strip()]
+    group = where_property(schema, args.group_by, client)[0] if args.group_by else None
     max_rows = args.max_rows or MAX_ROWS
     rows, more = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query", body, max_items=max_rows)
     stopped = f'stopped paging at {max_rows} rows; more rows match (--max-rows N raises the cap)' if more else ''
@@ -2010,24 +2038,37 @@ def cmd_search(client, args):
             kind, scope = client.resolve(args.within, want='data_source')
             if kind != 'data_source':
                 raise Fail(USAGE, f'--in takes a data source, and {args.within} is a page')
-            sources = [scope]
+            queue = [scope['id']]
         else:
             found, _ = client.pages_of('POST', '/v1/search', {'query': words, 'filter': {'property': 'object', 'value': 'page'}},
                                        max_items=limit)
             for page in found:
                 if page.get('object') == 'page':
                     add(page, 'title')
-            sources = [client.data_source(s['id']) for s in client.data_sources()]
+            queue = [s['id'] for s in client.data_sources()]
         needle = fold(words)
-        for schema in sources:
-            props = schema['properties']
-            searchable = [n for n, p in props.items() if p.get('type') in ('title', 'rich_text')]
-            conditions = [{'property': n, props[n]['type']: {'contains': words}} for n in searchable]
-            if not conditions:
+        searched = set()
+        while queue:
+            identifier = queue.pop(0)
+            searched.add(identifier)
+            try:
+                schema = client.data_source(identifier)
+                props = schema['properties']
+                searchable = [n for n, p in props.items() if p.get('type') in ('title', 'rich_text')]
+                conditions = [{'property': n, props[n]['type']: {'contains': words}} for n in searchable]
+                if not conditions:
+                    continue
+                rows, _ = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query",
+                                          {'filter': {'or': conditions} if len(conditions) > 1 else conditions[0]},
+                                          max_items=limit)
+            except ApiError as failure:
+                if args.within or failure.status not in (403, 404):
+                    raise
+                # a data source of the cached list that is no longer connected: read the list again, once, and skip it
+                fresh = client.refresh_data_sources()
+                if fresh is not None:
+                    queue = [s['id'] for s in fresh if s['id'] not in searched]
                 continue
-            rows, _ = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query",
-                                      {'filter': {'or': conditions} if len(conditions) > 1 else conditions[0]},
-                                      max_items=limit)
             for row in rows:
                 values = client.short_values(row, names=set(searchable) | {n for n, p in props.items() if p.get('type') == 'unique_id'})
                 matched = next((n for n, v in values.items() if isinstance(v, str) and needle in fold(v)), None)

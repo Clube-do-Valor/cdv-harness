@@ -2313,6 +2313,87 @@ class CacheTest(ClientTestCase):
         self.assertTrue(cache.is_dir())
 
 
+class StaleCacheTest(ClientTestCase):
+    """What the cache holds can be older than the workspace: a read re-reads it once before it refuses."""
+
+    DS_ROADMAP = uid(0xD53)
+
+    def warm(self):
+        """A cache built before the workspace changed."""
+        shutil.rmtree(self.home / ".cache", ignore_errors=True)
+        self.fake.data_sources[DS_TASKS]["properties"].pop("Priority", None)
+        code, out, err = self.run_cli("fetch", key(120))
+        self.assertEqual(code, 0, err)
+        self.fake.data_sources[DS_TASKS]["properties"]["Priority"] = {
+            "id": "pri", "name": "Priority", "type": "select",
+            "select": {"options": [option("High", 1), option("Low", 2)]}}
+        self.fake.calls.clear()
+
+    def schema_reads(self):
+        return self.fake.sent("GET", rf"/v1/data_sources/{DS_TASKS}")
+
+    def list_reads(self):
+        return [c for c in self.fake.sent("POST", r"/v1/search") if (c.json or {}).get("filter", {}).get("value") == "data_source"]
+
+    def test_query_rereads_the_schema_once_for_a_name_the_cache_lacks(self):
+        flags = {"--where": "Priority = 'High'", "--select": "Task name,Priority", "--order": "Priority desc",
+                 "--group-by": "Priority"}
+        for flag, value in flags.items():
+            with self.subTest(flag=flag):
+                self.warm()
+                code, out, err = self.run_cli("query", COLLECTION + DS_TASKS, flag, value)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(len(self.schema_reads()), 1)
+                self.assertEqual(len(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query")), 1)
+        self.warm()
+        code, out, err = self.run_cli("query", COLLECTION + DS_TASKS, "--where", "Priority = 'High' AND Sprint = 'x'")
+        self.assertEqual(code, 2)
+        self.assertIn("unknown property 'Sprint' in the condition", err)
+        self.assertEqual(len(self.schema_reads()), 1)
+        self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
+
+    def test_fetch_of_a_data_source_reads_the_api_whatever_the_reference_form(self):
+        outputs = []
+        for form in (COLLECTION + DS_TASKS, "Tasks", DS_TASKS, hex32(DS_TASKS)):
+            with self.subTest(form=form):
+                self.warm()
+                code, out, err = self.run_cli("fetch", form)
+                self.assertEqual(code, 0, err)
+                self.assertIn("Priority", out)
+                self.assertEqual(len(self.schema_reads()), 1)
+                self.assertIn("Priority", (self.home / ".cache" / "cdv-notion" / f"schema-{DS_TASKS}.json").read_text())
+                outputs.append(out)
+        self.assertEqual(len(set(outputs)), 1)
+
+    def test_a_data_source_title_missing_from_the_cached_list_refreshes_the_list_once(self):
+        self.warm()
+        self.fake.data_sources[self.DS_ROADMAP] = data_source(self.DS_ROADMAP, "Roadmap", projects_schema(), uid(0xD3))
+        code, out, err = self.run_cli("fetch", "Roadmap")
+        self.assertEqual(code, 0, err)
+        self.assertIn("data source: Roadmap", out)
+        self.assertEqual(len(self.list_reads()), 1)
+        self.fake.calls.clear()
+        code, out, err = self.run_cli("fetch", "Nowhere")
+        self.assertEqual(code, 2)
+        self.assertIn("'Nowhere' is not a page id, a url, a key or the title of a connected data source", err)
+        self.assertEqual(len(self.list_reads()), 1)
+
+    def test_search_skips_a_data_source_no_longer_connected_after_one_list_refresh(self):
+        gone = {"404": lambda: self.fake.data_sources.pop(DS_PROJECTS),
+                "403": lambda: self.fake.on("POST", rf"/v1/data_sources/{DS_PROJECTS}/query",
+                                            lambda r: error(403, "restricted_resource", "Not shared."))}
+        for status, disconnect in gone.items():
+            with self.subTest(status=status):
+                self.fake.data_sources[DS_PROJECTS] = data_source(DS_PROJECTS, "Projects", projects_schema(), DB_PROJECTS)
+                self.fake.overrides.clear()
+                self.warm()
+                disconnect()
+                code, out, err = self.run_cli("search", "invoice")
+                self.assertEqual(code, 0, err)
+                self.assertIn(self.page["url"], out)
+                self.assertEqual(len(self.list_reads()), 1)
+
+
 class ApiTest(ClientTestCase):
     def test_api_refuses_a_path_outside_v1(self):
         for path in ("/v2/pages", "/users/me", "https://elsewhere.example.com/v1/users/me", "../v1/users/me"):
