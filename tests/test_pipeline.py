@@ -234,21 +234,29 @@ class DeliveryProseTest(unittest.TestCase):
             r"report the status (it|the pipeline) ended on",
         )
 
-    def test_rollout_sets_merged_or_deployed_and_asks_one_step_per_question(self):
+    def test_rollout_calls_the_closing_moment_and_comments_each_step(self):
         self.assertSentence(
-            "cdv-rollout", r"\bmerged\b", r"`profile\.ticket_status_merged`", r"\bdeployed\b", r"`profile\.ticket_status_deployed`"
+            "cdv-rollout", r"\bmerged or deployed\b", r"closing moment of `cdv-notion-ticket`", r"`## Fechamento`",
+            r"status of that event",
+        )
+        self.assertSentence(
+            "cdv-rollout", r"each manual production step", r"one comment on the card", r"what ran, when, by whom, the result",
+            r"no line in the body",
         )
         self.assertSentence("cdv-rollout", r"production steps", r"not automatic", r"one per question")
+        text = (REPO_ROOT / "skills" / "cdv-rollout" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotRegex(text, r"ticket_status_|write one line on the card")
 
-    def test_big_track_plan_goes_to_the_ticket_system_not_a_commit(self):
+    def test_approved_plan_goes_to_a_child_page_of_the_task_card_not_a_commit(self):
         self.assertSentence(
             "cdv-kickoff",
-            r"big track",
+            r"every track that has a plan",
             r"approved plan",
-            r"page under the project",
-            r"ticket system",
-            r"never add it to a commit",
+            r"child page of the task card",
+            r"never added to a commit",
         )
+        text = (REPO_ROOT / "skills" / "cdv-kickoff" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn("page under the project", text)
 
 
 if __name__ == "__main__":

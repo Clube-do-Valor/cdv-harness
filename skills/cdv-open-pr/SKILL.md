@@ -50,9 +50,9 @@ Look up the open PR of the branch (`for-branch` on Bitbucket, `gh pr list --head
 
 Skip this step when `profile.ticket_system` is `none`. The PR links its ticket in a `## 🏷️ Ticket` section — the host template's placeholder may be left unfilled. Find it in this order:
 
-1. The conversation or `STATE-<slug>.md` (a ticket URL or a key matching `profile.ticket_key_pattern`).
+1. A key in the conversation, in `STATE-<slug>.md` or in the branch name (a ticket URL or a key matching `profile.ticket_key_pattern`), before any search by theme.
 2. The ticket database (`profile.ticket_database`): with Notion, `notion search <feature theme> --in <profile.ticket_database>` through the `cdv-notion` client (`.claude/skills/cdv-notion/scripts/notion`); read the hit's key and name (`notion fetch <KEY>` reads the card). With another ticket system, search it with its own tool.
-3. Nothing found → ask once: *"Não achei ticket para essa entrega. Crio um ticket (TL;DR + o que foi feito, você como assignee) ou abro o PR sem ticket?"* On "cria", create it in that database (the extension lists the properties a new ticket takes; assignee and requester are the user) with the body in the `cdv-notion-ticket` layout — with Notion, `notion create --parent <profile.ticket_database> --set '<Prop>=<value>'… --body-file <ticket.md>`, which prints the url and the key — then continue.
+3. Nothing found → ask once: *"Não achei card para essa entrega. Crio um card no modelo do contrato ou abro o PR sem ticket?"* On "cria", create the card only in the task skeleton, through the request arrives moment of `cdv-notion-ticket`: the requester is who asked (the developer only when the work started with them) and the request tag is set only when someone else asked or the type is the bug type; the extension lists what else a new card of this repository takes. With Notion, `notion create --parent <profile.ticket_database> --set '<Prop>=<value>'… --body-file <card.md>` prints the url and the key; then continue.
 
 The section, appended at the end of the description:
 
@@ -71,7 +71,7 @@ When `git diff --name-only origin/<profile.default_branch>...HEAD` has `{app_dir
 - **Title:** Conventional Commits, English, the intent of the whole branch (usually the main commit's subject), with ` (<KEY>)` at the end when there is a ticket — `fix(auth): reject expired invitation tokens (<KEY>)`.
 - **Body:** `<slug>-pr.md` from finalize (lint already passed) with the Ticket section appended. Mentions go in the host's markup (`bb mention <name>` on Bitbucket), only when the user asked for them.
 - Create the PR with the title and the body file against `profile.default_branch`, not draft, with the repository's default reviewers minus the author where the host has them and `close_source_branch` (the commands are in the VCS reference). The Claude Code footer goes in once.
-- When the ticket's pull-request link property is empty, set it to the PR URL (with Notion, `notion update <KEY> --set '<pull-request property>=<pr url>'`); leave its Status alone (the extension says why).
+- Then call the pull request open moment of `cdv-notion-ticket` on the card: the PR on its `**PRs:**` line, the pull request property when it is empty, the first sentence of the TL;DR as the summary, and the pull request open status. Run it before `rm <slug>-pr.md`, so the TL;DR can still be read from the file.
 - `rm <slug>-pr.md` and report one line: `PR #<N> aberto: <url> · ticket <KEY> · revisores <names>`.
 
 ### Step 6 — Update
@@ -85,6 +85,6 @@ Read a PR back, list PRs, comment on a PR (only when the user asks to post), CI 
 ## Composition
 
 - `cdv-finalize` — Step 9 pushes and calls this skill; a re-run after QA fixes lands in Step 6 here.
-- `cdv-notion-ticket` — the ticket's body (TL;DR + o que foi feito), written after the PR exists so it can link it.
+- `cdv-notion-ticket` — the card at each moment: the request arrives moment when this skill creates a card, the pull request open moment once the PR exists.
 - `cdv-notion` — the client every Notion step of Step 3 and Step 5 runs through.
 - `cdv-factory-finalize` — still does not open PRs: the factory pushes and hands back the link.

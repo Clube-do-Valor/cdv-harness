@@ -100,6 +100,15 @@ class ContractTextTest(SentenceCase):
                 self.assertRegex(rows[moment][1], writes)
                 self.assertRegex(rows[moment][2], role)
 
+    def test_ticket_status_keys_leave_the_schema_and_the_core(self):
+        keys = ["ticket_status_" + suffix for suffix in ("pr_open", "merged", "deployed")]
+        schema = read(REPO_ROOT / "profile.schema.yaml")
+        for key in keys:
+            self.assertNotRegex(schema, rf"^\s+{key}:", key)
+        for name, text in core_text_files():
+            for key in keys:
+                self.assertFalse(key in text, f"{name} still cites {key}")
+
     def test_cdv_notion_keeps_workspace_ids_out_and_points_to_the_contract(self):
         text = skill("cdv-notion")
         self.assertSentence(text, r"ids and keys of a real workspace", r"never in this core",
@@ -236,6 +245,57 @@ class HelpdeskTest(SentenceCase):
                             r"`cdv-notion-ticket`", where="cdv-debug")
         for name, text in core_text_files():
             self.assertFalse("notion-ticket-template" in text, f"{name} still names notion-ticket-template.md")
+
+
+class OtherSkillsTest(SentenceCase):
+    def test_kickoff_reads_the_card_with_its_comments_through_the_client(self):
+        self.assertSentence(skill("cdv-kickoff"), r"run starts from a card", r"open comments", r"`cdv-notion` client",
+                            r"`notion fetch <card> --discussions`", r"request from `## Pedido`",
+                            r"criteria from `## Entrega`", where="cdv-kickoff")
+
+    def test_kickoff_runs_the_plan_approved_moment_at_plan_approval(self):
+        self.assertSentence(skill("cdv-kickoff"), r"stop `plan-approval` is answered", r"every track that has a plan",
+                            r"before the build starts", r"plan approved moment of `cdv-notion-ticket`",
+                            r"no card exists", r"ask once whether to create it", where="cdv-kickoff")
+
+    def test_kickoff_flags_a_plan_too_big_for_one_card(self):
+        self.assertSentence(skill("cdv-kickoff"), r"more than one delivery that could ship alone",
+                            r"more than about a week and a half of work", r"say so at the plan stop",
+                            r"leave the split to the developer", where="cdv-kickoff")
+
+    def test_ticket_stage_ends_with_a_clean_check_or_its_findings_reported(self):
+        self.assertSentence(skill("cdv-kickoff"), r"`ticket` stage ends", r"`card_contract\.py check <card>`",
+                            r"exited `0`", r"findings are in the run's final report", where="cdv-kickoff")
+
+    def test_open_pr_finds_by_key_first_and_calls_the_pr_open_moment(self):
+        text = skill("cdv-open-pr")
+        step = section(text, "Step 3 — The ticket")
+        items = re.findall(r"^(\d)\. (.+)$", step, re.M)
+        self.assertRegex(items[0][1], r"key in the conversation.*branch name.*before any search by theme")
+        self.assertRegex(items[1][1], r"`notion search <feature theme>")
+        self.assertSentence(step, r"create the card only in the task skeleton", r"request arrives moment",
+                            r"`cdv-notion-ticket`", where="cdv-open-pr Step 3")
+        self.assertSentence(step, r"requester is who asked", r"request tag is set only when someone else asked or the "
+                            r"type is the bug type", where="cdv-open-pr Step 3")
+        self.assertSentence(text, r"pull request open moment of `cdv-notion-ticket`", where="cdv-open-pr")
+        for gone in (r"leave its Status alone", r"assignee and requester are the user", r"você como assignee"):
+            self.assertNotRegex(text, re.compile(gone, re.I))
+
+    def test_finalize_defines_the_first_sentence_for_who_asked(self):
+        self.assertSentence(skill("cdv-finalize"), r"first sentence of the TL;DR", r"what changed for who asked",
+                            r"at most 200 characters", where="cdv-finalize")
+        guidelines = read(SKILLS / "cdv-finalize" / "references" / "PR_GUIDELINES.md")
+        self.assertSentence(guidelines, r"primeira frase do TL;DR", r"o que mudou para quem pediu",
+                            r"até 200 caracteres", r"resumo do card", where="PR_GUIDELINES.md")
+        example = re.search(r"^> (.+)$", guidelines, re.M).group(1)
+        first = re.match(r".+?[.!?](?=\s|$)", example).group(0)
+        self.assertLessEqual(len(first), 200)
+
+    def test_prod_records_a_write_as_a_card_comment(self):
+        text = skill("cdv-prod")
+        self.assertSentence(text, r"Record the write as one comment on the card", r"`cdv-notion-ticket`",
+                            r"never as a line in its body", where="cdv-prod")
+        self.assertNotRegex(text, r"Write one line on the card")
 
 
 class ProjectSkillTest(SentenceCase):

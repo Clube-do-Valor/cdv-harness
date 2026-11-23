@@ -1,7 +1,8 @@
 ---
 name: cdv-rollout
 description: >
-  After a pull request is merged or deployed - move the card to the status of that event, then list
+  After a pull request is merged or deployed - close the card through cdv-notion-ticket (its closing
+  and the status of that event, a comment per production step), then list
   the production steps the deploy does not run by itself (migrations run by hand, configuration,
   backfills, flags, a worker restart, a data fix) and take the developer through them one per
   question, each read through cdv-prod and each write through its protocol. Triggers on "mergeou",
@@ -33,10 +34,11 @@ repository does not have that thing: skip the step that needs it.
 
 ## Step 1 - The event moves the card
 
-When the developer says the pull request merged, set the card's status to `profile.ticket_status_merged`; when they say it deployed, set `profile.ticket_status_deployed`.
+When the developer says the pull request merged or deployed, call the closing moment of `cdv-notion-ticket`: `## Fechamento` with 1 to 3 items and the status of that event.
 
 - The card is the one the pull request's `🏷️ Ticket` section links; with `profile.ticket_system`
-  `none` there is no card, and a status key set to `none` skips that move.
+  `none` there is no card. While the card lists a pull request of another repository that has
+  not reached the same event, `cdv-notion-ticket` leaves the status and says which one it waits for.
 - Only the developer's word starts a move: never infer a merge or a deploy from the branch, and
   never merge, tag or deploy yourself unless the developer says so for that action.
 - After a deploy, confirm it landed before Step 2: `.claude/harness/bin/prod-read
@@ -53,8 +55,7 @@ scheduled jobs that need a first run, data fixes). Then list the production step
 - A read the step needs goes through `cdv-prod` (`.claude/harness/bin/prod-read`); a write goes
   through the `cdv-prod` write protocol: one question per mutation, guarded by the old value, the
   row printed before and after.
-- After each step, write one line on the card (what ran, when, by whom, the result), so the card
-  tells what production holds.
+- After each manual production step, record it as one comment on the card through `cdv-notion-ticket` (what ran, when, by whom, the result), and write no line in the body.
 - With the developer away, stop at the first step: production steps are never unattended.
 
 ## Step 3 - Report

@@ -47,6 +47,7 @@ repository does not have that thing: skip the step that needs it.
 ## Step 1 - Read the request and the repository, fill the signals
 
 Read the request whole (the card with its comments, the thread, the brief) and the code it touches.
+When a run starts from a card, read it with its open comments through the `cdv-notion` client (`notion fetch <card> --discussions`), taking the request from `## Pedido` and the criteria from `## Entrega` when the card has them.
 Search the docs first, always. From what you read, fill the signals object. The signals are facts,
 not questions: never put them to the developer as a form, and never decide a default yourself - a
 signal you cannot settle from the evidence takes the value the evidence supports best, and the
@@ -157,7 +158,10 @@ Rules of the run:
 
 - In `plan-then-build` and `autonomous` mode, when a stage ends, start the next stage at once, without a prompt from the developer: the only waits are the run profile's `stops`.
 - In `step-by-step` mode every stage is a stop: say what the stage did and what the next one will do, and wait for the developer.
-- On a big track, write the approved plan to a page under the project in the ticket system (`profile.ticket_system`, the project the card belongs to), and never add it to a commit: the working copy stays in `.specs/features/<feature>/plan.md`, which git ignores, and the page is updated when the plan changes during the build.
+- When the stop `plan-approval` is answered, on every track that has a plan and before the build starts, run the plan approved moment of `cdv-notion-ticket` (the delivery zone, the plan page, the in progress status); if no card exists, ask once whether to create it.
+- On every track that has a plan, the approved plan goes to a child page of the task card (`Plano técnico: <card title>`, written by `cdv-notion-ticket`), and is never added to a commit: the working copy stays in `.specs/features/<feature>/plan.md`, which git ignores, and the page is rewritten as the current state when the plan changes during the build.
+- When the plan holds more than one delivery that could ship alone, or more than about a week and a half of work, say so at the plan stop and leave the split to the developer.
+- When the `ticket` stage ends, `card_contract.py check <card>` (in `cdv-notion-ticket/scripts/`) has exited `0`, or its findings are in the run's final report.
 - When the approved plan lists a one-way door in its `Landing` table, switch the run profile to `builder_role: builder_risk` (and validate it again) before you dispatch the builder.
 - After a Verifier round with findings, a builder or fixer child closes them and `verify` starts again. When `run_status.py start verify` exits `3` and marks the stage `capped` with findings open, write each open item, tagged `defect` or `proof-gap`, into the pull request description and continue to the review.
 - While the developer is away, stop and ask before any step that sends something to a person or a live automation, writes in production or deploys, whatever the mode and whatever the brief says.

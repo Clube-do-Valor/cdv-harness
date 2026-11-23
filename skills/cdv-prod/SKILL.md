@@ -73,6 +73,6 @@ A production write is one question per mutation, labelled as production (`[PRODU
 1. Guard the statement by the old value: the `where` holds the key and the value read just before (`->where('id', 42)->where('status', 'draft')`), so a row that changed since the read is not touched.
 2. Print the row before and after the change inside the same snippet (`dump($before)`, the update, `dump($after)`), and the number of rows changed.
 3. `prod-read` cannot write: the developer runs the approved snippet in their own terminal and pastes the output back, and you check the row after against what the question promised.
-4. Write one line on the card: what changed, when, the old and the new value.
+4. Record the write as one comment on the card through `cdv-notion-ticket` (what ran, when, by whom, the result: what changed, the old and the new value), never as a line in its body.
 
 Never run a production write in an unattended mode (`plan-then-build` or `autonomous` with the developer away): stop at the question and wait. One answer covers one mutation; the next one is asked again.

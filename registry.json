@@ -47,7 +47,7 @@
       "owner": "augusto-henriques",
       "description": "Finalize a feature branch — ephemeral `<slug>-pr.md` at repo root (lean PR format, never committed), atomic conventional commits with inferred scope, branch guard, state report, then the push and the pull request opened (or updated) through `cdv-open-pr` at wrap-up (never merges). Triggers on \"finaliza essa feature\", \"wrap up this branch\", \"gera o PR description e os commits\", \"comita isso e prepara o PR\". Do NOT use for planning unimplemented work (cdv-kickoff), PRD/PROGRESS artifacts, or merging.",
       "path": "skills/cdv-finalize",
-      "contentHash": "bedd8b2c6b068fbc776c9c98280cebfbbfaa652b60c1cb65138fab57cd11d2d5"
+      "contentHash": "79db1b0000cfcb628e1989febbaf21b83ab8219fffce59f378c18812fc7da3f1"
     },
     {
       "name": "cdv-frontend",
@@ -87,7 +87,7 @@
       "owner": "augusto-henriques",
       "description": "Start a feature or a fix larger than a one-liner with one command - read the request (a card link, a chat thread, a brief) and the repository, propose the run profile through its scripts (track small/medium/big, mode, chain, workspace, roles, optional steps), ask one question screen for medium and big work and none for small, write and validate the run profile, then run the chain (grilling, tlc-spec-lean plan, build and Verifier, review, fixes, browser QA, PR, pipeline, card) with no prompt per stage, stopping only where the profile says. Triggers on \"start this feature\", \"kickoff\", \"/cdv-kickoff\", \"começa essa feature\", \"vamos fazer esse card\", or a hand-off from cdv-debug or cdv-grilling. Do NOT use for a pure root-cause investigation with no build (cdv-debug), an open interview (cdv-grilling), a review of an existing branch (cdv-code-review), or a factory run (cdv-factory-small-feature).",
       "path": "skills/cdv-kickoff",
-      "contentHash": "9c9ae876a9f39118111aa42537fd2cb7664849b42aaecff72e2a15a54dc19cc6"
+      "contentHash": "9e7497689e119e660ddb7b21846847747842ea9c1f5dac30697605a96340a11d"
     },
     {
       "name": "cdv-notion",
@@ -95,7 +95,7 @@
       "owner": "augusto-henriques",
       "description": "Read, query, create, edit and comment on Notion pages and data sources through the public REST API with the bundled `notion` client (one API token on the machine, no Notion MCP needed) — fetch a card by url, id or ticket key with its properties and body, query a data source with a readable condition and counts, search, change properties in the short format, edit the body in Notion-flavored Markdown, comment, upload and download files, find people. Triggers on any Notion request: \"lê o card\", \"busca no Notion\", \"atualiza o status do card\", \"move o card\", \"escreve no corpo do card\", \"comenta no card\", \"quantos cards\", \"lista as tasks do projeto\", \"fetch this Notion page\", a pasted notion.so or app.notion.com link, or a ticket key. The core skills that touch the card run their Notion steps through this client. Do NOT use to decide what a delivery note or a bug analysis says (cdv-notion-ticket and cdv-debug own the content), or for another ticket system.",
       "path": "skills/cdv-notion",
-      "contentHash": "d066f66fa1c60b734c050b8e67b5c7d61f8bf8c4ae8b4f4cacf7d210bde3f65b"
+      "contentHash": "606d4e89a528929515b1f8094f2549cb148e6e5623cb11cd99ac48f519289098"
     },
     {
       "name": "cdv-notion-project",
@@ -119,7 +119,7 @@
       "owner": "augusto-henriques",
       "description": "Open or update the pull request of a branch through the host's API (`profile.pr_cli`, the bundled `bb` client for Bitbucket or `gh` for GitHub) — conventional title, the finalize description plus the `🏷️ Ticket` section with the ticket hyperlinked, the default reviewers, close-source-branch. Called by `cdv-finalize` Step 9 right after the push; triggers on its own on \"abre o PR\", \"open the PR\", \"abre os PRs dos workers\", \"atualiza a descrição do PR\", \"comenta no PR\". Claude in Chrome only as the fallback when the developer has no token and does not want to create one now; do NOT use to merge, approve or decline.",
       "path": "skills/cdv-open-pr",
-      "contentHash": "248beba2e89973c9afd81042a26623219290c78139e2214d9f8ad2e76599e61a"
+      "contentHash": "d1825c3e2e204df609f4569608568b130a25174888ba1a7f33b22c724c1e38f3"
     },
     {
       "name": "cdv-pr-review",
@@ -135,7 +135,7 @@
       "owner": "augusto-henriques",
       "description": "Answer a question about production the safe way - registry data from the local copy first, production itself only for run history, the state after a deploy and the environment, always through `.claude/harness/bin/prod-read` (one SSH hop into the application container on a read-only session, rows capped, every call logged); and a production write, when one is needed, only through its protocol (one question per mutation, guarded by the old value, the row printed before and after, never unattended). Triggers on \"olha em produção\", \"check production\", \"confere no banco de prod\", \"o job rodou hoje?\", \"subiu a migration?\", \"what does prod say\", a production step of cdv-rollout, or a production read inside cdv-debug. Do NOT use for local data questions the local copy answers, for a deploy (never), or for a smoke test that writes (production-affecting paths are the developer's).",
       "path": "skills/cdv-prod",
-      "contentHash": "38193183d2173ae4ed867642ad272651d6baa6c8104fabb8ff0b57486f0bbde6"
+      "contentHash": "0a499c208026e04382776153ee23a8874237caf192852e6dc4658609f98575d1"
     },
     {
       "name": "cdv-qa",
@@ -157,9 +157,9 @@
       "name": "cdv-rollout",
       "version": "0.1.0",
       "owner": "augusto-henriques",
-      "description": "After a pull request is merged or deployed - move the card to the status of that event, then list the production steps the deploy does not run by itself (migrations run by hand, configuration, backfills, flags, a worker restart, a data fix) and take the developer through them one per question, each read through cdv-prod and each write through its protocol. Triggers on \"mergeou\", \"merged\", \"foi pro ar\", \"deployed\", \"subiu em produção\", \"o que falta em produção?\", \"rollout dessa feature\". Do NOT use to merge, tag or deploy (the developer does that, or says so explicitly), before the pull request exists (cdv-finalize), or for an investigation in production (cdv-debug with cdv-prod).",
+      "description": "After a pull request is merged or deployed - close the card through cdv-notion-ticket (its closing and the status of that event, a comment per production step), then list the production steps the deploy does not run by itself (migrations run by hand, configuration, backfills, flags, a worker restart, a data fix) and take the developer through them one per question, each read through cdv-prod and each write through its protocol. Triggers on \"mergeou\", \"merged\", \"foi pro ar\", \"deployed\", \"subiu em produção\", \"o que falta em produção?\", \"rollout dessa feature\". Do NOT use to merge, tag or deploy (the developer does that, or says so explicitly), before the pull request exists (cdv-finalize), or for an investigation in production (cdv-debug with cdv-prod).",
       "path": "skills/cdv-rollout",
-      "contentHash": "e62be31b8c3f95f35224561775393ddb8d17307499d9960b8f56b0e2276f4309"
+      "contentHash": "4efdce9d0e0c5617cd91b82f8966aa5cf4a34fd6f801d84a232e762bdf576810"
     },
     {
       "name": "create-adr",

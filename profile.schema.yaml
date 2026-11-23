@@ -353,7 +353,8 @@ variables:
     required: false
     description: File that receives one line per production read (UTC time, mode, sha256 of the probe, exit code); belongs in profile.local.yaml.
 
-  # Browser QA (cdv-qa) and delivery (cdv-notion-ticket, cdv-rollout)
+  # Browser QA (cdv-qa). The card statuses are the names map of the card contract
+  # (skills/cdv-notion-ticket/scripts/card-contract.json), not profile keys.
   qa_side_stack_script:
     type: string
     required: false
@@ -362,18 +363,6 @@ variables:
     type: string
     required: false
     description: Marker every record created in an external system during QA carries in its name, so it can be found and deleted.
-  ticket_status_pr_open:
-    type: string
-    required: false
-    description: Card status set when the pull request is opened; `none` skips the move.
-  ticket_status_merged:
-    type: string
-    required: false
-    description: Card status set when the pull request is merged; `none` skips the move.
-  ticket_status_deployed:
-    type: string
-    required: false
-    description: Card status set when the change is deployed; `none` skips the move.
 
   # Machine (normally in profile.local.yaml)
   main_checkout:

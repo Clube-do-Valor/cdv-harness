@@ -77,4 +77,4 @@ A rate limit (429) is waited out inside the client (`Retry-After`, at most 5 tim
 - `cdv-notion-ticket` — the task card and the form ticket at each moment, in the card contract: it decides the content, this client writes it.
 - `cdv-open-pr` — finds or creates the ticket and links the pull request with these commands.
 - `cdv-debug` — reads the card a bug report came with; it writes nothing on it.
-- `cdv-rollout`, `cdv-prod`, `cdv-kickoff` — status moves, one-line notes and plan pages on the card, through the same commands.
+- `cdv-rollout`, `cdv-prod`, `cdv-kickoff`, `cdv-notion-project` — call the moments of `cdv-notion-ticket` at their events (plan approved, merged or deployed, a production step as a comment), or write the project page, through the same commands.
