@@ -1124,59 +1124,90 @@ def cmd_update(client, args):
             raise Fail(USAGE, f'the new body leaves out {len(dropped)} child item(s) that Notion would delete: {listed}. '
                               'Keep their <page>/<database> tags in the file, or pass --allow-deleting-content')
 
-    changed = {}
+    # Everything above only read. From here each request writes; once one has landed, a later refusal
+    # is "done in part" (exit 4), with what landed and what did not, so a rerun does not repeat it.
+    steps, landed, misses = [], [], []
     if properties or args.icon:
-        payload = {}
+        what = []
         if properties:
-            payload['properties'] = properties
+            what.append('properties ' + ', '.join(properties))
         if args.icon:
-            icon = icon_of(args.icon)
-            payload['icon'] = None if icon == 'none' else icon
-        stored = client.call('PATCH', f"/v1/pages/{page['id']}", payload)
-        changed = client.short_values(stored, names=set(properties))
-        page = stored
-    client.say(f"updated {page.get('url')}")
-    if changed:
-        client.say(json.dumps(changed, ensure_ascii=False, indent=2))
-    if args.icon:
-        client.say(f'icon: {args.icon}')
-
-    misses = []
+            what.append('icon')
+        steps.append((' and '.join(what), lambda: write_properties(client, page, properties, args.icon)))
+    else:
+        client.say(f"updated {page.get('url')}")
     if args.edit:
-        matched = [(old, new) for _, old, new, state in plan if state == 'matched']
-        command = {'content_updates': [{'old_str': old, 'new_str': new} for old, new in matched]}
-        if args.allow_deleting_content:
-            command['allow_deleting_content'] = True
-        answer = client.call('PATCH', f"/v1/pages/{page['id']}/markdown",
-                             {'markdown_version': MARKDOWN_VERSION, 'type': 'update_content', 'update_content': command})
-        notion_misses = [w for w in answer.get('warnings', []) if w.get('code') in ('no_match', 'indentation_mismatch')]
-        for number, old, _, state in plan:
-            client.say(f'edit {number}: {state}' + ('' if state == 'matched' else f': {old[:80]!r}'))
-            if state != 'matched':
-                misses.append(f'edit {number} ({old[:80]!r}): {state}')
-        for warning in notion_misses:
-            misses.append(f"Notion: {warning.get('message')}")
-        for warning in answer.get('warnings', []):
-            if warning not in notion_misses:
-                client.warn(f"warning {warning.get('code')}: {warning.get('message')}")
+        matched = [(number, old, new) for number, old, new, state in plan if state == 'matched']
+        steps.append(('body edits ' + ', '.join(str(n) for n, *_ in matched),
+                      lambda: write_edits(client, page, plan, matched, args.allow_deleting_content, misses)))
     for kind in ('replace', 'prepend', 'append'):
-        if kind not in files:
-            continue
-        if kind == 'replace':
-            command = {'new_str': files[kind]}
-            if args.allow_deleting_content:
-                command['allow_deleting_content'] = True
-            body = {'markdown_version': MARKDOWN_VERSION, 'type': 'replace_content', 'replace_content': command}
-        else:
-            body = {'markdown_version': MARKDOWN_VERSION, 'type': 'insert_content',
-                    'insert_content': {'content': files[kind], 'position': {'type': 'start' if kind == 'prepend' else 'end'}}}
-        answer = client.call('PATCH', f"/v1/pages/{page['id']}/markdown", body)
-        client.say({'replace': 'body replaced', 'prepend': 'body: added at the start', 'append': 'body: added at the end'}[kind])
-        for warning in answer.get('warnings', []):
-            client.warn(f"warning {warning.get('code')}: {warning.get('message')}")
+        if kind in files:
+            label = {'replace': 'body replaced', 'prepend': 'body added at the start', 'append': 'body added at the end'}[kind]
+            steps.append((label, lambda kind=kind: write_body(client, page, kind, files[kind], args.allow_deleting_content)))
+    for number, (label, write) in enumerate(steps):
+        try:
+            write()
+        except Fail as failure:
+            if not landed:
+                raise
+            rest = [name for name, _ in steps[number + 1:]]
+            raise Fail(PARTIAL, f"done in part on {page.get('url')}: written: {'; '.join(landed)}. Not written: {label} "
+                                f"({failure.message})" + (f"; not sent: {'; '.join(rest)}" if rest else '')
+                       + (f"; edits that did not apply: {'; '.join(misses)}" if misses else '')
+                       + '. Rerun only what was not written')
+        landed.append(label)
     if misses:
         raise Fail(PARTIAL, 'done in part; not applied: ' + '; '.join(misses))
     return DONE
+
+
+def write_properties(client, page, properties, icon_text):
+    payload = {}
+    if properties:
+        payload['properties'] = properties
+    if icon_text:
+        icon = icon_of(icon_text)
+        payload['icon'] = None if icon == 'none' else icon
+    stored = client.call('PATCH', f"/v1/pages/{page['id']}", payload)
+    changed = client.short_values(stored, names=set(properties))
+    client.say(f"updated {stored.get('url') or page.get('url')}")
+    if changed:
+        client.say(json.dumps(changed, ensure_ascii=False, indent=2))
+    if icon_text:
+        client.say(f'icon: {icon_text}')
+
+
+def write_edits(client, page, plan, matched, allow_deleting, misses):
+    command = {'content_updates': [{'old_str': old, 'new_str': new} for _, old, new in matched]}
+    if allow_deleting:
+        command['allow_deleting_content'] = True
+    answer = client.call('PATCH', f"/v1/pages/{page['id']}/markdown",
+                         {'markdown_version': MARKDOWN_VERSION, 'type': 'update_content', 'update_content': command})
+    notion_misses = [w for w in answer.get('warnings', []) if w.get('code') in ('no_match', 'indentation_mismatch')]
+    for number, old, _, state in plan:
+        client.say(f'edit {number}: {state}' + ('' if state == 'matched' else f': {old[:80]!r}'))
+        if state != 'matched':
+            misses.append(f'edit {number} ({old[:80]!r}): {state}')
+    for warning in notion_misses:
+        misses.append(f"Notion: {warning.get('message')}")
+    for warning in answer.get('warnings', []):
+        if warning not in notion_misses:
+            client.warn(f"warning {warning.get('code')}: {warning.get('message')}")
+
+
+def write_body(client, page, kind, content, allow_deleting):
+    if kind == 'replace':
+        command = {'new_str': content}
+        if allow_deleting:
+            command['allow_deleting_content'] = True
+        body = {'markdown_version': MARKDOWN_VERSION, 'type': 'replace_content', 'replace_content': command}
+    else:
+        body = {'markdown_version': MARKDOWN_VERSION, 'type': 'insert_content',
+                'insert_content': {'content': content, 'position': {'type': 'start' if kind == 'prepend' else 'end'}}}
+    answer = client.call('PATCH', f"/v1/pages/{page['id']}/markdown", body)
+    client.say({'replace': 'body replaced', 'prepend': 'body: added at the start', 'append': 'body: added at the end'}[kind])
+    for warning in answer.get('warnings', []):
+        client.warn(f"warning {warning.get('code')}: {warning.get('message')}")
 
 
 def cmd_trash(client, args):
@@ -1211,8 +1242,16 @@ def cmd_create(client, args):
             entries = json.loads(read_file(args.pages_file))
         except json.JSONDecodeError as error:
             raise Fail(USAGE, f'{args.pages_file} is not JSON: {error}')
-        if not isinstance(entries, list):
-            raise Fail(USAGE, f'{args.pages_file} must hold a JSON array of pages')
+        if not isinstance(entries, list) or not entries:
+            raise Fail(USAGE, f'{args.pages_file} must hold a non-empty JSON array of pages')
+        for number, entry in enumerate(entries, 1):
+            if not isinstance(entry, dict) or not isinstance(entry.get('properties') or {}, dict):
+                raise Fail(USAGE, f'{args.pages_file}, page {number}: each page is an object with a "properties" '
+                                  'object; nothing was sent')
+            content = entry.get('content', entry.get('body'))
+            if content is not None and not isinstance(content, str):
+                raise Fail(USAGE, f'{args.pages_file}, page {number}: "content" is the body as a markdown string; '
+                                  'nothing was sent')
         drafts = [([assignment(k, v) for k, v in (entry.get('properties') or {}).items()],
                    entry.get('content', entry.get('body')), entry.get('icon')) for entry in entries]
     else:
@@ -1222,8 +1261,14 @@ def cmd_create(client, args):
     else:
         target, page_schema = {'page_id': parent['id']}, client.schema_for({'parent': {}})
     payloads = []
-    for assignments, content, icon in drafts:
-        payload = {'parent': target, 'properties': client.build_properties(assignments, page_schema)}
+    for number, (assignments, content, icon) in enumerate(drafts, 1):
+        try:
+            built = client.build_properties(assignments, page_schema)
+        except Fail as failure:
+            if len(drafts) > 1 and failure.code == USAGE:
+                raise Fail(USAGE, f'page {number} of {len(drafts)}: {failure.message}; nothing was sent')
+            raise
+        payload = {'parent': target, 'properties': built}
         if content:
             payload['markdown'] = content
             payload['markdown_version'] = MARKDOWN_VERSION
@@ -1234,19 +1279,35 @@ def cmd_create(client, args):
             if page_schema['properties'][name].get('type') == 'title':
                 title = ''.join(part['text']['content'] for part in value['title'])
         payloads.append((payload, title))
-    for payload, title in payloads:
+    created = []
+    for number, (payload, title) in enumerate(payloads):
         try:
-            page = client.call('POST', '/v1/pages', payload)
-            note = ''
-        except WriteInDoubt as doubt:
-            page = find_created(client, kind, parent, title, started, doubt)
-            if page is None:
-                raise Fail(REFUSED, f'Notion answered {doubt.status} to the create of {title!r} and no page with that title '
-                                    'was created by this integration since the command started; nothing was sent '
-                                    'again. Run the command again')
-            note = f' (Notion answered {doubt.status}, but the page was created; not sent again)'
-        client.say(f"created {page.get('url')} {client.key_of(page)}".rstrip() + note)
+            page = create_one(client, kind, parent, payload, title, started)
+        except Fail as failure:
+            if not created:
+                raise
+            rest = [repr(t or '(untitled)') for _, t in payloads[number + 1:]]
+            raise Fail(PARTIAL, f"done in part: created {len(created)} of {len(payloads)}: {', '.join(created)}. "
+                                f"Not created: {title or '(untitled)'!r} ({failure.message})"
+                       + (f"; not sent: {', '.join(rest)}" if rest else '')
+                       + '. Rerun with only the pages that were not created')
+        created.append(page.get('url') or page.get('id', ''))
     return DONE
+
+
+def create_one(client, kind, parent, payload, title, started):
+    try:
+        page = client.call('POST', '/v1/pages', payload)
+        note = ''
+    except WriteInDoubt as doubt:
+        page = find_created(client, kind, parent, title, started, doubt)
+        if page is None:
+            raise Fail(REFUSED, f'Notion answered {doubt.status} to the create of {title!r} and no page with that title '
+                                'was created by this integration since the command started; nothing was sent '
+                                'again. Run the command again')
+        note = f' (Notion answered {doubt.status}, but the page was created; not sent again)'
+    client.say(f"created {page.get('url')} {client.key_of(page)}".rstrip() + note)
+    return page
 
 
 def find_created(client, kind, parent, title, started, doubt):

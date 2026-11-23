@@ -56,7 +56,7 @@ Write a multi-line `OLD` or `NEW` from a file: `--edit "$(cat old.md)" "$(cat ne
 - **Status moves by event only.** Change a status when the user asks or a skill step says so; a status change can fire the data source's automations (dates stamped, notifications). Never trash, never resolve, never delete without an explicit request.
 - **People by id.** In a property write `user://<uuid>`, a unique name, an e-mail or `me`; in a body or comment use `<mention url="user://<uuid>">Name</mention>`, never a bare `@Name`. `me` is the person whose e-mail is `me` in `~/.config/cdv-notion/config.json` (else `git config user.email`).
 - **Comments are signed.** With a workspace integration token the comment shows the name of `me`; with a personal token it shows its owner. Only the comments this token wrote can be edited.
-- **Report what the client reports.** Exit `4` (some `--edit` did not match) and every `warning` line go to the user as they are; re-fetch and retry only the edits that missed.
+- **Report what the client reports.** Exit `4` (done in part: some `--edit` did not match, or a later write was refused after an earlier one landed) and every `warning` line go to the user as they are; re-fetch and retry only what was not written. Nothing is sent until every property, option, file and page of a `--pages-file` checks out, so an exit `2` means nothing changed.
 - **Results are sized for the model.** `query` prints 50 rows unless `--limit` says otherwise and stops paging at 2,000 rows (`--max-rows` raises it); prefer `--count`, `--group-by` and `--select` to dumping rows.
 - **Nothing of the workspace goes into a repository.** Ids, keys and property names of a real workspace stay in the consumer's profile and extension files, never in this core.
 
@@ -68,7 +68,7 @@ Write a multi-line `OLD` or `NEW` from a file: `--edit "$(cat old.md)" "$(cat ne
 | `1` | Notion refused or could not be reached; on 403/404 the message names the page to connect | connect the integration to the page (menu → Connections) or report it |
 | `2` | the command is wrong: unknown property or option (nearest names listed), a condition that does not compile, a refused path | fix the command; nothing was sent |
 | `3` | no usable token (missing, revoked, mistyped) | the user runs `notion auth login` in a terminal |
-| `4` | done in part (some edits did not match) | report the misses, re-fetch, retry those |
+| `4` | done in part: some `--edit` did not match, or a later write was refused after an earlier one landed (the properties set, the pages created, by url) | report what was written and what was not; re-fetch and rerun only what was not written, never the whole command |
 
 A rate limit (429) is waited out inside the client (`Retry-After`, at most 5 times). A create that ends in 502, 503, 504 or a timeout is never sent twice: the client looks for the page first.
 

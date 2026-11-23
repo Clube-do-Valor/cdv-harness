@@ -887,6 +887,59 @@ class CreateTest(ClientTestCase):
         for i, line in enumerate(lines):
             self.assertIn(key(200 + i), line)
 
+    def test_local_checks_fail_before_any_write(self):
+        pages = self.tmp / "pages.json"
+        cases = [
+            [{"properties": {"Task name": "Step 0"}}, {"properties": {"Task name": "Step 1"}},
+             {"properties": {"Task name": "Step 2", "Status": "Finished"}}],
+            [{"properties": {"Task name": "Step 0"}}, "not a page"],
+            [{"properties": {"Task name": "Step 0"}}, {"properties": {"Task name": "Step 1"}, "content": ["a list"]}],
+        ]
+        for entries in cases:
+            with self.subTest(pages=entries):
+                pages.write_text(json.dumps(entries))
+                code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--pages-file", pages)
+                self.assertEqual(code, 2, err)
+                self.assertIn("nothing was sent", err)
+        code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--set", "Task name=A",
+                                      "--body-file", self.tmp / "missing.md")
+        self.assertEqual(code, 2, err)
+        code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--append-file", self.tmp / "missing.md")
+        self.assertEqual(code, 2, err)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.fake.title_of(self.page), "Export invoices")
+        self.assertEqual(self.page["properties"]["Status"]["status"]["name"], "Done")
+
+    def test_a_write_that_lands_in_part_exits_4_naming_what_landed(self):
+        note = self.tmp / "note.md"
+        note.write_text("Shipped.\n")
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", lambda r: error(400, "validation_error", "Bad markdown."))
+        code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--append-file", note)
+        self.assertEqual(code, 4, err)
+        self.assertEqual(self.page["properties"]["Status"]["status"]["name"], "Rollout")
+        self.assertRegex(err, r"written: properties Status\b")
+        self.assertRegex(err, r"Not written: body added at the end \(.*400")
+        self.fake.overrides.clear()
+
+        pages = self.tmp / "pages.json"
+        pages.write_text(json.dumps([{"properties": {"Task name": f"Step {i}"}} for i in range(3)]))
+        posts = []
+
+        def second_refused(r):
+            posts.append(r)
+            return error(400, "validation_error", "Refused.") if len(posts) == 2 else None
+
+        self.fake.on("POST", r"/v1/pages", second_refused)
+        code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--pages-file", pages)
+        self.assertEqual(code, 4, err)
+        self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 2)
+        first = [pg for pg in self.fake.pages.values() if self.fake.title_of(pg) == "Step 0"]
+        self.assertEqual(len(first), 1)
+        self.assertIn(first[0]["url"], out)
+        self.assertIn("created 1 of 3: " + first[0]["url"], err)
+        self.assertIn("Not created: 'Step 1'", err)
+        self.assertIn("not sent: 'Step 2'", err)
+
     def test_create_after_503_finds_the_page_and_does_not_resend(self):
         for status in (502, 503, 504):
             with self.subTest(status=status):
