@@ -10,7 +10,9 @@ as written, and on exit 4, done in part, also the page of the command); or the c
 `notion-update-page` or `notion-create-pages` under any server prefix - it runs
 `card_contract.py check <ref>` (with `--body-replaced` after a whole-body replace) and, on findings,
 exits 2 with them on stderr, which the host shows the model beside the tool result. A client
-`fetch` pins the request zone from its own output, with no call to Notion.
+`fetch`, when it is the command's one client call with nothing piped, redirected or run after it,
+pins the request zone from its own output, with no call to Notion; an output that may be cut (the
+client's truncation marker, a request zone that does not reach its end marker) pins nothing.
 
 One check per tool call (the first entry to create the claim file named after `tool_use_id` wins),
 three failed checks in a row on one page say so once and then stay silent for that page in the
@@ -202,8 +204,19 @@ def bash_targets(command, output, code):
     if code == 4:
         partial = [m.group(1) for m in PARTIAL_ON.finditer(output or "")]
         pages += partial or ([] if updated else refs)
-    fetched = any(verb == "fetch" for verb, _ in calls)
-    return [(page, replaced) for page in pages], fetched
+    return [(page, replaced) for page in pages], whole_fetch(command, calls)
+
+
+def whole_fetch(command, calls):
+    """True when the command's one client call is a `fetch` with nothing piped, redirected or run
+    after it, so the call's output is the fetch's own output."""
+    if [verb for verb, _ in calls] != ["fetch"]:
+        return False
+    words = h.lex(command)
+    if "fetch" not in words:
+        return False
+    after = words[len(words) - words[::-1].index("fetch"):]
+    return not any(word in h.OPERATORS or set(word) & set("<>|;&") for word in after)
 
 
 def connector_targets(tool, tool_input, response):

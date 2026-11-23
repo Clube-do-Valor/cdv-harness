@@ -302,6 +302,54 @@ class CardHookTest(HookCase):
         self.hook(self.bash(f"{CLIENT_CMD} fetch {cf.key(1)}", stdout=fetched.stdout))
         self.assertEqual(json.loads(stored[0].read_text())["digest"], "kept")
 
+    def test_a_cut_or_piped_fetch_pins_nothing(self):
+        request = "## Pedido\n\nO pedido como chegou.\nCom uma segunda linha de quem pediu.\n\n"
+        self.add(cf.task(1, request + GOOD.split("\n\n", 2)[2].replace("O pedido como chegou.\n\n", "")))
+        fetched = subprocess.run([str(self.client), "fetch", cf.key(1)], capture_output=True, text=True, env=self.env)
+        self.assertEqual(fetched.returncode, 0, fetched.stderr)
+        whole = fetched.stdout
+        self.assertIn("## Entrega", whole)
+        lines = whole.splitlines()
+        cut = "\n".join(lines[: lines.index("O pedido como chegou.") + 1]) + "\n"
+        pins = self.home / ".cache" / "cdv-notion" / "card-pins"
+        cases = {
+            "piped through head": (f"{CLIENT_CMD} fetch {cf.key(1)} | head -40", cut),
+            "piped, the output whole": (f"{CLIENT_CMD} fetch {cf.key(1)} | sed -n 1,400p", whole),
+            "redirected": (f"{CLIENT_CMD} fetch {cf.key(1)} 2>&1", whole),
+            "the client's truncation marker": (f"{CLIENT_CMD} fetch {cf.key(1)}",
+                                               whole.rstrip("\n") + "\n(truncated: 3 blocks not loaded; fetch again)\n"),
+            "a request zone with no end marker": (f"{CLIENT_CMD} fetch {cf.key(1)}", cut),
+            "two client calls": (f"{CLIENT_CMD} fetch {cf.key(1)} && {CLIENT_CMD} fetch {cf.key(1)}", whole + whole),
+        }
+        as_json = subprocess.run([str(self.client), "fetch", cf.key(1), "--json"], capture_output=True, text=True,
+                                 env=self.env)
+        self.assertEqual(as_json.returncode, 0, as_json.stderr)
+        marked = json.loads(as_json.stdout)
+        marked["markdown"]["truncated"] = True
+        cases["--json with truncated"] = (f"{CLIENT_CMD} fetch {cf.key(1)} --json", json.dumps(marked))
+        project = self.add(cf.project(2, cf.project_body(current="")))
+        shown = subprocess.run([str(self.client), "fetch", project["id"]], capture_output=True, text=True,
+                               env=self.env).stdout
+        shown_lines = shown.splitlines()
+        cases["a request toggle with no closing tag"] = (
+            f"{CLIENT_CMD} fetch {project['id']}", "\n".join(shown_lines[: shown_lines.index("</toggle>")]) + "\n")
+        for name, (command, stdout) in cases.items():
+            with self.subTest(case=name):
+                for stale in sorted(pins.glob("*.json")) if pins.is_dir() else []:
+                    stale.unlink()  # each case alone
+                self.assertSilent(self.hook(self.bash(command, stdout=stdout)))
+                self.assertEqual(sorted(pins.glob("*.json")) if pins.is_dir() else [], [])
+        checked = subprocess.run([sys.executable, str(self.checker), "check", cf.key(1)], capture_output=True,
+                                 text=True, env=self.env)
+        self.assertEqual((checked.returncode, checked.stdout), (0, ""), checked.stderr)
+        for stale in sorted(pins.glob("*.json")):
+            stale.unlink()
+        for command, stdout in ((f"{CLIENT_CMD} fetch {cf.key(1)} --json", as_json.stdout),
+                                (f"{CLIENT_CMD} fetch {project['id']}", shown)):
+            with self.subTest(whole=command):
+                self.assertSilent(self.hook(self.bash(command, stdout=stdout)))
+        self.assertEqual(len(list(pins.glob("*.json"))), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

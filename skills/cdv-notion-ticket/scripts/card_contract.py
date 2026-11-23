@@ -511,9 +511,23 @@ def card_request(kind, lines, names_map):
     return None
 
 
+def request_reaches_its_end(kind, lines, names_map):
+    """True when the request zone ends at its end marker: `## Entrega` or `## Fechamento` after
+    `## Pedido` on a task, the request toggle's closing tag on a project. A zone that runs to the end
+    of the text may be a fetch output that was cut."""
+    if kind == "task":
+        span = request_span(lines)
+        return span is not None and span[1] < len(lines)
+    wanted = fold(names_map["projects"]["toggles"]["request"])
+    return any(fold(title) == wanted and end <= len(lines) and lines[end - 1].strip() == "</toggle>"
+               for title, _, _, end in toggle_spans(lines))
+
+
 def pin_from_fetch_output(text):
     """Pin the request zone from the output of `notion fetch` (text or --json) with no call to
-    Notion: used by the card-check hook after a fetch. Returns True when a new pin was stored."""
+    Notion: used by the card-check hook after a fetch. Returns True when a new pin was stored. An
+    output that may be cut pins nothing: the client's truncation marker, or a request zone that does
+    not reach its end marker."""
     names_map = names(settings())
     text = text or ""
     page_id = kind = None
@@ -528,9 +542,13 @@ def pin_from_fetch_output(text):
         source = (page.get("parent") or {}).get("data_source_id")
         schema = client().Cache().get(f"schema-{source}") if source else None
         title = rich((schema or {}).get("title")) if schema else None
+        if (fetched.get("markdown") or {}).get("truncated"):
+            return False
         body = ((fetched.get("markdown") or {}).get("markdown")) if fetched.get("markdown") else None
     else:
         lines = text.splitlines()
+        if any(line.startswith("(truncated: ") for line in lines):
+            return False
         title = None
         for index, line in enumerate(lines):
             if line.startswith("id: ") and page_id is None:
@@ -539,7 +557,7 @@ def pin_from_fetch_output(text):
                 title = re.sub(r"\s*\([^()]*\)\s*$", "", line[len("parent: data source "):]).strip()
             elif line == "body:":
                 rest = lines[index + 1 :]
-                while rest and (rest[-1].startswith("(truncated: ") or not rest[-1].strip()):
+                while rest and not rest[-1].strip():
                     rest.pop()
                 for cut in range(len(rest) - 1, -1, -1):
                     if rest[cut].startswith("discussions:"):
@@ -557,8 +575,9 @@ def pin_from_fetch_output(text):
         kind = "project"
     else:
         return False
-    zone_text = card_request(kind, body_lines(body), names_map)
-    if zone_text is None or read_pin(page_id) is not None:
+    lines = body_lines(body)
+    zone_text = card_request(kind, lines, names_map)
+    if zone_text is None or not request_reaches_its_end(kind, lines, names_map) or read_pin(page_id) is not None:
         return False
     write_pin(page_id, digest(zone_text))
     return True
