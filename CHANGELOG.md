@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `prod-read` runs `docker exec` with `-e HOME=/tmp`: an exec user with no writable home (`www-data` in a PHP image) made tinker exit `1` on "Writing to directory .config/psysh is not allowed", so every read failed with exit `4`.
 - **New skill `cdv-kickoff`:** one command starts a feature: `scripts/propose_profile.py` proposes the run profile (track, mode, chain, workspace, roles, optional steps) from the request's signals, `run_profile.py validate` gates it, and the chain runs through `run_status.py`, `role_target.py` and `brief.py` with no prompt per stage. The run profile (`run.yaml`, or `RUN-<slug>.yaml` with no plan) and its work folder are git-ignored.
 - **Optional steps of a kickoff run:** `skills/cdv-kickoff/references/optional/` holds the recipes `slack-draft`, `mock-before-after`, `blind-judges` and `validation-page`, each with Signal, When it runs, Recipe, Output and Stop.
 - **New skill `cdv-qa`:** the agent runs the browser QA itself, records each step with its screenshot (`scripts/qa_report.py add|render`, the list goes into the final report) and keeps the external test records it creates in `scripts/qa_manifest.py add|done|pending`, deleting them at the end. `step-by-step` mode hands each step to the developer.

@@ -11,7 +11,7 @@
 Vendored to `.claude/harness/bin/prod-read` by `harness sync`. It reads the repository profile
 (`.claude/harness/profile.yaml`, with `profile.local.yaml` over it) and runs, with no local shell:
 
-    ssh <prod_ssh_target> "docker exec -i -u <prod_exec_user> $(docker ps -qf name=<prod_app_container>)
+    ssh <prod_ssh_target> "docker exec -i -e HOME=/tmp -u <prod_exec_user> $(docker ps -qf name=<prod_app_container>)
         sh -c 'php artisan tinker --execute \"$(cat)\"'" < probe
 
 The text on stdin is `DB::setDefaultConnection('<prod_readonly_connection>');` when that key is set,
@@ -223,7 +223,7 @@ def session_prefix(values):
 
 
 def remote_command(user, container):
-    return f"docker exec -i -u {user} $(docker ps -qf name={container}) sh -c 'php artisan tinker --execute \"$(cat)\"'"
+    return f"docker exec -i -e HOME=/tmp -u {user} $(docker ps -qf name={container}) sh -c 'php artisan tinker --execute \"$(cat)\"'"
 
 
 def run_ssh(target, command, text, timeout):
