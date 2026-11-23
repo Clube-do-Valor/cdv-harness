@@ -1519,8 +1519,8 @@ class RedirectTest(ClientTestCase):
         self.assertEqual(landed[0].get("authorization"), "Bearer " + TOKEN)
 
     def test_a_redirect_that_changes_the_scheme_drops_the_token(self):
-        """Same host and port, another scheme: the token stays behind, both ways. The module's own _OPENER and
-        its redirect handler run; only its HTTPS connection is replaced, since no local server speaks TLS."""
+        # Same host and port, another scheme: the token stays behind, both ways. The module's own _OPENER and
+        # its redirect handler run; only its HTTPS connection is replaced, since no local server speaks TLS.
         import http.client
         import urllib.request
         import urllib.response
