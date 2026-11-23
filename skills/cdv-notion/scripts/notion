@@ -427,6 +427,7 @@ class Notion:
         self._people = None
         self._listed = None
         self._warned_unlisted = False
+        self._list_stopped_at = 0  # the page of GET /v1/users that failed, 0 while none did
         self._settings = None
         self._schemas = {}
 
@@ -637,23 +638,45 @@ class Notion:
             self.cache.put('people', known)
 
     def list_users(self):
-        """(people known after listing, None) or (people from rows read, the reason the list failed, as the API
-        gave it)."""
-        try:
-            users, _ = self.pages_of('GET', '/v1/users')
-        except ApiError as error:
-            return self.people(), f'{error.status} {error.api_code}: {error.api_message}'.strip()
-        for user in users:
-            self.remember(user)
-        return self.people(), None
+        """(people known after listing, None) or, when a page of the list fails, (the people of the pages read
+        before it plus the people from rows read, the reason as the API gave it). Each page's people are kept as
+        it arrives; the page that failed is in self._list_stopped_at."""
+        cursor, number = None, 0
+        while True:
+            number += 1
+            query = {'page_size': 100}
+            if cursor:
+                query['start_cursor'] = cursor
+            try:
+                answer = self.call('GET', '/v1/users', query=query)
+            except Fail as failure:
+                if failure.code == NO_TOKEN:
+                    raise
+                self._list_stopped_at = number
+                if isinstance(failure, ApiError):
+                    return self.people(), f'{failure.status} {failure.api_code}: {failure.api_message}'.strip()
+                return self.people(), failure.cause
+            for user in answer.get('results', []):
+                self.remember(user)
+            if not (answer.get('has_more') and answer.get('next_cursor')):
+                return self.people(), None
+            cursor = answer['next_cursor']
 
     def warn_unlisted(self, reason):
-        """One line per run: a person found by name or e-mail was matched without the workspace's user list."""
-        if reason and not self._warned_unlisted:
-            self._warned_unlisted = True
-            self.warn(f'warning: the list of users could not be read (GET /v1/users answered {reason}); a name or '
-                      'e-mail was matched only over the people seen in pages read on this machine. Pass '
-                      '`user://<uuid>`, or turn on the integration\'s user information capability, to remove the doubt')
+        """One line per run: a person found by name or e-mail was matched without the whole user list."""
+        if not reason or self._warned_unlisted:
+            return
+        self._warned_unlisted = True
+        stopped = self._list_stopped_at
+        if stopped > 1:
+            said = (f'the list of users is incomplete: page {stopped} of GET /v1/users failed ({reason}); a name or '
+                    f'e-mail was matched over the people of the {stopped - 1} page(s) read before it and the people '
+                    'seen in pages read on this machine')
+        else:
+            said = (f'the list of users could not be read (GET /v1/users failed: {reason}); a name or e-mail was '
+                    'matched only over the people seen in pages read on this machine')
+        self.warn(f'warning: {said}. Pass `user://<uuid>`, or turn on the integration\'s user information '
+                  'capability, to remove the doubt')
 
     def user_name(self, identifier):
         known = self.people().get(identifier)

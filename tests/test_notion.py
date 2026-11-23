@@ -1893,6 +1893,56 @@ class PeopleTest(ClientTestCase):
         self.assertEqual(code, 0, err)
         self.assertEqual(doubt_lines(err), [])
 
+    def test_a_user_list_that_fails_on_a_later_page_keeps_the_people_read(self):
+        souza = uid(0xA4)
+        failures = {"403": ("403 restricted_resource", "Insufficient permissions"),
+                    "500": ("500 internal_server_error", "Something went wrong"), "timeout": ("in time",)}
+
+        def fresh(failure):
+            """Ana Lima in the cache from a row read; Ana Souza only on page 1 of the list; page 2 fails."""
+            shutil.rmtree(self.home / ".cache", ignore_errors=True)
+            self.fake.overrides.clear()
+            self.page["properties"]["Assignee"]["people"] = [USERS[ANA]]
+            code, out, err = self.run_cli("fetch", PAGE)
+            self.assertEqual(code, 0, err)
+
+            def listing(r, failure=failure):
+                if not r.query.get("start_cursor"):
+                    return 200, {"object": "list", "results": [person(souza, "Ana Souza", "ana.souza@example.com")],
+                                 "has_more": True, "next_cursor": "page-2"}
+                if failure == "timeout":
+                    raise TimeoutError("timed out")
+                if failure == "500":
+                    return error(500, "internal_server_error", "Something went wrong.")
+                return error(403, "restricted_resource", "Insufficient permissions for this endpoint.")
+
+            self.fake.on("GET", r"/v1/users", listing)
+            self.fake.calls.clear()
+
+        for failure, reason in failures.items():
+            for args in (("update", PAGE, "--set", "Assignee=Ana"), ("query", "Tasks", "--where", "Assignee has Ana")):
+                with self.subTest(failure=failure, ambiguous=args[0]):
+                    fresh(failure)
+                    code, out, err = self.run_cli(*args)
+                    self.assertEqual(code, 2, err)
+                    for shown in ("Ana Lima", "user://" + ANA, "Ana Souza", "user://" + souza):
+                        self.assertIn(shown, err)
+                    self.assertEqual(self.writes(), [])
+                    self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
+                    self.assertEqual(len(self.fake.sent("GET", r"/v1/users")) >= 2, True, "page 2 was asked for")
+            with self.subTest(failure=failure, unique="Ana Souza"):
+                fresh(failure)
+                code, out, err = self.run_cli("update", PAGE, "--set", "Assignee=Ana Souza")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]["Assignee"],
+                                 {"people": [{"id": souza}]})
+                warning = [line for line in err.splitlines() if line.startswith("warning:")]
+                self.assertEqual(len(warning), 1, err)
+                self.assertIn("incomplete", warning[0])
+                self.assertIn("page 2", warning[0])
+                for words in reason:
+                    self.assertIn(words, warning[0])
+
     def test_whoami_from_settings_then_git(self):
         self.settings(me="ana@example.com")
         code, out, err = self.run_cli("whoami")
