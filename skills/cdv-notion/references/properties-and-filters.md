@@ -32,7 +32,7 @@ A property named `id` or `url` (any case) is printed as `userDefined:<name>`, an
 | select, status | an existing option, any case; empty clears | `--set 'Status=Done'` |
 | multi-select | `a,b` or a JSON array; existing options only | `--set 'Tags=Backend,Helpdesk'` |
 | date | `date:<Property>:start`, `:end`; `Prop=<date>` is the start | `--set 'date:Done at:start=2026-11-22'` |
-| person | `user://<uuid>`, a unique name, an e-mail, `me`; several with commas | `--set 'Assignee=me'` |
+| person | `user://<uuid>`, a name or e-mail that matches one person, `me`; several with commas | `--set 'Assignee=me'` |
 | relation | page references (url, id, key); several with commas | `--set 'Project=https://app.notion.com/p/<id>'` |
 | checkbox | `__YES__` / `__NO__` (also true/false) | `--set 'Completed?=__YES__'` |
 | url, e-mail, phone | the text; empty clears | `--set 'Pull Request=https://…/pull/7'` |
@@ -41,6 +41,7 @@ A property named `id` or `url` (any case) is printed as `userDefined:<name>`, an
 
 - `title` (or `name`) also names a data source's title property, whatever it is called.
 - An unknown property or option exits `2` and lists the nearest names; nothing is written. The schema is re-read once before refusing, so an option created a minute ago is found.
+- A person given by name or e-mail is looked up among the people the API lists and the people seen in rows read. Several matches exit `2` listing each one's name, e-mail and `user://` id, and nothing is sent: pass the id. An exact e-mail or a `user://` id is never ambiguous. The same holds for `has` in `--where`.
 - A list replaces the whole value: to add a tag, write the current tags and the new one.
 - Formula, rollup, unique id, created and edited time and by are computed by Notion: writing them exits `2`.
 - `--pages-file` takes `[{"properties": {"Task name": "A", "Tags": ["Backend"], "Completed?": true}, "content": "<markdown>", "icon": "🧾"}, …]`: the same keys as `--set`, values as strings, lists, booleans or numbers.

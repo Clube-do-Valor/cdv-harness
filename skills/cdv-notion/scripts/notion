@@ -351,6 +351,7 @@ class Notion:
         self.cache = Cache()
         self._bot = None
         self._people = None
+        self._listed = None
         self._settings = None
         self._schemas = {}
 
@@ -944,9 +945,11 @@ class Notion:
         if len(matches) == 1:
             return matches[0][0]
         if not matches:
-            raise Fail(USAGE, f'nobody matches {text!r}; look them up with `notion users find {text}`')
-        names = ', '.join(f"{p['name']} (user://{i})" for i, p in matches)
-        raise Fail(USAGE, f'{text!r} matches {len(matches)} people: {names}; pass the user:// id')
+            raise Fail(USAGE, f'nobody matches {text!r} among the people the API lists and the people seen in rows '
+                              'read; nothing was sent')
+        names = '; '.join(', '.join(filter(None, [p.get('name'), p.get('email'), f'user://{i}'])) for i, p in matches)
+        raise Fail(USAGE, f'{text!r} matches {len(matches)} people: {names}. Nothing was sent; pass the user:// id '
+                          'of the one you mean')
 
     def page_id_of(self, text):
         ref = parse_ref(text)
@@ -956,13 +959,21 @@ class Notion:
             return self.page_by_key(ref.prefix, ref.number)['id']
         raise Fail(USAGE, f'{text!r} is not a page reference')
 
-    def find_people(self, text):
-        needle = fold(text)
-        people, _ = self.list_users() if not self.matches_known(needle) else (self.people(), None)
-        return [(i, p) for i, p in people.items() if needle in fold(p.get('name')) or needle in fold(p.get('email'))]
+    def everyone(self):
+        """The people the API lists plus the people seen in rows read (the cache), listed once per run."""
+        if self._listed is None:
+            self._listed = self.list_users()
+        return self._listed
 
-    def matches_known(self, needle):
-        return any(needle in fold(p.get('name')) or needle in fold(p.get('email')) for p in self.people().values())
+    def find_people(self, text):
+        """Every person whose name or e-mail contains `text`, over the listed users and the cache; an exact
+        e-mail match is the one person meant, never an ambiguity."""
+        needle = fold(text)
+        people, _ = self.everyone()
+        exact = [(i, p) for i, p in people.items() if needle and fold(p.get('email')) == needle]
+        if len(exact) == 1:
+            return exact
+        return [(i, p) for i, p in people.items() if needle in fold(p.get('name')) or needle in fold(p.get('email'))]
 
 
 def unique_of(properties):

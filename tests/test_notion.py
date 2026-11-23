@@ -1215,6 +1215,38 @@ class PeopleTest(ClientTestCase):
                 self.assertEqual(code, 0, err)
                 self.assertIn("user://" + who, out)
 
+    def test_person_by_name_is_resolved_over_listed_users_and_cache(self):
+        souza = uid(0xA4)
+        # Ana Lima reaches the cache from a row read; Ana Souza is only in the API's user list.
+        code, out, err = self.run_cli("fetch", PAGE)
+        self.assertEqual(code, 0, err)
+        self.fake.users = {souza: person(souza, "Ana Souza", "ana.souza@example.com")}
+        self.fake.calls.clear()
+        for args in (("update", PAGE, "--set", "Assignee=Ana"), ("query", "Tasks", "--where", "Assignee has Ana")):
+            with self.subTest(ambiguous=args):
+                code, out, err = self.run_cli(*args)
+                self.assertEqual(code, 2, err)
+                for shown in ("Ana Lima", "ana@example.com", "user://" + ANA,
+                              "Ana Souza", "ana.souza@example.com", "user://" + souza):
+                    self.assertIn(shown, err)
+                self.assertTrue(self.fake.sent("GET", r"/v1/users"))
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
+        code, out, err = self.run_cli("users", "find", "ana")
+        self.assertEqual(code, 0, err)
+        self.assertIn("user://" + ANA, out)
+        self.assertIn("user://" + souza, out)
+        code, out, err = self.run_cli("update", PAGE, "--set", "Assignee=Zed")
+        self.assertEqual(code, 2)
+        self.assertIn("nobody matches", err)
+        self.assertEqual(self.writes(), [])
+        for value, wanted in (("ana@example.com", ANA), ("Ana Souza", souza), ("user://" + ANA, ANA)):
+            with self.subTest(unique=value):
+                code, out, err = self.run_cli("update", PAGE, "--set", "Assignee=" + value)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]["Assignee"],
+                                 {"people": [{"id": wanted}]})
+
     def test_whoami_from_settings_then_git(self):
         self.settings(me="ana@example.com")
         code, out, err = self.run_cli("whoami")
