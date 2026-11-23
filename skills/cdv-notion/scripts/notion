@@ -551,6 +551,8 @@ class Notion:
                     raise self.write_failed(path, error=error)
                 raise Fail(REFUSED, f'could not reach api.notion.com: {error}')
             parsed = self.parse(payload)
+            if status == 529 and write:  # "overloaded" is a 5xx: the write may have been applied, so never resend it
+                raise self.write_failed(path, status, parsed)
             if status in (429, 529):
                 reason = (parsed.get('additional_data') or {}).get('rate_limit_reason', '')
                 if limited >= MAX_RETRIES or reason == 'public_api_request_blocked':

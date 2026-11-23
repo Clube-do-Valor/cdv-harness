@@ -1153,7 +1153,7 @@ class CreateTest(ClientTestCase):
 
 WRITE_OUTCOMES = {  # how a write's request ends -> which of the three cases the client must say it is
     "400": "refused", "429": "refused", "500": "in doubt", "502": "in doubt", "503": "in doubt",
-    "504": "in doubt", "timeout": "in doubt", "reset": "in doubt", "unreachable": "not sent",
+    "504": "in doubt", "529": "in doubt", "timeout": "in doubt", "reset": "in doubt", "unreachable": "not sent",
 }
 
 
