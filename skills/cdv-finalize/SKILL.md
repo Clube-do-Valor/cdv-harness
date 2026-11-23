@@ -70,7 +70,7 @@ This generation is **unconditional** in the normal mode: every run produces the 
 
 Mandatory section order from [PR_GUIDELINES.md](references/PR_GUIDELINES.md):
 
-1. `## ⚡ TL;DR` — **mandatory, the very first section.** 3-4 short sentences for managers/stakeholders, ≤80 words, plain PT-BR, no technical jargon (no column/method/hook names, file paths, workflow-tool nodes, pipeline jargon, or ticket links). See "Regra do TL;DR" in PR_GUIDELINES.md.
+1. `## ⚡ TL;DR` — **mandatory, the very first section.** 3-4 short sentences for managers/stakeholders, ≤80 words, plain PT-BR, no technical jargon (no column/method/hook names, file paths, workflow-tool nodes, pipeline jargon, or ticket links). The first sentence of the TL;DR says what changed for who asked, in at most 200 characters: `cdv-notion-ticket` copies it unchanged into the card's summary. See "Regra do TL;DR" in PR_GUIDELINES.md.
 2. `## 🔍 O que muda e por quê` — ONE short paragraph (the request/problem, prior state, closed scope) + 3-6 bullets of BEHAVIORAL changes. Never per-file — the diff shows the files.
 3. `## 🎯 Decisões para o reviewer validar` — 2-4 bullets of judgment calls the diff does not explain by itself: accepted trade-offs, non-obvious business rules, deliberate side effects, assumed debt. **Highest-signal section — write it first.**
 4. `## 🧪 Como testar` — exact copy-paste test commands + `**N passed (M assertions)**`, then a QA roteiro of ≤5 numbered `Passo` steps with measurable `*Esperado*` lines. Steps that write to an integration in `profile.production_writing_integrations` (or dispatch jobs that write) are tagged `[PRODUCTION-AFFECTING]` and run manually by the reviewer only.
@@ -96,7 +96,7 @@ Before drafting "O que muda e por quê", run this self-check:
 2. *Would this referenced ticket explain why this PR exists without needing the current diff?* If yes, the ticket is *adjacent context*, not this PR's scope. Demote it to "Riscos e impactos" with a relationship label.
 3. *Is there any sentence that, if read alone, describes a different problem than the diff fixes?* If yes, delete or move it.
 
-**Anti-bloat gate (run after writing the draft):** execute [scripts/lint-pr-description.sh](scripts/lint-pr-description.sh) `<slug>-pr.md` — **exit 0 required** before presenting the file. It mechanically enforces: TL;DR first and ≤80 words, 40-100 lines, Decisões present with 2-4 bullets, ≤5 Passos, Riscos present, ≥1 external link, no file-inventory filler, Pós-deploy without placeholders. Two checks remain YOUR judgment (the script cannot decide them):
+**Anti-bloat gate (run after writing the draft):** execute [scripts/lint-pr-description.sh](scripts/lint-pr-description.sh) `<slug>-pr.md` — **exit 0 required** before presenting the file. It mechanically enforces: TL;DR first and ≤80 words, its first sentence ≤200 characters, a key matching `profile.ticket_key_pattern` in the Ticket section, 40-100 lines, Decisões present with 2-4 bullets, ≤5 Passos, Riscos present, ≥1 external link, no file-inventory filler, Pós-deploy without placeholders. Two checks remain YOUR judgment (the script cannot decide them):
 
 1. TL;DR carries no forbidden terms (column/method names, file paths, pipeline jargon — see "Regra do TL;DR").
 2. "Decisões" bullets are *substantive and specific to this diff*, `## 🚀 Pós-deploy` appears **iff** the diff touches migrations/config/commands/queues, and `## 🛠️ Extras` only with real out-of-band commits.

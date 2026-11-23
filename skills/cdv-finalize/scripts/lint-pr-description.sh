@@ -18,6 +18,7 @@ profile_value() {
   printf '%s' "$value"
 }
 TICKET_SYSTEM="$(profile_value ticket_system)"
+TICKET_KEY_PATTERN="$(profile_value ticket_key_pattern)"
 
 FILE="${1:-}"
 [ -n "$FILE" ] && [ -f "$FILE" ] || { echo "usage: $0 <slug>-pr.md" >&2; exit 2; }
@@ -30,6 +31,14 @@ if [ "$first_section" = "## ⚡ TL;DR" ]; then say PASS "TL;DR is the first sect
 
 tldr_words="$(awk '/^## ⚡ TL;DR/{f=1;next} /^## /{f=0} f' "$FILE" | wc -w)"
 if [ "$tldr_words" -le 80 ] && [ "$tldr_words" -gt 0 ]; then say PASS "TL;DR has $tldr_words words (≤80)"; else say FAIL "TL;DR has $tldr_words words (must be 1-80)"; fi
+
+# The first sentence becomes the card's summary: up to the first . ! or ? followed by a space or the
+# end, or the whole section when it has no such end. Characters, not bytes.
+first_sentence="$(awk '/^## ⚡ TL;DR/{f=1;next} /^## /{f=0} f' "$FILE" | python3 -c 'import re, sys
+text = " ".join(sys.stdin.read().split())
+end = re.search(r"[.!?](?=\s|$)", text)
+print(len(text[: end.end()] if end else text))')"
+if [ "$first_sentence" -le 200 ]; then say PASS "TL;DR first sentence has $first_sentence characters (≤200)"; else say FAIL "TL;DR first sentence has $first_sentence characters (max 200: it becomes the card's summary)"; fi
 
 lines="$(wc -l < "$FILE")"
 if [ "$lines" -ge 40 ] && [ "$lines" -le 100 ]; then say PASS "$lines lines (40-100)"; else say FAIL "$lines lines (target 40-80, hard ceiling 100, floor 40)"; fi
@@ -52,6 +61,9 @@ if grep -q '^## 🏷️ Ticket' "$FILE"; then
   ticket="$(awk '/^## 🏷️ Ticket/{f=1;next} /^## /{f=0} f' "$FILE")"
   if [ "$TICKET_SYSTEM" = "notion" ]; then ticket_url='https?://[^)]*notion\.(so|com)/'; else ticket_url='https?://[^)]*'; fi
   if printf '%s' "$ticket" | grep -qE "\\[([^]\\\\]|\\\\.)+\\]\\(${ticket_url}"; then say PASS "Ticket section links the ticket"; else say FAIL "Ticket section without a [KEY — name](ticket url) link"; fi
+  if [ -n "$TICKET_KEY_PATTERN" ] && [ "$TICKET_KEY_PATTERN" != "none" ]; then
+    if printf '%s' "$ticket" | python3 -c 'import re, sys; sys.exit(0 if re.search(sys.argv[1], sys.stdin.read()) else 1)' "$TICKET_KEY_PATTERN"; then say PASS "Ticket section holds a key matching ticket_key_pattern"; else say FAIL "Ticket section holds no key matching ticket_key_pattern ($TICKET_KEY_PATTERN)"; fi
+  fi
   if [ "$(grep -m1 -n '^## ' <(tac "$FILE") | cut -d: -f2-)" = "## 🏷️ Ticket" ]; then say PASS "Ticket is the last section"; else say FAIL "Ticket must be the last section"; fi
 fi
 

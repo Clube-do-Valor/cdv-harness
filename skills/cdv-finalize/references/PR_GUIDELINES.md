@@ -11,7 +11,7 @@ Alvo: **40–80 linhas**. Teto rígido: 100. Se passar, corte — não existe an
 ```markdown
 ## ⚡ TL;DR
 
-<3-4 frases curtas para gestores e stakeholders, ≤80 palavras, português claro. Sem nomes de colunas, métodos/hooks/eventos, paths de arquivo, nós de ferramenta de workflow, jargão de pipeline ou links de tickets. Ver "Regra do TL;DR" abaixo.>
+<3-4 frases curtas para gestores e stakeholders, ≤80 palavras, português claro; a primeira diz o que mudou para quem pediu, em até 200 caracteres. Sem nomes de colunas, métodos/hooks/eventos, paths de arquivo, nós de ferramenta de workflow, jargão de pipeline ou links de tickets. Ver "Regra do TL;DR" abaixo.>
 
 ## 🔍 O que muda e por quê
 
@@ -96,14 +96,14 @@ A seção `## ⚡ TL;DR` é a primeira do PR e a única que não-engenheiros lee
 
 - **Público:** gestores, stakeholders e líderes de área sem contexto de código. Tempo de leitura alvo: ≤15 segundos.
 - **Tamanho:** 3-4 frases curtas, ≤80 palavras no total.
-- **Forma:** frase 1 descreve o que estava quebrado/faltando em termos operacionais; frase 2 descreve o que muda na prática depois deste PR; frase 3 confirma se há impacto visível em telas, processo ou configuração (em geral `Sem mudanças em telas, processos ou configuração`).
+- **Forma:** a primeira frase do TL;DR diz o que mudou para quem pediu, em até 200 caracteres: ela é copiada sem mudança para o resumo do card (`cdv-notion-ticket`), e o `scripts/lint-pr-description.sh` reprova uma mais longa; frase 2 diz o que estava quebrado ou faltando em termos operacionais; frase 3 confirma se há impacto visível em telas, processo ou configuração (em geral `Sem mudanças em telas, processos ou configuração`).
 - **Proibido:** nomes de colunas, métodos/hooks/eventos, nós de ferramenta de workflow, paths de arquivo, thresholds técnicos, listas de guardas numeradas, trechos de código/SQL, jargão de pipeline (`batch window`, `dedupe key`) e links de tickets.
 - **Permitido:** nomes de operação de negócio (`sincronização`, `importação`, `notificação`), resultados visíveis ao usuário e o mecanismo em alto nível em português claro.
 - **Autoteste:** leia o TL;DR em voz alta como se explicasse para um Diretor de Operações que nunca abriu o código. Se disser qualquer termo proibido, reescreva.
 
 Exemplo canônico (um relatório que saía em branco; o extension do repositório pode trazer exemplos reais):
 
-> O relatório mensal saía em branco quando o período terminava num fim de semana, porque a consulta parava no último dia útil. A partir deste PR, o relatório usa o último dia do período, e os meses que fecham num sábado ou domingo voltam a mostrar os números completos sem correção manual.
+> O relatório mensal volta a mostrar os números completos nos meses que fecham num sábado ou domingo, sem correção manual. Ele saía em branco porque a consulta parava no último dia útil; agora usa o último dia do período.
 
 ---
 
