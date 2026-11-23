@@ -12,8 +12,8 @@ in doubt is checked like one that landed, on the page its message names, and a w
 never sent is not); or the connector's `notion-update-page` or `notion-create-pages` under any server
 prefix - it runs `card_contract.py check <ref>` (as a whole-body replace for the page that had one, and only for it)
 and, on findings, exits 2 with them on stderr, which the host shows the model beside the tool result. A client
-`fetch`, when it is the command's one client call with nothing piped, redirected or run after it,
-pins the request zone from its own output, with no call to Notion; an output that may be cut (the
+`fetch`, when it is the command's one client call with nothing piped, redirected or run after it and
+nothing before it but `cd` and assignments, which print nothing, pins the request zone from its own output, with no call to Notion; an output that may be cut (the
 client's truncation marker, a request zone that does not reach its end marker) pins nothing.
 
 The hook ends inside its time budget (25 s, before the host's timeout of 30 s) whatever the number
@@ -577,15 +577,19 @@ def replaced_flags(calls, shown_pages, created):
 
 
 def whole_fetch(command, calls):
-    """True when the command's one client call is a `fetch` with nothing piped, redirected or run
-    after it, so the call's output is the fetch's own output."""
-    if [call.verb for call in calls] != ["fetch"]:
+    """True when the call's output is the output of one `fetch` and nothing else: the fetch is the last
+    command, with nothing piped or redirected, and each command before it is a `cd` or an assignment."""
+    if [call.verb for call in calls] != ["fetch"] or not calls[0].whole:
         return False
-    words = h.lex(command)
-    if "fetch" not in words:
-        return False
-    after = words[len(words) - words[::-1].index("fetch"):]
-    return not any(word in h.OPERATORS or set(word) & set("<>|;&") for word in after)
+    *before, last = read_commands(command)[0]
+    variables = Variables()
+    for one in before:
+        variables.run(one.words)
+        silent = one.words[:1] == ["cd"] and "-" not in one.words or all(map(ASSIGNMENT.fullmatch, one.words))
+        if not (silent and one.words and one.after in (";", "\n", "&&")):
+            return False
+    return not last.redirected and last.after in ("", ";", "\n") and last.words[0] not in KEYWORDS \
+        and bool(client_words(last.words, variables))
 
 
 def connector_targets(tool, tool_input, response):

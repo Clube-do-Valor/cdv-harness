@@ -904,6 +904,50 @@ class CardHookTest(HookCase):
                 self.assertSilent(self.hook(self.bash(command, stdout=stdout)))
         self.assertEqual(len(list(pins.glob("*.json"))), 2)
 
+    def test_a_fetch_pins_only_when_nothing_else_in_the_command_prints(self):
+        other = self.add(cf.task(1, "## Pedido\n\nOutro pedido.\nCom uma segunda linha.\n\n" + GOOD.split("\n\n", 2)[2]))
+        page = self.add(cf.task(2, GOOD))
+        outputs = {}
+        for found in (other, page):
+            proc = subprocess.run([str(self.client), "fetch", found["id"]], capture_output=True, text=True, env=self.env)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            outputs[found["id"]] = proc.stdout
+        whole, old = outputs[page["id"]], outputs[other["id"]]
+        cut = old[: old.index("Com uma segunda linha.")]
+        pins = self.home / ".cache" / "cdv-notion" / "card-pins"
+        module = self.hook_module()
+
+        def pinned(command, stdout=whole):
+            for stale in sorted(pins.glob("*.json")) if pins.is_dir() else []:
+                stale.unlink()  # each command alone
+            self.assertEqual(self.run_module(module, self.bash(command, stdout=stdout)), (0, ""))
+            return [path.stem for path in sorted(pins.glob("*.json"))] if pins.is_dir() else []
+
+        fetch = f"{CLIENT_CMD} fetch {cf.key(2)}"
+        for name, command, stdout in (
+                ("a cut copy of another card", f"head -20 old.txt; {fetch}", cut + whole),
+                ("a whole copy of another card", f"cat old.txt; {fetch}", old + whole),
+                ("the copy after", f"{fetch}; cat old.txt", whole + old)):
+            with self.subTest(read=name):
+                self.assertEqual(pinned(command, stdout), [])
+        # As the host runs it
+        self.assertSilent(self.hook(self.bash(f"head -20 old.txt; {fetch}", stdout=cut + whole)))
+        self.assertEqual(sorted(pins.glob("*.json")) if pins.is_dir() else [], [])
+        for command in (f"echo x; {fetch}", f"true && {fetch}", f"pwd\n{fetch}", f"cd - && {fetch}", f"cd x || {fetch}", f"cd x | {fetch}",
+                        f"cd x & {fetch}", f"echo id | {fetch}", f"export X=1; {fetch}", f"exec 2>&1; {fetch}", f"cd x; ls; {fetch}",
+                        f"if true; then {fetch}; fi", f"for i in 1; do {fetch}; done", f"({fetch})", f"{{ {fetch}; }}", f"! {fetch}",
+                        f"bash -c '{fetch}'", f"OUT=$({fetch})", f"echo \"$({fetch})\"", f"{fetch} &", f"{fetch} | cat", f"{fetch} > f.md",
+                        f"> f.md {fetch}", f"{fetch} 2>&1", f"{fetch} < /dev/null", f"{fetch}; cd x", f"{fetch} && {fetch}",
+                        f"X=$({fetch}); {fetch}", f"{fetch}; echo it's", f"cd it's; {fetch} > f.md", "N=$(which notion) fetch"):
+            with self.subTest(nothing=command):
+                self.assertEqual(pinned(command), [])
+        for command in (fetch, f"cd x && {fetch}", f"cd x; {fetch}", f"cd x\n{fetch}\n", f"cd \"$(git rev-parse --show-toplevel)\" &&\n  {fetch}",
+                        f"cd x > /dev/null && {fetch}", f"X=1; {fetch}", f"X=1 {fetch}", f"X=$(cat old.txt); {fetch}", f"cd x && A=1 B=2 && {fetch};",
+                        f"N={CLIENT_CMD}; $N fetch {cf.key(2)}", f"timeout 60 {fetch}", f"python3 -u {fetch}", f"# the card\n{fetch} # whole",
+                        f"{CLIENT_CMD} \\\n  fetch {cf.key(2)}"):
+            with self.subTest(pinned=command):
+                self.assertEqual(pinned(command), [page["id"]])
+
 
 if __name__ == "__main__":
     unittest.main()
