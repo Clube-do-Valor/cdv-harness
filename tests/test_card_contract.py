@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -511,10 +512,14 @@ class RequestPinTest(CardCase):
             ("a mention taken out", f'<mention url="user://{one}">Ana</mention> pediu', "Ana pediu"),
             ("a link taken out", f"[Ana](https://example.com/{one}) pediu", "Ana pediu"),
             ("a word that only looks like a tag", "envie para <cliente> hoje", "envie para <fornecedor> hoje"),
+            ("words behind the name of a tag", "envie <file do cliente> hoje", "envie <file do fornecedor> hoje"),
             ("a tag as text in inline code", "use `<b>` aqui", "use `<i>` aqui"),
             ("an escaped tag", "use \\<b> aqui", "use \\<i> aqui"),
             ("stars in inline code", "`**x**`", "`x`"),
             ("stars typed by hand", "\\*x\\*", "x"),
+            ("marks that only close", "5* x* y", "5 x y"),
+            ("marks that only open", "*a *b", "a b"),
+            ("a mark alone", "*a b", "a b"),
             ("underscores in a bare address", "https://example.com/_a_/y", "https://example.com/a/y"),
             ("a caption in an attribute", '<img src="https://example.com/x.png" alt="boleto" />', '<img src="https://example.com/x.png" alt="extrato" />'),
             ("a cell of a table", "<table>\n<tr><td>10</td><td>0</td></tr>\n</table>", "<table>\n<tr><td>1</td><td>00</td></tr>\n</table>"),
@@ -540,10 +545,18 @@ class RequestPinTest(CardCase):
             ("an entity in a tag", '<a href="https://example.com/y?a=1&b=2">x</a>', '<a href="https://example.com/y?a=1&amp;b=2">x</a>'),
             ("an underscore escaped in a link", "[x](https://example.com/a_b)", "[x](https://example.com/a\\_b)"),
             ("the order of a tag's attributes", '<date start="2026-11-22" end="2026-11-23" />', '<date end="2026-11-23" start="2026-11-22"/>'),
+            ("two bold words", "**a** e **b**", "<b>a</b> e b"),
+            ("bold with italics inside", "**a *b* c**", "a b c"),
+            ("a mark with no pair", "**a** 5* b", "a 5\\* b"),
             ("stars that are text", "2 * 3 e snake__case", "2 \\* 3 e snake\\_\\_case"),
         ], [])
         page = self.add(cf.task(9, "## Pedido\n\nO pedido.\n\n" + entrega().replace("**Objetivo:**", '<a href="https://x">**Objetivo:**</a>')))
         self.assertClean(page)  # labels are compared as plain text, every tag dropped
+        # A long pasted line of loose marks is read in one pass (about 0.1 s; a search per mark takes minutes)
+        started = time.monotonic()
+        for mark in ("_a ", "*a ", "**a ", "~~a ", "__a "):
+            self.cc.digest(mark * 40000)
+        self.assertLess(time.monotonic() - started, 60)
 
     def test_a_picture_or_file_read_again_with_another_signature_is_the_same_request(self):
         signed = "https://files.example.com/space/tela.png?X-Sig=111&X-Date=1"

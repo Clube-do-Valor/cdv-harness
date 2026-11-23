@@ -160,7 +160,7 @@ REQUEST_TOKEN = re.compile(
     ESCAPE.pattern.replace("(", "(?P<escaped>", 1)
     + r"|(?P<ticks>`+)(?P<code>.+?)(?<!`)(?P=ticks)(?!`)"
     + r"|(?P<tag><(?P<closing>/?)(?P<name>[A-Za-z][\w-]*)"
-      r"(?P<attributes>(?:\s+[\w:-]+(?:\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'<>=`]+))?)*)\s*/?>)"
+      r"(?P<attributes>(?:\s+[\w:-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'<>=`]+))*)\s*/?>)"
     + r"|(?P<bare>https?://[^\s<>\[\]()\\*`]*[^\s<>\[\]()\\*`_~])"
     + r"|(?P<open>!?\[)"
     + r"|\]\((?P<address>(?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*\))*)(?P<rest>(?:\s+(?:\"[^\"]*\"|'[^']*'))?)\)"
@@ -179,9 +179,10 @@ WORD_TAGS = {"a", "mention", "date"}
 TARGET_ATTRIBUTES = {"url", "href", "source", "src"}
 DATE_ATTRIBUTES = {"start", "end", "start-time", "end-time", "time-zone"}
 CAPTION_ATTRIBUTES = {"alt", "caption"}
-EMPHASIS = [re.compile(pattern) for pattern in (
-    r"\*\*(?=\S)(.+?)\*\*", r"(?<!\w)__(?=\S)(.+?)__(?!\w)", r"~~(?=\S)(.+?)~~",
-    r"(?<!\*)\*(?=\S)(.+?)(?<=\S)\*(?!\*)", r"(?<!\w)_(?=\S)(.+?)(?<=\S)_(?!\w)")]
+# The marks of bold, strikethrough and italics: where each one opens and where it closes.
+EMPHASIS = [tuple(map(re.compile, (f"{opens}|{closes}", opens, closes))) for opens, closes in (
+    (r"\*\*(?=\S)", r"\*\*"), (r"(?<!\w)__(?=\S)", r"__(?!\w)"), (r"~~(?=\S)", r"~~"),
+    (r"(?<!\*)\*(?=\S)", r"(?<=\S)\*(?!\*)"), (r"(?<!\w)_(?=\S)", r"(?<=\S)_(?!\w)"))]
 
 
 def address_of(text):
@@ -221,6 +222,18 @@ def tag_words(match):
     return space + "".join(sorted(said)) + space
 
 
+def without_pairs(text, mark, opens, closes):
+    """The text without the marks of one kind that pair up around some text; a mark alone is text."""
+    out, last, opened = [], 0, None
+    for match in mark.finditer(text):
+        if opened is None:
+            opened = match if opens.match(text, match.start()) else None
+        elif closes.match(text, match.start()) and match.start() > opened.end():
+            out += [text[last : opened.start()], text[opened.end() : match.start()]]
+            last, opened = match.end(), None
+    return "".join(out) + text[last:]
+
+
 def request_words(line):
     """The words of one line of the request with only their formatting dropped (bold, italics, colour,
     inline code marks, escapes): the target of every link and mention, the days and hours of a date and
@@ -254,8 +267,8 @@ def request_words(line):
             address = address_of(match.group("address"))
             out.append("]" + hold(f"({unsigned(address) if opened == '![' else address}){match.group('rest')}"))
     text = "".join(out) + line[last:]
-    for pattern in EMPHASIS:
-        text = pattern.sub(r"\1", text)
+    for mark, opens, closes in EMPHASIS:
+        text = without_pairs(text, mark, opens, closes)
     text = html.unescape(text)
     return re.sub(r"\x00(\d+)\x00", lambda m: kept[int(m.group(1))], text).replace("️", "")
 
