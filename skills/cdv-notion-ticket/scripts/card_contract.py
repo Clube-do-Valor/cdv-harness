@@ -30,6 +30,7 @@ text; a later change is the finding `request-changed` until `accept-request` pin
 """
 
 import argparse
+import bisect
 import contextlib
 import copy
 import datetime
@@ -158,11 +159,12 @@ def fold(text):
     return " ".join(unicodedata.normalize("NFC", plain(text)).casefold().split())
 
 
-# A line of the request, read for its digest: an escaped character, inline code, a tag, a bare address,
-# and the brackets of a link or a picture with its address.
+# A line of the request, read for its digest: an escaped character, a run of backquotes (inline code when
+# a later run as long closes it), a tag, a bare address, and the brackets of a link or a picture with its
+# address.
 REQUEST_TOKEN = re.compile(
     ESCAPE.pattern.replace("(", "(?P<escaped>", 1)
-    + r"|(?P<ticks>`+)(?P<code>.+?)(?<!`)(?P=ticks)(?!`)"
+    + r"|(?P<ticks>`+)"
     + r"|(?P<tag><(?P<closing>/?)(?P<name>[A-Za-z][\w-]*)"
       r"(?P<attributes>(?:\s+[\w:-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s\"'<>=`]+))*)\s*/?>)"
     + r"|(?P<bare>https?://[^\s<>\[\]()\\*`]*[^\s<>\[\]()\\*`_~])"
@@ -257,7 +259,9 @@ def request_words(line):
     inline code marks, escapes): the target of every link and mention, the days and hours of a date and
     the text of inline code stay, and of a picture or a file its caption and its unsigned address; of a
     mention the name shown does not. `plain`, which labels and titles are compared with, drops every tag."""
-    kept, out, last, brackets = [], [], 0, []
+    kept, out, last, brackets, runs = [], [], 0, [], {}
+    for run in re.finditer("`+", line):  # where the runs of backquotes of each length start
+        runs.setdefault(len(run.group(0)), []).append(run.start())
 
     def hold(text):
         kept.append(text)
@@ -269,7 +273,14 @@ def request_words(line):
         if match.group("escaped"):
             out.append(hold(match.group("escaped")))
         elif match.group("ticks"):
-            out.append(hold(match.group("code")))
+            length = len(match.group("ticks"))
+            starts = runs.get(length, [])
+            place = bisect.bisect_left(starts, last)
+            if place < len(starts):
+                out.append(hold(line[last : starts[place]]))
+                last = starts[place] + length
+            else:  # a run that nothing closes is text
+                out.append(match.group("ticks"))
         elif match.group("tag"):
             said = tag_words(match)
             out.append(hold(said) if said.strip() else said)
@@ -314,7 +325,7 @@ def quote(text):
 # The body
 # ---------------------------------------------------------------------------------------------
 
-HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+HEADING = re.compile(r"^(#{1,6})\s+(.*)$")
 LIST_ITEM = re.compile(r"^(?:[-*+]|\d+[.)])\s+\S")
 BOLD_DATE = re.compile(
     r"^(?:[-*+]\s+)?(?:\*\*|__|<b>|<strong>)\s*\d{1,2}/\d{1,2}\s*(?:\*\*|__|</b>|</strong>)\s*·\s", re.I
@@ -357,7 +368,7 @@ def heading(line, level=None):
         return None
     if level is not None and len(match.group(1)) != level:
         return None
-    return len(match.group(1)), plain(match.group(2))
+    return len(match.group(1)), plain(match.group(2).rstrip("#"))  # its closing marks dropped
 
 
 def h2_index(lines, title):
@@ -453,7 +464,8 @@ def toggle_spans(lines):
                 first_child = cursor + 1
             cursor += 1
         children = range(cursor if first_child is None else first_child, cursor)
-        found.append((plain(re.sub(r"<[^>]+>", "", title or "")), children, index, cursor + 1))
+        tagged, end, rest = (title or "").rpartition(">")  # past the last `>` no tag closes
+        found.append((plain(re.sub(r"<[^>]+>", "", tagged + end) + rest), children, index, cursor + 1))
         index = cursor + 1
     return found
 
@@ -734,7 +746,7 @@ def pin_from_fetch_output(text):
             if line.startswith("id: ") and page_id is None:
                 page_id = line[4:].strip()
             elif line.startswith("parent: data source ") and title is None:
-                title = re.sub(r"\s*\([^()]*\)\s*$", "", line[len("parent: data source "):]).strip()
+                title = re.sub(r"\([^()]*\)\s*$", "", line[len("parent: data source "):]).strip()
             elif line == "body:":
                 rest = lines[index + 1 :]
                 while rest and not rest[-1].strip():

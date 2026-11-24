@@ -11,6 +11,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import sys
 from pathlib import Path
 
@@ -31,6 +32,22 @@ CREATED = "2026-11-20T10:00:00.000Z"
 SINCE = "2026-11-01"
 ME = "ana@example.com"
 NOBODY_KNOWN = {"object": "user", "id": uid(0xA9)}  # a person whose e-mail the token cannot read
+
+
+@contextlib.contextmanager
+def cpu_limit(seconds=20):
+    """Ends a reading that takes more than this many seconds of this process's own CPU time: it cannot
+    hang, and a busy machine does not change it (the wall clock does not count)."""
+    def stop(*_):
+        raise AssertionError(f"still reading after {seconds} s of CPU time")
+
+    before = signal.signal(signal.SIGVTALRM, stop)
+    signal.setitimer(signal.ITIMER_VIRTUAL, seconds)
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_VIRTUAL, 0)
+        signal.signal(signal.SIGVTALRM, before)
 
 
 def key(number):

@@ -118,7 +118,7 @@ PARTIAL_ON = re.compile(r"done in part on (https?://\S+?):(?:\s|$)")
 # A write in doubt (sent, with no answer the client can trust), alone or after a write that landed:
 # `In doubt: <what> (<cause>): ...`. The cause names the page by the API path the request went to. A
 # refused (`Not written:`) or unsent (`Not sent:`) write names that path too, and is not one.
-IN_DOUBT = re.compile(r"(?m)^\s*(?:done in part\b.*?\. )?In doubt: .*$")
+IN_DOUBT = re.compile(r"(?m)^[^\S\n]*(?:done in part\b.*?\. )?In doubt: .*$")
 PAGE_PATH = re.compile(r"/v1/pages/(" + UUID.pattern + ")")
 MAX_DEPTH = 3  # a command string inside a command string
 OPERATOR = re.compile(r"&&|\|\||;;&|;;|;&|\|&|[;|&()]")

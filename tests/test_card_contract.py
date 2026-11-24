@@ -640,6 +640,45 @@ class RequestPinTest(CardCase):
         ], ["request-changed"])
 
 
+class ReadingTimeTest(CardCase):
+    """The time a reading takes follows the length of the text, not the shape of one line. Each input is
+    long enough that a pattern which retries cannot end inside the limit, and is read in a small part of it."""
+
+    def test_runs_of_backquotes_in_the_request(self):
+        for line, words in (
+            ("a `*x*` b", "a *x* b"), ("a ``x ` *y*`` b", "a x ` *y* b"), ("`*a*` e `*b*`", "*a* e *b*"),
+            ("\\``*a*` b", "`*a* b"), ("`a\\` *b*", "a\\ b"),  # a run after an escaped one; no escape inside the code
+            ("``*a*` b", "``a` b"), ("`*a*`` b", "`a`` b"), ("``` `*a*` ``", "``` *a* ``"),  # a run nothing closes is text
+        ):
+            with self.subTest(line=line):
+                self.assertEqual(self.cc.request_words(line), words)
+        with cf.cpu_limit():
+            self.cc.digest("a" + "`" * 100000)
+            self.cc.digest(" ".join("`" * length for length in range(1, 1501)))
+
+    def test_spaces_and_marks_inside_a_heading(self):
+        for line, read in (("## x ##", (2, "x")), ("  ## Entrega  ", (2, "Entrega")), ("# a # #", (1, "a #")), ("### a#", (3, "a")),
+                           ("## ##", (2, "")), ("# a  b", (1, "a  b")), ("##", None), ("##x", None), ("####### x", None)):
+            with self.subTest(line=line):
+                self.assertEqual(self.cc.heading(line), read)
+        with cf.cpu_limit():
+            for run in (" " * 100000, "#" * 100000, " #" * 50000):
+                self.assertEqual(self.cc.heading(f"# a{run}x")[0], 1)
+
+    def test_open_tags_in_the_title_of_a_toggle(self):
+        for title, read in (("## <b>O pedido</b>", "O pedido"), ('<span color="red">x</span> < y', "x < y"), ("a <b", "a <b"), ("<> a", "<> a")):
+            with self.subTest(title=title):
+                self.assertEqual(self.cc.toggles(["<toggle>", title, "\tx", "</toggle>"]), [(read, ["\tx"])])
+        with cf.cpu_limit():
+            self.cc.toggles(["<toggle>", "a" + "<" * 200000, "</toggle>"])
+
+    def test_spaces_in_the_parent_line_of_a_fetch_output(self):
+        output = f"id: {uid(0xE1)}\nparent: data source Tasks%s({cf.DS_TASKS})\nbody:\n## Pedido\n\nO pedido.\n\n## Entrega\n"
+        with cf.cpu_limit():
+            self.assertTrue(self.cc.pin_from_fetch_output(output % (" " * 200000)))
+            self.assertFalse(self.cc.pin_from_fetch_output(output.replace(uid(0xE1), uid(0xE2)) % (" " * 200000 + "x ")))
+
+
 class FailureTest(CardCase):
     def test_no_token_exits_3_and_an_unreadable_page_exits_4_with_the_client_message(self):
         page = self.add(cf.task(1, ""))

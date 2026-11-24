@@ -546,6 +546,17 @@ class CardHookTest(HookCase):
         self.assertSilent(self.hook(self.event("Bash", {"command": "cat notes.txt"}, {"stdout": doubt[2], "stderr": ""})))
         self.assertEqual(self.calls(), [])
 
+    def test_an_output_of_blank_lines_is_read_in_time_that_follows_its_length(self):
+        module, path = self.hook_module(), f"/v1/pages/{uid(0xD1)}"
+        blank = "\n" * 200000
+        for doubt in (f"In doubt: the update ({path} timed out): look", f" \t\x0bIn doubt: the update ({path} timed out)",
+                      f"done in part on x: written: a. In doubt: the update ({path} timed out)"):
+            with self.subTest(doubt=doubt), cf.cpu_limit():
+                self.assertEqual(module.pages_in_doubt(f"{blank}{doubt}\n{blank}x"), [uid(0xD1)])
+        with cf.cpu_limit():
+            self.assertEqual(module.bash_targets(f"{CLIENT_CMD} update $K --set a=b", blank, 0), ([], False))
+        self.assertEqual(module.pages_in_doubt(f"x In doubt: the update ({path} timed out)"), [])
+
     def test_connector_page_writes_are_checked_under_any_server_prefix(self):
         bad = self.add(cf.task(1, ""))
         other = self.add(cf.task(2, ""))
