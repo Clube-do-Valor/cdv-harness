@@ -61,6 +61,7 @@ When a pull request is opened for the card, add it to the `**PRs:**` line as `<r
 
 When the developer says the pull request merged or deployed, write `## Fechamento` with 1 to 3 items (what changed for who asked; `Fora do código:` for what depends on someone outside the code) and set the status of that event.
 
+- A card that already holds `## Fechamento` (the skeleton's, with its placeholders) has that zone filled with `--edit`; one is appended only when the card has none.
 - A manual production step is recorded as one comment on the card (what ran, when, by whom, the result) with `notion comments add <card> --body '<text>'`, and never as a change to the body. The comment stays open: the API cannot read a resolved one.
 
 ### 5. Validated by who asked - done
@@ -71,7 +72,7 @@ When a card whose request came from someone else is closed, offer the developer 
 
 ## Writing the body
 
-`notion fetch <card>` first, always. Then the smallest edit: `notion update <card> --edit '<old text>' '<new text>'` for a line or a zone, `--append-file <file.md>` to add `## Fechamento`, `--replace-file <file.md>` only for a body that is being replaced on purpose (the check then judges the whole card, whoever it belongs to). When no `--edit` matched, the client exits `1` and nothing is changed; when some `--edit` matched and some did not, it exits `4` naming the ones that did not. Either way the card is re-read and the missed edits retried once, never forced with a rewrite. Properties go with `--set`, in the names of the names map.
+`notion fetch <card>` first, always. Then the smallest edit: `notion update <card> --edit '<old text>' '<new text>'` for a line or a zone, `--append-file <file.md>` to add `## Fechamento` to a card that has none, `--replace-file <file.md>` only for a body that is being replaced on purpose (the check then judges the whole card, whoever it belongs to). When no `--edit` matched, the client exits `1` and nothing is changed; when some `--edit` matched and some did not, it exits `4` naming the ones that did not. Either way the card is re-read and the missed edits retried once, never forced with a rewrite. Properties go with `--set`, in the names of the names map.
 
 ## A helpdesk form ticket
 

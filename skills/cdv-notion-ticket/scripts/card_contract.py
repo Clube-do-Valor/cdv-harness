@@ -400,24 +400,48 @@ def label_line(lines, label):
     return None
 
 
+FORMAT_TAG = re.compile(rf"</?(?:{'|'.join(sorted(FORMAT_TAGS))})(?:\s[^<>]*)?>", re.I)
+
+
+def item_words(line):
+    """The words of a list item, its `<...>` kept, formatting and escapes dropped: what a skeleton's
+    placeholder is compared with (`plain` reads `<what ...>` as a tag and drops it)."""
+    text = FORMAT_TAG.sub("", re.sub(r"^(?:[-*+]|\d+[.)])\s+", "", line.strip()))
+    text = re.sub(r"[*_`]", "", html.unescape(ESCAPE.sub(r"\1", text)))
+    return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+
+def placeholders():
+    """The list items of the skeletons as they stand before anybody fills them."""
+    texts = (skeleton["text"] for skeleton in data()["skeletons"].values())
+    return {item_words(line) for text in texts for line in text.splitlines() if LIST_ITEM.match(line) and "<" in line}
+
+
 def items_after(lines, index):
     """The top-level list items of the list that follows line `index` (blank lines skipped)."""
-    count, seen_list = 0, False
+    items, seen_list = [], False
     for line in lines[index + 1 :]:
         if not line.strip():
             continue
         if LIST_ITEM.match(line):
-            count += 1
+            items.append(line)
             seen_list = True
         elif seen_list and line[:1] in (" ", "\t"):
             continue
         else:
             break
-    return count
+    return items
 
 
 def top_items(lines):
-    return sum(1 for line in lines if LIST_ITEM.match(line))
+    return [line for line in lines if LIST_ITEM.match(line)]
+
+
+def counted(items):
+    """(how many of the items are filled, what to say of those still a skeleton's placeholder)."""
+    empty = placeholders()
+    count = sum(1 for line in items if item_words(line) not in empty)
+    return count, "" if count == len(items) else " (a placeholder of the skeleton is not an item)"
 
 
 def request_span(lines):
@@ -867,9 +891,9 @@ def delivery_rules(card, found):
         found.add("done-when", "`**Pronto quando:**` is missing from `## Entrega`",
                   f"Write `**Pronto quando:**` followed by {low} to {high} list items someone can observe")
     else:
-        count = items_after(delivery, done_when[0])
+        count, left = counted(items_after(delivery, done_when[0]))
         if not low <= count <= high:
-            found.add("done-when", f"`**Pronto quando:**` has {count} list items, not {low} to {high}",
+            found.add("done-when", f"`**Pronto quando:**` has {count} list items{left}, not {low} to {high}",
                       f"Keep {low} to {high} criteria someone can observe; a larger delivery is another card")
 
 
@@ -933,8 +957,20 @@ def pull_request_properties(card, found, rank):
         summary_rule(card, found)
 
 
+def closings(card):
+    """The line indexes of the card's `## Fechamento` headings; one between `## Pedido` and `## Entrega`
+    is the requester's own heading."""
+    pedido, entrega = h2_index(card.lines, "Pedido"), h2_index(card.lines, "Entrega")
+    theirs = range(pedido, entrega) if card.kind == "task" and None not in (pedido, entrega) else ()
+    headed = ((index, heading(line, 2)) for index, line in enumerate(card.lines))
+    return [index for index, h2 in headed if h2 and fold(h2[1]) == fold("Fechamento") and index not in theirs]
+
+
 def closing_rule(card, found, rank):
-    if rank >= RANKS["merged"] and filled(prop(card.page, card.names["tasks"]["properties"]["pull_request"])):
+    if rank >= RANKS["merged"] and len(closings(card)) > 1:
+        found.add("closing", f"the card has {len(closings(card))} `## Fechamento` zones, not one",
+                  "Put the closing under the first one and delete the others")
+    elif rank >= RANKS["merged"] and filled(prop(card.page, card.names["tasks"]["properties"]["pull_request"])):
         start = h2_index(card.lines, "Fechamento")
         low, high = limits()["closing"]
         if start is None:
@@ -942,9 +978,9 @@ def closing_rule(card, found, rank):
                       f"Write `## Fechamento` with {low} to {high} items: what changed for who asked, and "
                       "`Fora do código:` for what depends on someone outside the code")
         else:
-            count = top_items(zone(card.lines, start))
+            count, left = counted(top_items(zone(card.lines, start)))
             if not low <= count <= high:
-                found.add("closing", f"`## Fechamento` has {count} list items, not {low} to {high}",
+                found.add("closing", f"`## Fechamento` has {count} list items{left}, not {low} to {high}",
                           f"Keep {low} to {high} items: what changed for who asked, and `Fora do código:`")
 
 

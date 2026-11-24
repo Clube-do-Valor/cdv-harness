@@ -191,6 +191,14 @@ class TicketSkillTest(SentenceCase):
         self.sentence(r"merged or deployed", r"write `## Fechamento` with 1 to 3 items", r"`Fora do código:`",
                       r"status of that event")
 
+    def test_an_existing_fechamento_is_filled_and_one_is_appended_only_when_there_is_none(self):
+        self.sentence(r"already holds `## Fechamento`", r"skeleton's, with its placeholders", r"that zone filled",
+                      r"appended only when the card has none")
+        self.sentence(r"`--append-file <file\.md>`", r"`## Fechamento` to a card that has none")
+        limits = section(read(CONTRACT), "Limits")
+        self.assertSentence(limits, r"placeholder of a skeleton", r"is not an item", where="card-contract.md")
+        self.assertSentence(limits, r"one `## Fechamento`", r"second", r"finding", where="card-contract.md")
+
     def test_done_only_when_the_developer_says_who_asked_validated(self):
         self.sentence(r"done status only when the developer says who asked validated")
 

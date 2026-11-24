@@ -307,6 +307,74 @@ class TaskRulesTest(CardCase):
                 page = self.add(cf.task(number, REQUEST + entrega(items)))
                 self.assertEqual(self.rules(page), expected)
 
+    def read_back(self, item):
+        """The forms in which Notion may give a list item of a skeleton back."""
+        return (item, item.replace("<", r"\<").replace(">", r"\>"), item.replace("<", r"\<"),
+                item.replace("<", "&lt;").replace(">", "&gt;"), item.replace("- ", "- **", 1) + "**",
+                item.replace("- ", '- <span color="gray">', 1) + "</span>", item.replace("- ", "* ", 1))
+
+    def test_a_skeletons_placeholder_is_not_a_done_when_item(self):
+        placeholder = "- <1 to 5 criteria someone can observe>"
+        self.assertIn(placeholder, cf.contract()["skeletons"]["task"]["text"])
+        real = "- Critério observável 1."
+        for number, form in enumerate(self.read_back(placeholder), start=1):
+            with self.subTest(form=form):
+                page = self.add(cf.task(number, REQUEST + entrega(1).replace(real, form)))
+                self.assertEqual(self.rules(page), ["done-when"])
+                self.assertIn("placeholder", self.check(page)[1])
+                self.set_body(page, REQUEST + entrega(1).replace(real, form + "\n" + real))
+                self.assertEqual(self.rules(page), [])
+                self.set_body(page, REQUEST + entrega(5).replace(real, form + "\n" + real))
+                self.assertEqual(self.rules(page), [])
+        about = self.add(cf.task(90, REQUEST + entrega(1).replace(real, "- A tela diz <1 to 5 criteria someone can observe>.")))
+        self.assertEqual(self.rules(about), [])
+
+    def test_a_skeletons_placeholder_is_not_a_closing_item(self):
+        skeleton = cf.run_main(self.cc, ["skeleton", "task"])[1]
+        empty = skeleton[skeleton.index("## Fechamento"):]
+        changed, outside = [line for line in nonblank(empty) if line.startswith("- ")]
+        delivered = REQUEST + entrega() + "\n"
+        for number, (one, two) in enumerate(zip(self.read_back(changed), self.read_back(outside)), start=1):
+            with self.subTest(form=one):
+                page = self.add(cf.task(number, delivered + f"## Fechamento\n\n{one}\n{two}\n", status="Rollout", pr=PR_URL,
+                                        summary=SUMMARY))
+                self.assertEqual(self.rules(page), ["closing"])
+                self.assertIn("placeholder", self.check(page)[1])
+                self.set_body(page, delivered + f"## Fechamento\n\n- A tela exporta.\n{two}\n")
+                self.assertEqual(self.rules(page), [])
+        bold = self.add(cf.task(80, delivered + "## Fechamento\n\n" + outside.replace("- Fora do código:", "- **Fora do código:**"),
+                                status="Rollout", pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(bold), ["closing"])
+        form = self.add(cf.task(81, "## Prazo\n\nSexta.\n\n" + empty + "\nPR: #12\n", status="Done", email="c@example.com",
+                                pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(form), ["closing"])
+
+    def test_a_second_closing_is_a_finding(self):
+        skeleton = cf.run_main(self.cc, ["skeleton", "task"])[1]
+        empty = skeleton[skeleton.index("## Fechamento"):]
+        delivered = REQUEST + entrega() + "\n"
+        bodies = {"the skeleton's, then nine items": delivered + empty + "\n" + fechamento(9),
+                  "both filled": delivered + fechamento() + "\n" + fechamento(1),
+                  "read back in bold": delivered + fechamento() + "\n" + fechamento(1).replace("## Fechamento", "## <b>Fechamento</b>")}
+        for number, (name, body) in enumerate(bodies.items(), start=1):
+            with self.subTest(case=name):
+                page = self.add(cf.task(number, body, status="Rollout", pr=PR_URL, summary=SUMMARY))
+                self.assertEqual(self.rules(page), ["closing"])
+                self.assertIn("2 `## Fechamento`", self.check(page)[1])
+        no_code = self.add(cf.task(10, REQUEST + entrega(prs=None) + "\n" + fechamento() + "\n" + fechamento(), status="Done",
+                                   summary=SUMMARY))
+        self.assertEqual(self.rules(no_code), ["closing"])
+        form = self.add(cf.task(11, "## Prazo\n\nSexta.\n\n" + fechamento() + "\n" + fechamento() + "\nPR: #12\n",
+                                status="Done", email="c@example.com", pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(form), ["closing"])
+        working = self.add(cf.task(12, delivered + empty + "\n" + empty))
+        self.assertEqual(self.rules(working), [])
+        review = self.add(cf.task(14, delivered + empty + "\n" + empty, status="Code Review", pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(review), [])
+        theirs = REQUEST + "## Fechamento\n\n- O do mês passado.\n\n" + entrega() + "\n" + fechamento()
+        headed = self.add(cf.task(13, theirs, status="Rollout", pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(headed), [])
+
     def test_the_pr_line_and_the_pr_property_agree(self):
         body_only = self.add(cf.task(1, full_task(prs="ledger-api #12"), status="Code Review", summary=SUMMARY))
         self.assertIn("pr-link", self.rules(body_only))
