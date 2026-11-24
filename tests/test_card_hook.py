@@ -688,10 +688,17 @@ class CardHookTest(HookCase):
             "an unknown loop, one written": (f"while read K; do {through} --replace-file f.md; done < l", lines[1], [2]),
             "an unknown loop, two written": (f"while read K; do {through} --replace-file f.md; done < l", lines[0] + lines[1], []),
             "two unknown pages, one replaced": (f"{through} --replace-file f; {CLIENT_CMD} update $J --set a=b", lines[0] + lines[1], []),
+            "two unknown pages, the replaced one not written": (f"{through} --replace-file f; {CLIENT_CMD} update $J --set a=b", lines[1], []),
+            "two unknown pages, the replaced one hidden": (
+                f"{through} --replace-file f > /dev/null; {CLIENT_CMD} update $J --set a=b", lines[1], []),
             "an unknown page beside a known one": (f"{change}; {through} --replace-file f.md", lines[1] + lines[0], []),
             "a known page replaced beside an unknown one": (f"{replace}; {through} --set a=b", lines[0] + lines[1], [1]),
             "one page created, an unknown one replaced": (
                 f"{CLIENT_CMD} create --parent T --set a=b; {through} --replace-file f.md || true", f"created {theirs['url']} {two}\n", []),
+            "an unknown page beside a create whose output is hidden": (
+                f"{CLIENT_CMD} create --parent T --set a=b > /dev/null; {through} --replace-file f.md", lines[1], []),
+            "one page created in a shape the reading does not open": (
+                f"eval '{CLIENT_CMD} create --parent T --set a=b'; {through} --replace-file f.md || true", f"created {theirs['url']} {two}\n", []),
             "a comment": (f"{change} # not --replace-file f.md", lines[1], []),
             "a comment on a line of its own": (f"# notion update {two} --replace-file f.md\n{change}", lines[1], []),
             "an echo": (f"echo notion update {two} --replace-file f.md; {change}", lines[1], []),
@@ -712,6 +719,7 @@ class CardHookTest(HookCase):
         # A call that failed: the page the output shows takes the flag of its own call
         for command, shown, expected in ((f"{replace} && {change}", lines[0], [1]), (f"{change} && {replace}", lines[1], []),
                                          (f"{change} && {through} --replace-file f.md", lines[1], []),
+                                         (f"{through} --replace-file f.md; {CLIENT_CMD} update $J --set a=b && false", lines[1], []),
                                          (f"{through} --replace-file f.md && false", lines[1], [2])):
             with self.subTest(failed=command):
                 self.assertEqual(self.marked(command, error="Exit code 2\n" + shown)[0], expected)

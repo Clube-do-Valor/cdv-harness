@@ -563,15 +563,15 @@ def replaced_flags(calls, shown_pages, created):
 
     A call that names its page is paired with it by the page itself: the checker compares the page it
     read with the one named. A replace whose page the command does not tell (or a command whose reading
-    is not whole) can be paired with no call: the page takes it when it is the only one the call wrote,
-    and several take none. A card left unmarked by mistake costs one judgement; a card marked by mistake
-    gets someone else's card rewritten."""
+    is not whole) can be paired with no call: the page takes it when the command holds one write of the
+    client and it is the only page shown as written; with more than one write (the page shown may be the
+    other one's) or several pages, none takes it. A card left unmarked by mistake costs one judgement; a
+    card marked by mistake gets someone else's card rewritten."""
     flags = [word for call in calls if call.replaces and call.whole for ref in call.refs if ref
              for word in ("--body-replaced-of", ref)]
     unpaired = [call for call in calls if call.replaces and (not call.whole or None in call.refs)]
     writes = [call for call in calls if call.verb in ("update", "create")]
-    named = {ref for call in writes for ref in call.refs if ref}
-    if unpaired and len(shown_pages) <= 1 and not shown_pages & created and (len(writes) == 1 or not named):
+    if unpaired and len(shown_pages) <= 1 and not shown_pages & created and len(writes) == 1:
         flags.append("--body-replaced")
     return flags
 
