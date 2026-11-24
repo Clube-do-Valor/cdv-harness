@@ -438,10 +438,22 @@ def top_items(lines):
 
 
 def counted(items):
-    """(how many of the items are filled, what to say of those still a skeleton's placeholder)."""
+    """(how many of the items are filled, how many are still a skeleton's placeholder)."""
     empty = placeholders()
     count = sum(1 for line in items if item_words(line) not in empty)
-    return count, "" if count == len(items) else " (a placeholder of the skeleton is not an item)"
+    return count, len(items) - count
+
+
+def items_rule(found, rule, where, items, bounds, fix):
+    """The findings of a list: a count of filled items out of `bounds` (None: not judged), and a
+    placeholder left in it, unless the count already says the list holds nothing else."""
+    count, left = counted(items)
+    miscounted = bounds is not None and not bounds[0] <= count <= bounds[1]
+    if miscounted:
+        note = " (a placeholder of the skeleton is not an item)" if left else ""
+        found.add(rule, f"{where} has {count} list items{note}, not {bounds[0]} to {bounds[1]}", fix)
+    if left and (count or not miscounted):
+        found.add(rule, f"{where} still holds a placeholder of the skeleton", "Fill it with what it asks for, or delete it")
 
 
 def request_span(lines):
@@ -891,10 +903,8 @@ def delivery_rules(card, found):
         found.add("done-when", "`**Pronto quando:**` is missing from `## Entrega`",
                   f"Write `**Pronto quando:**` followed by {low} to {high} list items someone can observe")
     else:
-        count, left = counted(items_after(delivery, done_when[0]))
-        if not low <= count <= high:
-            found.add("done-when", f"`**Pronto quando:**` has {count} list items{left}, not {low} to {high}",
-                      f"Keep {low} to {high} criteria someone can observe; a larger delivery is another card")
+        items_rule(found, "done-when", "`**Pronto quando:**`", items_after(delivery, done_when[0]), (low, high),
+                   f"Keep {low} to {high} criteria someone can observe; a larger delivery is another card")
 
 
 def people_rules(card, found):
@@ -970,21 +980,22 @@ def closings(card):
 
 
 def closing_rule(card, found, rank):
-    if rank >= RANKS["merged"] and len(closings(card)) > 1:
-        found.add("closing", f"the card has {len(closings(card))} `## Fechamento` zones, not one",
+    if rank < RANKS["merged"]:
+        return
+    starts = closings(card)
+    delivered = filled(prop(card.page, card.names["tasks"]["properties"]["pull_request"]))
+    low, high = limits()["closing"]
+    if len(starts) > 1:
+        found.add("closing", f"the card has {len(starts)} `## Fechamento` zones, not one",
                   "Put the closing under the first one and delete the others")
-    elif rank >= RANKS["merged"] and filled(prop(card.page, card.names["tasks"]["properties"]["pull_request"])):
-        start = h2_index(card.lines, "Fechamento")
-        low, high = limits()["closing"]
-        if start is None:
-            found.add("closing", "the card has a pull request and no `## Fechamento`",
-                      f"Write `## Fechamento` with {low} to {high} items: what changed for who asked, and "
-                      "`Fora do código:` for what depends on someone outside the code")
-        else:
-            count, left = counted(top_items(zone(card.lines, start)))
-            if not low <= count <= high:
-                found.add("closing", f"`## Fechamento` has {count} list items{left}, not {low} to {high}",
-                          f"Keep {low} to {high} items: what changed for who asked, and `Fora do código:`")
+    elif starts:
+        items_rule(found, "closing", "`## Fechamento`", top_items(zone(card.lines, starts[0])),
+                   (low, high) if delivered else None,
+                   f"Keep {low} to {high} items: what changed for who asked, and `Fora do código:`")
+    elif delivered:
+        found.add("closing", "the card has a pull request and no `## Fechamento`",
+                  f"Write `## Fechamento` with {low} to {high} items: what changed for who asked, and "
+                  "`Fora do código:` for what depends on someone outside the code")
 
 
 def project_rules(card, found):

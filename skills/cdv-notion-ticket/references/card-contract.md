@@ -61,6 +61,8 @@ moved once, unchanged, under a new `## Pedido`, and is a task card from then on.
 - `**Pronto quando:**` holds 1 to 5 list items.
 - `## Fechamento` holds 1 to 3 list items.
 - An item that is still a placeholder of a skeleton (`- <what changed for who asked>`) is not an item.
+  One left beside a filled item is a finding until it is filled or deleted; in `## Fechamento` a
+  placeholder left is judged from the merged status on, with or without a pull request.
 - A card holds one `## Fechamento`: a second one is a finding from the merged status on.
 - The summary property holds one sentence of at most 200 characters on one line: what changed for
   who asked. It is the first sentence of the pull request's TL;DR, copied unchanged.

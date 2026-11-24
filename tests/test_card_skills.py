@@ -197,6 +197,7 @@ class TicketSkillTest(SentenceCase):
         self.sentence(r"`--append-file <file\.md>`", r"`## Fechamento` to a card that has none")
         limits = section(read(CONTRACT), "Limits")
         self.assertSentence(limits, r"placeholder of a skeleton", r"is not an item", where="card-contract.md")
+        self.assertSentence(limits, r"left beside a filled item", r"finding", r"filled or deleted", where="card-contract.md")
         self.assertSentence(limits, r"one `## Fechamento`", r"second", r"finding", where="card-contract.md")
 
     def test_done_only_when_the_developer_says_who_asked_validated(self):

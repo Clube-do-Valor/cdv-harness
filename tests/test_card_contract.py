@@ -321,13 +321,77 @@ class TaskRulesTest(CardCase):
             with self.subTest(form=form):
                 page = self.add(cf.task(number, REQUEST + entrega(1).replace(real, form)))
                 self.assertEqual(self.rules(page), ["done-when"])
-                self.assertIn("placeholder", self.check(page)[1])
-                self.set_body(page, REQUEST + entrega(1).replace(real, form + "\n" + real))
-                self.assertEqual(self.rules(page), [])
-                self.set_body(page, REQUEST + entrega(5).replace(real, form + "\n" + real))
-                self.assertEqual(self.rules(page), [])
+                self.assertIn("0 list items (a placeholder", self.check(page)[1])
         about = self.add(cf.task(90, REQUEST + entrega(1).replace(real, "- A tela diz <1 to 5 criteria someone can observe>.")))
         self.assertEqual(self.rules(about), [])
+
+    def test_a_placeholder_left_beside_a_real_done_when_item_is_a_finding(self):
+        placeholder, real = "- <1 to 5 criteria someone can observe>", "- Critério observável 1."
+        for number, form in enumerate(self.read_back(placeholder), start=1):
+            for items in (1, 5):
+                for where, pair in (("above", form + "\n" + real), ("below", real + "\n" + form)):
+                    with self.subTest(form=form, items=items, where=where):
+                        page = self.add(cf.task(number, REQUEST + entrega(items).replace(real, pair)))
+                        self.assertEqual(self.rules(page), ["done-when"])
+                        message = self.check(page)[1]
+                        self.assertIn("placeholder", message)
+                        self.assertRegex(message, r"Fill it .*or delete it")
+                        self.assertNotIn("list items", message)  # 5 filled items are 5, not 6
+        waiting = self.add(cf.task(90, REQUEST + entrega(1).replace(real, real + "\n" + placeholder), status="Not started"))
+        self.assertClean(waiting)
+        many = self.add(cf.task(91, REQUEST + entrega(6).replace(real, real + "\n" + placeholder)))
+        self.assertEqual(self.rules(many), ["done-when", "done-when"])
+        message = self.check(many)[1]
+        self.assertIn("6 list items", message)
+        self.assertRegex(message, r"Fill it .*or delete it")
+
+    def test_a_placeholder_left_in_the_closing_is_a_finding(self):
+        skeleton = cf.run_main(self.cc, ["skeleton", "task"])[1]
+        empty = skeleton[skeleton.index("## Fechamento"):]
+        changed, outside = [line for line in nonblank(empty) if line.startswith("- ")]
+        delivered, real = REQUEST + entrega() + "\n", "- A tela exporta."
+        no_code = REQUEST + entrega(prs=None) + "\n"
+
+        def closing(*items):
+            return "## Fechamento\n\n" + "\n".join(items) + "\n"
+
+        def assert_left(page):
+            self.assertEqual(self.rules(page), ["closing"])
+            message = self.check(page)[1]
+            self.assertIn("placeholder", message)
+            self.assertRegex(message, r"Fill it .*or delete it")
+            self.assertNotIn("list items", message)
+
+        for number, forms in enumerate(zip(self.read_back(changed), self.read_back(outside)), start=1):
+            for left in forms:
+                with self.subTest(left=left):
+                    page = self.add(cf.task(number, delivered + closing(real, left), status="Rollout", pr=PR_URL, summary=SUMMARY))
+                    assert_left(page)
+                    self.set_body(page, delivered + closing(left, real, real, real))
+                    assert_left(page)
+        for number, status in enumerate(("Rollout", "Done"), start=20):
+            with self.subTest(status=status):
+                assert_left(self.add(cf.task(number, delivered + closing(real, outside), status=status, pr=PR_URL, summary=SUMMARY)))
+                assert_left(self.add(cf.task(number + 10, no_code + closing(real, outside), status=status, summary=SUMMARY)))
+        assert_left(self.add(cf.task(40, no_code + empty, status="Done", summary=SUMMARY)))  # with no pull request too
+        form = "## Prazo\n\nSexta.\n\n"
+        assert_left(self.add(cf.task(41, form + closing(real, outside) + "\nPR: #12\n", status="Done", email="c@example.com",
+                                     pr=PR_URL, summary=SUMMARY)))
+        assert_left(self.add(cf.task(42, form + closing(real, outside), status="Done", email="c@example.com", summary=SUMMARY)))
+        many = self.add(cf.task(43, delivered + closing(real, real, real, real, outside), status="Done", pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(many), ["closing", "closing"])
+        theirs = REQUEST + closing(real, outside) + "\n" + entrega() + "\n" + fechamento()
+        for name, page in {
+            "before the merged status": cf.task(50, delivered + closing(real, outside), status="Code Review", pr=PR_URL, summary=SUMMARY),
+            "in progress": cf.task(51, delivered + closing(real, outside)),
+            "the requester's own heading": cf.task(52, theirs, status="Done", pr=PR_URL, summary=SUMMARY),
+            "filled, with no code": cf.task(53, no_code + closing(real, "- Fora do código: nada."), status="Done", summary=SUMMARY),
+            "five items, with no code": cf.task(54, no_code + fechamento(5), status="Done", summary=SUMMARY),
+            "both filled": cf.task(55, delivered + closing(real, "- Fora do código: nada."), status="Done", pr=PR_URL,
+                                   summary=SUMMARY),
+        }.items():
+            with self.subTest(clean=name):
+                self.assertEqual(self.rules(self.add(page)), [])
 
     def test_a_skeletons_placeholder_is_not_a_closing_item(self):
         skeleton = cf.run_main(self.cc, ["skeleton", "task"])[1]
@@ -339,9 +403,7 @@ class TaskRulesTest(CardCase):
                 page = self.add(cf.task(number, delivered + f"## Fechamento\n\n{one}\n{two}\n", status="Rollout", pr=PR_URL,
                                         summary=SUMMARY))
                 self.assertEqual(self.rules(page), ["closing"])
-                self.assertIn("placeholder", self.check(page)[1])
-                self.set_body(page, delivered + f"## Fechamento\n\n- A tela exporta.\n{two}\n")
-                self.assertEqual(self.rules(page), [])
+                self.assertIn("0 list items (a placeholder", self.check(page)[1])
         bold = self.add(cf.task(80, delivered + "## Fechamento\n\n" + outside.replace("- Fora do código:", "- **Fora do código:**"),
                                 status="Rollout", pr=PR_URL, summary=SUMMARY))
         self.assertEqual(self.rules(bold), ["closing"])
