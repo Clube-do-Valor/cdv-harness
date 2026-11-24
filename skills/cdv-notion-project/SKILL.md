@@ -43,7 +43,8 @@ When the skill refines a project, it writes nothing inside the request toggle, w
 When the skill proposes the tasks of a project, each task is one plan (at most about a week and a half of work for a person), the list is shown to the developer before any card exists, and the skill creates only the cards the developer approves, each in the task skeleton with `## Pedido` quoting the part of the briefing it serves.
 
 - Each proposed task names what it delivers and the part of the briefing it serves; a part that cannot ship alone joins the task it depends on.
-- Create each approved card with `notion create --parent <tasks data source> --set '<title property>=<title>' --set '<project property>=<project url>' --body-file <card.md>`, the body from `card_contract.py skeleton task` with `## Pedido` filled and the rest left for the plan approved moment of `cdv-notion-ticket`.
+- Create each approved card through the request arrives moment of `cdv-notion-ticket`: the requester is who asked for the project, the developer only when the project started with them, and the type and the request tag follow that moment.
+- The `notion create` of that moment gains `--set '<project property>=<project url>'`, with the body from `card_contract.py skeleton task` with `## Pedido` filled and the rest left for the plan approved moment of `cdv-notion-ticket`.
 
 ## Step 4 - A plan of the project is approved
 

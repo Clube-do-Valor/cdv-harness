@@ -376,6 +376,16 @@ class ProjectSkillTest(SentenceCase):
                       r"creates only the cards the developer approves", r"task skeleton",
                       r"`## Pedido` quoting the part of the briefing it serves")
 
+    def test_a_projects_cards_are_created_through_the_request_arrives_moment(self):
+        step = section(self.text, "Step 3 - Cut the project into tasks")
+        self.assertSentence(step, r"each approved card through the request arrives moment of `cdv-notion-ticket`",
+                            r"requester is who asked for the project",
+                            r"developer only when the project started with them", where="Step 3")
+        self.assertSentence(step, r"`notion create` of that moment", r"`--set '<project property>=<project url>'`",
+                            r"`card_contract\.py skeleton task` with `## Pedido` filled", where="Step 3")
+        for command in re.findall(r"`notion create [^`]*`", step):
+            self.assertIn("<requester property>", command)
+
     def test_an_approved_plan_updates_the_project_in_one_pass(self):
         self.sentence(r"plan of the project is approved", r"in one pass", r"executors", r"status",
                       r"effort score", r"list of tasks", r"current toggle")

@@ -103,7 +103,7 @@
       "owner": "augusto-henriques",
       "description": "Own a Notion project page in the card contract: keep the briefing as it arrived in the request toggle, write the project as it stands in the current toggle (objective, what will and will not be done, dependencies, decisions, the dated scope log), score its effort, cut it into tasks the size of one plan each and create only the cards the developer approves, and log every scope change after the first approved plan. Runs when there is a briefing to refine, a project to cut into tasks, a plan of the project approved, or a scope change to log; triggers on \"refina esse projeto\", \"quebra o projeto em tasks\", \"registra a mudança de escopo\", \"atualiza a página do projeto\". Works through the cdv-notion client, in a repository or at user level. Do NOT use for a task card or a helpdesk ticket (cdv-notion-ticket), for the plan of one task (tlc-spec-lean, started by cdv-kickoff), or to rewrite the request toggle, which no skill writes.",
       "path": "skills/cdv-notion-project",
-      "contentHash": "70c5f052974b481adf72e39db0b5ac39d1c8c72edc1040900f54332c53f635a5"
+      "contentHash": "32aba33cf850922b109477b88bf62594c64491350bb8b636a197983ce2aaf3d4"
     },
     {
       "name": "cdv-notion-ticket",
