@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import time
 import unittest
@@ -146,6 +147,26 @@ class SkeletonTest(CardCase):
         self.assertTrue(out.startswith("## Pedido"))
         self.assertTrue(nonblank(out)[-1].startswith("- Fora do código:"))
         self.assertNotIn("**Plano:**", cf.run_main(self.cc, ["skeleton", "task-small"])[1])
+
+    def test_the_checker_runs_by_its_path_with_no_interpreter_in_front(self):
+        ran = subprocess.run([str(cf.CHECKER), "skeleton", "task-small"], cwd=str(self.tmp), capture_output=True,
+                             text=True, timeout=60)
+        self.assertEqual(ran.returncode, 0, ran.stderr)
+        self.assertEqual(nonblank(ran.stdout), nonblank(DOOR_1["task-small"]))
+        listed = subprocess.run(["git", "ls-files", "-s", "skills"], cwd=str(REPO_ROOT), capture_output=True, text=True,
+                                check=True).stdout.splitlines()
+        seen = []
+        for mode, _sha, _stage, name in (line.split(maxsplit=3) for line in listed):
+            # a script with an interpreter line is called by its path; tlc-spec-lean's are called through python3
+            if "/scripts/" not in name or name.startswith("skills/tlc-spec-lean/"):
+                continue
+            if (REPO_ROOT / name).read_bytes().startswith(b"#!"):
+                seen.append(name)
+                self.assertEqual(mode, "100755", f"{name} is committed as {mode}")
+        self.assertIn("skills/cdv-notion-ticket/scripts/card_contract.py", seen)
+        for text in REPO_ROOT.glob("skills/cdv-*/**/*.md"):
+            for match in re.finditer(r"(python3 )?\S*tlc-spec-lean/scripts/\w+\.py", text.read_text(encoding="utf-8")):
+                self.assertTrue(match.group(1), f"{text.name} names {match.group(0)} with no python3 in front")
 
     def test_skeleton_of_an_unknown_kind_exits_2_naming_the_four(self):
         code, out, err = cf.run_main(self.cc, ["skeleton", "unknown"])

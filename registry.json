@@ -47,7 +47,7 @@
       "owner": "augusto-henriques",
       "description": "Finalize a feature branch — ephemeral `<slug>-pr.md` at repo root (lean PR format, never committed), atomic conventional commits with inferred scope, branch guard, state report, then the push and the pull request opened (or updated) through `cdv-open-pr` at wrap-up (never merges). Triggers on \"finaliza essa feature\", \"wrap up this branch\", \"gera o PR description e os commits\", \"comita isso e prepara o PR\". Do NOT use for planning unimplemented work (cdv-kickoff), PRD/PROGRESS artifacts, or merging.",
       "path": "skills/cdv-finalize",
-      "contentHash": "79db1b0000cfcb628e1989febbaf21b83ab8219fffce59f378c18812fc7da3f1"
+      "contentHash": "bb476da5343b89dac1cba544df150271bb0e7ff0b5e75fafaf4695c13cf48182"
     },
     {
       "name": "cdv-frontend",
