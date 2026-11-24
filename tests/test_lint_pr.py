@@ -92,6 +92,24 @@ class LintPrTest(unittest.TestCase):
         proc = self.assertPasses(description(tldr=wrapped))
         self.assertIn(f"TL;DR first sentence has {len(' '.join(wrapped.split()))} characters", proc.stdout)
 
+    def test_a_first_sentence_in_bold_or_italics_ends_at_its_own_period(self):
+        rest = " Antes " + " ".join(["palavra"] * 22) + " no fim."  # with the first one, more than 200 characters
+        at_100 = "x" * 99 + "."
+        for text in (f"**{at_100}**", f"*{at_100}*", f"_{at_100}_", f"__{at_100}__", f"***{at_100}***", f"**{at_100}",
+                     f"**{'x' * 99}**."):
+            with self.subTest(text=text[:4] + text[-4:]):
+                proc = self.assertPasses(description(tldr=text + rest))
+                self.assertIn("TL;DR first sentence has 100 characters", proc.stdout)
+        for marks in ("**", "*", "_"):
+            with self.subTest(marks=marks):
+                self.assertPasses(description(tldr=f"{marks}{'x' * 199}.{marks} {REST}"))
+                self.assertFailsOnly(description(tldr=f"{marks}{'x' * 200}.{marks} {REST}"),
+                                     "TL;DR first sentence has 201 characters")
+        self.assertIn("TL;DR first sentence has 100 characters",
+                      self.assertPasses(description(tldr=f"**{'x' * 100}**")).stdout)
+        quoted = self.assertPasses(description(tldr="A tela diz “" + "x" * 60 + ".”" + rest))
+        self.assertIn("TL;DR first sentence has 74 characters", quoted.stdout)
+
     def test_a_ticket_section_without_a_key_fails(self):
         self.assertFailsOnly(description(ticket=f"[Exportar faturas]({NOTION_URL})"),
                              "Ticket section holds no key matching ticket_key_pattern")

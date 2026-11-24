@@ -35,11 +35,13 @@ tldr_words="$(awk '/^## ⚡ TL;DR/{f=1;next} /^## /{f=0} f' "$FILE" | wc -w)"
 if [ "$tldr_words" -le 80 ] && [ "$tldr_words" -gt 0 ]; then say PASS "TL;DR has $tldr_words words (≤80)"; else say FAIL "TL;DR has $tldr_words words (must be 1-80)"; fi
 
 # The first sentence becomes the card's summary: up to the first . ! or ? followed by a space or the
-# end, or the whole section when it has no such end. Characters, not bytes.
+# end (closing marks of bold, italics or a quote may stand between), or the whole section when it has
+# no such end. Characters, not bytes; the marks of bold or italics around it are not counted.
 first_sentence="$(awk '/^## ⚡ TL;DR/{f=1;next} /^## /{f=0} f' "$FILE" | python3 -c 'import re, sys
 text = " ".join(sys.stdin.read().split())
-end = re.search(r"[.!?](?=\s|$)", text)
-print(len(text[: end.end()] if end else text))')"
+end = re.search(r"[.!?][*_\"\x27”’]*(?=\s|$)", text)
+first = text[: end.end()] if end else text
+print(len(re.sub(r"^[*_]+|[*_]+(?=[.!?*_\"\x27”’]*$)", "", first)))')"
 if [ "$first_sentence" -le 200 ]; then say PASS "TL;DR first sentence has $first_sentence characters (≤200)"; else say FAIL "TL;DR first sentence has $first_sentence characters (max 200: it becomes the card's summary)"; fi
 
 lines="$(wc -l < "$FILE")"
