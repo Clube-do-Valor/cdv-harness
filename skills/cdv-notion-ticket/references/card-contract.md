@@ -43,7 +43,8 @@ Any other page (a plan page under a task, a sprint, a page of another source) is
 
 The form's sections stay as the form wrote them. At closing the ticket gains `## Fechamento` with 1
 to 3 list items and the line `PR: #<n>` linked to the pull request; a ticket closed with no code
-change gets the summary property only.
+change gets the summary property only. A form ticket kept in a merge of requests has its own sections
+moved once, unchanged, under a new `## Pedido`, and is a task card from then on.
 
 ### Project page
 

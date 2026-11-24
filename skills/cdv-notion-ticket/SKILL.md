@@ -86,6 +86,8 @@ A form ticket is a card whose form e-mail property is filled and whose body has 
 
 When several request cards are served by one delivery, keep the card with the lowest key, propose a title that names the delivery, copy each other request under `## Pedido` headed by its key, add its requester to the requester property, set each other card to the archived status with `Pedido atendido em <key of the kept card>.` as the first line of its body, trash none, and run `scripts/card_contract.py accept-request <kept card>` so the merged request becomes the pinned one.
 
+When the kept card is a form ticket (it has no `## Pedido`), its own sections go first under the new `## Pedido`, unchanged, headed by its key, then each other request. Put the two headings above the first line of its sections with `--edit`, so no word of theirs is written again. From then on it is a task card, and this is the one time a form ticket's body is moved.
+
 ## Composition
 
 - `cdv-kickoff` - runs the plan approved moment when the plan is approved or, on a track with no plan that started from a card, when the `build` stage starts, and this skill as the `ticket` stage of a run.

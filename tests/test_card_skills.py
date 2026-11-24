@@ -212,6 +212,16 @@ class TicketSkillTest(SentenceCase):
                       r"requester property", r"archived status", r"`Pedido atendido em <key of the kept card>\.`",
                       r"trash none", r"`scripts/card_contract\.py accept-request <kept card>`")
 
+    def test_a_form_ticket_kept_in_a_merge_has_its_own_sections_put_first_under_pedido(self):
+        merge = section(self.text, "Several requests, one delivery")
+        self.assertSentence(merge, r"kept card is a form ticket", r"its own sections go first under the new `## Pedido`",
+                            r"unchanged", r"headed by its key", r"then each other request", where="the merge step")
+        self.assertSentence(merge, r"from then on it is a task card", r"the one time a form ticket's body is moved",
+                            where="the merge step")
+        self.assertSentence(merge, r"headings above the first line of its sections with `--edit`", where="the merge step")
+        self.assertSentence(section(read(CONTRACT), "Form ticket"), r"kept in a merge of requests", r"unchanged",
+                            r"`## Pedido`", r"task card", where="card-contract.md")
+
     def test_requester_is_who_asked_and_the_tag_only_for_others_or_bugs(self):
         self.sentence(r"creates a card", r"requester is who asked",
                       r"developer only when the work started with them",
