@@ -236,6 +236,14 @@ class TicketSkillTest(SentenceCase):
                       r"contract and the names map", r"skips only the steps that read a profile key")
         self.assertNoSentence(self.text, r"profile\.yaml` is missing", r"stop", where="cdv-notion-ticket/SKILL.md")
 
+    def test_the_user_level_client_and_checker_follow_the_config_dir(self):
+        for name in ("cdv-notion", "cdv-notion-ticket"):
+            self.assertSentence(skill(name), r"`<config dir>/skills/cdv-notion/scripts/notion` at user level",
+                                r"`<config dir>` is `\$CLAUDE_CONFIG_DIR`, else `~/\.claude`", where=name)
+        self.sentence(r"checker", r"`<config dir>/skills/cdv-notion-ticket/scripts/card_contract\.py` at user level")
+        for path in sorted(SKILLS.glob("cdv-*/**/*.md")):
+            self.assertNotRegex(read(path), r"(~|\$HOME|\$\{HOME\})/\.claude/", f"{path.parent.name}/{path.name}")
+
 
 class HelpdeskTest(SentenceCase):
     def setUp(self):

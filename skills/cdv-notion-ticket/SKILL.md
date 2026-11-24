@@ -19,7 +19,7 @@ Below, `profile.<key>` is a value from the profile. A key that is missing or `no
 
 With a profile, `profile.ticket_system` decides: `none` means there is no card, so skip this skill; another system than `notion` means say so and stop.
 
-Every Notion step below runs through the `cdv-notion` client (`.claude/skills/cdv-notion/scripts/notion` in a repository, `<config dir>/skills/cdv-notion/scripts/notion` at user level, written `notion` below; its skill has the commands and the markdown). When `notion auth status` exits `3` there is no token on this machine: write nothing to Notion, leave the text in the chat to paste, and say the developer runs `notion auth login` in a terminal.
+Every Notion step below runs through the `cdv-notion` client (`.claude/skills/cdv-notion/scripts/notion` in a repository, `<config dir>/skills/cdv-notion/scripts/notion` at user level, where `<config dir>` is `$CLAUDE_CONFIG_DIR`, else `~/.claude`; written `notion` below; its skill has the commands and the markdown). The checker, `scripts/card_contract.py` of this skill, is `.claude/skills/cdv-notion-ticket/scripts/card_contract.py` in a repository and `<config dir>/skills/cdv-notion-ticket/scripts/card_contract.py` at user level. When `notion auth status` exits `3` there is no token on this machine: write nothing to Notion, leave the text in the chat to paste, and say the developer runs `notion auth login` in a terminal.
 
 ## Operating principles
 

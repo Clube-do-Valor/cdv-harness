@@ -9,7 +9,7 @@ metadata:
 
 # Notion through the API
 
-One client, `scripts/notion` in this skill, does every Notion read and write. It is installed at `.claude/skills/cdv-notion/scripts/notion` in a repository that vendors the harness and at `~/.claude/skills/cdv-notion/scripts/notion` at user level; below, `notion` means that path (call it by the path, it is not on `PATH`). Python standard library only, nothing to install.
+One client, `scripts/notion` in this skill, does every Notion read and write. It is installed at `.claude/skills/cdv-notion/scripts/notion` in a repository that vendors the harness and at `<config dir>/skills/cdv-notion/scripts/notion` at user level (`<config dir>` is `$CLAUDE_CONFIG_DIR`, else `~/.claude`); below, `notion` means that path (call it by the path, it is not on `PATH`). Python standard library only, nothing to install.
 
 Everything is written as the integration that owns the token: Notion shows the integration as the author of every page and edit. Comments carry the name of the person in `me` (see Rules).
 
