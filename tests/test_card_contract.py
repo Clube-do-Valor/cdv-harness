@@ -388,6 +388,27 @@ class TaskRulesTest(CardCase):
         self.set_body(form, "## Prazo\n\nSexta.\n\n" + fechamento() + "\nPR: #12\n")
         self.assertEqual(self.rules(form), [])
 
+    def test_a_pr_line_in_the_request_is_the_words_of_who_asked(self):
+        said = "## Pedido\n\nPRs: veja o #7 do portal.\n\n**PRs:** portal #8\n\n"
+        both = self.add(cf.task(1, said + entrega() + "\n" + fechamento(), status="Code Review", pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(both), [])
+        none = "## Pedido\n\nPRs: os dois do mês passado não resolveram.\n\n"
+        unnamed = self.add(cf.task(2, none + entrega() + "\n" + fechamento(), status="Code Review", pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(unnamed), [])
+        no_code = self.add(cf.task(3, said + entrega(prs=None), status="Done", summary=SUMMARY))
+        self.assertEqual(self.rules(no_code), [])
+        owed = self.add(cf.task(4, said + entrega(prs=None) + "\n" + fechamento(), status="Rollout", pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(owed), ["pr-link"])
+        form_body = "## Prazo\n\nPR: #7 não resolveu.\n\n"
+        asked = self.add(cf.task(5, form_body + fechamento(), status="Done", email="c@example.com", summary=SUMMARY))
+        self.assertEqual(self.rules(asked), [])
+        unanswered = self.add(cf.task(6, form_body + fechamento(), status="Done", email="c@example.com", pr=PR_URL,
+                                      summary=SUMMARY))
+        self.assertEqual(self.rules(unanswered), ["pr-link"])
+        answered = self.add(cf.task(7, form_body + fechamento() + "\nPR: #12\n", status="Done", email="c@example.com",
+                                    pr=PR_URL, summary=SUMMARY))
+        self.assertEqual(self.rules(answered), [])
+
     def test_pr_open_owes_the_property_and_a_summary_of_at_most_200_characters(self):
         empty = self.add(cf.task(1, full_task(), status="Code Review", summary=SUMMARY))
         self.assertIn("pr-property", self.rules(empty))
@@ -422,7 +443,7 @@ class TaskRulesTest(CardCase):
         self.assertEqual(self.rules(closed), [])
         no_closing = self.add(cf.task(4, form_body + "\nPR: #12\n", status="Done", email="c@example.com", pr=PR_URL,
                                       summary=SUMMARY))
-        self.assertEqual(self.rules(no_closing), ["closing"])
+        self.assertEqual(self.rules(no_closing), ["pr-link", "closing"])  # with no closing, every line is the form's own
         with_request = self.add(cf.task(5, REQUEST, email="c@example.com"))
         self.assertEqual(sorted(self.rules(with_request)), ["delivery-zone", "done-when", "objective"])
 

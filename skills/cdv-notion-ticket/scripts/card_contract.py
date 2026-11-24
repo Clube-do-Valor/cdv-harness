@@ -906,14 +906,17 @@ def people_rules(card, found):
 
 
 def pr_line(card):
-    """(names a pull request?, the line) for the card's kind: `**PRs:**` on a task, `PR: #<n>` on a form."""
+    """(names a pull request?, the line) for the card's kind: `**PRs:**` on a task, `PR: #<n>` on a form.
+    A line like it in the words of who asked is theirs, not the card's."""
+    theirs = request_lines(card)
+    lines = [line for index, line in enumerate(card.lines) if index not in theirs]
     if card.kind == "form":
-        for line in card.lines:
+        for line in lines:
             text = plain(line)
             if re.match(r"^PR:\s*\[?#\d+", text):
                 return True, text
         return False, None
-    found = label_line(card.lines, "PRs")
+    found = label_line(lines, "PRs")
     if found is None:
         return False, None
     return bool(re.search(r"#\d+", found[1])), "PRs: " + found[1]

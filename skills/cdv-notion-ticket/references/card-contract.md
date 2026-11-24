@@ -208,7 +208,7 @@ What a task owes grows with its status: not started, archived and a status the m
 owe nothing of the body; in progress owes `## Pedido`, `## Entrega` with `**Objetivo:**` and
 `**Pronto quando:**`, the assignee, the requester and the type; pull request open owes the pull
 request property and the summary, and the `**PRs:**` line (on a form ticket `PR: #<n>`) and the
-property agree from then on; merged, deployed and done owe the summary, and `## Fechamento` when the
+property agree from then on (such a line in the words of who asked is theirs, not the card's); merged, deployed and done owe the summary, and `## Fechamento` when the
 card has a pull request. A form ticket never owes `## Pedido` nor `## Entrega`.
 
 The first check of a card pins its request zone (the text from `## Pedido` to `## Entrega`, or the
