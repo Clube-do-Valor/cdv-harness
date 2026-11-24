@@ -20,7 +20,8 @@ directory ending in `/sub`.
   card-check     the session runs `notion update <key>` through a fake cdv-notion client (the real
                  client over a fake Notion kept in a file, its settings and cache under the probe's
                  own home) on a card outside the contract -> the PostToolUse hook's finding reaches
-                 the model after the call
+                 the model after the call. A session that made no tool call at all is run once more;
+                 a case that still cannot be judged says what the session answered
 
 A case passes when the session's tool call has the probed shape, its tool result is an error that
 carries the hook's own message, and the command's own output is absent. Exit 0 every selected case
@@ -54,6 +55,7 @@ SUBDIR = "sub"
 CASES = HOOKS + [f"{h}-subdir" for h in HOOKS] + ["card-check"]
 PROJECT_DIR = '"$CLAUDE_PROJECT_DIR"/'
 CLIENT = ".claude/skills/cdv-notion/scripts/notion"
+SESSION_SECONDS = 300
 
 
 def git(cwd, *args):
@@ -132,18 +134,29 @@ def fake_card(root, repo):
     return cf.key(1)
 
 
-def judge_card(events):
+def answered(proc, events):
+    """What a session that cannot be judged answered, on one line: its stream's result, its exit code and
+    the last line of its stderr."""
+    result = next((e for e in events if isinstance(e, dict) and e.get("type") == "result"), None)
+    said = "no result in the stream" if result is None else \
+        f"result {result.get('subtype')}, is_error {result.get('is_error')}: {' '.join(str(result.get('result')).split())[:200]}"
+    last = (proc.stderr or "").strip().splitlines()[-1:] or ["empty"]
+    return f"the session answered: {said}; exit code {proc.returncode}; stderr: {last[0][:200]}"
+
+
+def judge_card(proc, events):
     """The card-check finding reached the model after the client's call. The host adds a PostToolUse
     hook's exit-2 stderr beside the tool result, not inside the stream's tool_result block, so the
     proof is the hook's own response (PostToolUse, exit 2, the finding on stderr, from
     --include-hook-events) and the model's reply quoting a `card-check:` line it was shown."""
     mode = next((e.get("permissionMode") for e in events if e.get("type") == "system" and e.get("subtype") == "init"), None)
     if mode != "bypassPermissions":
-        return False, f"the session's permission mode is {mode!r}, not bypassPermissions"
+        return False, f"the session's permission mode is {mode!r}, not bypassPermissions; {answered(proc, events)}"
     calls = {b["id"] for b in blocks_of(events, "tool_use")
              if b.get("name") == "Bash" and CLIENT in str((b.get("input") or {}).get("command", ""))}
     if not calls:
-        return False, f"the session made no call of {CLIENT} (tool calls: {[b.get('name') for b in blocks_of(events, 'tool_use')]})"
+        return False, (f"the session made no call of {CLIENT} (tool calls: {[b.get('name') for b in blocks_of(events, 'tool_use')]}); "
+                       f"{answered(proc, events)}")
     responses = [e for e in events if e.get("type") == "system" and e.get("subtype") == "hook_response"
                  and e.get("hook_event") == "PostToolUse" and "card-check:" in str(e.get("stderr"))]
     if not responses:
@@ -156,18 +169,34 @@ def judge_card(events):
     return True, "the model quoted: " + " ".join(replies.split())[:240]
 
 
+def run_card(run):
+    """The judgement of the card-check session `run` gives, run once more when it made no tool call at all
+    (the API, the network or the model failed, not the hook). A session that made one is judged as it is:
+    one in which the hook gave no finding is never run again."""
+    proc, events = run()
+    if not any(blocks_of(events, "tool_use")):
+        print(f"card-check: the session made no tool call and is run once more - {answered(proc, events)}")
+        proc, events = run()
+    return judge_card(proc, events)
+
+
 def session(claude, repo, prompt, model, *flags):
     """One `claude -p` session in the consumer. It saves no session under the config dir (the probe
     reads the stream and never resumes; auto-memory off, or the CLI still makes the project's memory
     folder there), and loads the consumer's settings only: a hook in the user's own settings (a
-    user-level card-check with the real client and token) cannot fire inside it."""
-    proc = subprocess.run(
-        [claude, "-p", prompt, "--model", model, "--permission-mode", "bypassPermissions",
-         "--output-format", "stream-json", "--verbose", "--max-turns", "4",
-         "--no-session-persistence", "--setting-sources", "project,local", *flags],
-        cwd=str(repo), capture_output=True, text=True, timeout=300, stdin=subprocess.DEVNULL,
-        env=dict(os.environ, CLAUDE_CODE_DISABLE_AUTO_MEMORY="1"),
-    )
+    user-level card-check with the real client and token) cannot fire inside it. One that hangs is
+    stopped and judged by what it had said."""
+    try:
+        proc = subprocess.run(
+            [claude, "-p", prompt, "--model", model, "--permission-mode", "bypassPermissions",
+             "--output-format", "stream-json", "--verbose", "--max-turns", "4",
+             "--no-session-persistence", "--setting-sources", "project,local", *flags],
+            cwd=str(repo), capture_output=True, text=True, timeout=SESSION_SECONDS, stdin=subprocess.DEVNULL,
+            env=dict(os.environ, CLAUDE_CODE_DISABLE_AUTO_MEMORY="1"),
+        )
+    except subprocess.TimeoutExpired as late:  # its output is bytes, or None
+        out, err = ((text or b"").decode(errors="replace") for text in (late.stdout, late.stderr))
+        proc = subprocess.CompletedProcess(late.cmd, f"none, stopped after {SESSION_SECONDS} s", out, err)
     events = []
     for line in proc.stdout.splitlines():
         try:
@@ -230,7 +259,7 @@ def probe(case, claude, repo, model, analysis_cmd, test_cmd):
         prompt = (f"run this exact Bash command once, unchanged, and nothing else: {command}\n"
                   "When it returns, reply with every line starting with 'card-check:' that you were shown after "
                   "the command (by the tool result or by a hook), quoted exactly, or the word NONE.")
-        return judge_card(session(claude, repo, prompt, model, "--include-hook-events")[1])
+        return run_card(lambda: session(claude, repo, prompt, model, "--include-hook-events"))
     hook, subdir = case.removesuffix("-subdir"), case.endswith("-subdir")
     first = (f"First run this exact Bash command, unchanged, as its own call: cd {SUBDIR} && pwd\n"
              "Then, in a separate call, " if subdir else "")
