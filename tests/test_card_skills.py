@@ -264,6 +264,18 @@ class OtherSkillsTest(SentenceCase):
                             r"before the build starts", r"plan approved moment of `cdv-notion-ticket`",
                             r"no card exists", r"ask once whether to create it", where="cdv-kickoff")
 
+    def test_the_plan_approved_moment_runs_in_every_mode_and_on_a_track_with_no_plan(self):
+        kickoff = skill("cdv-kickoff")
+        self.assertSentence(kickoff, r"mode that has no such stop", r"`autonomous`", r"`step-by-step`",
+                            r"plan is approved when the `plan` stage ends", r"same moment runs then", where="cdv-kickoff")
+        self.assertSentence(kickoff, r"track with no plan", r"run that started from a card", r"that moment",
+                            r"when the `build` stage starts", r"`## Entrega` with no `Plano:` line",
+                            where="cdv-kickoff")
+        self.assertSentence(kickoff, r"track with no plan and no card", r"nothing is asked and nothing is written",
+                            where="cdv-kickoff")
+        self.assertSentence(skill("cdv-notion-ticket"), r"`cdv-kickoff`", r"plan approved moment", r"plan is approved",
+                            r"track with no plan", r"`build` stage starts", where="cdv-notion-ticket")
+
     def test_kickoff_flags_a_plan_too_big_for_one_card(self):
         self.assertSentence(skill("cdv-kickoff"), r"more than one delivery that could ship alone",
                             r"more than about a week and a half of work", r"say so at the plan stop",

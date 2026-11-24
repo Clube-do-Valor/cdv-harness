@@ -87,7 +87,7 @@ When several request cards are served by one delivery, keep the card with the lo
 
 ## Composition
 
-- `cdv-kickoff` - runs the plan approved moment when the stop `plan-approval` is answered, and this skill as the `ticket` stage of a run.
+- `cdv-kickoff` - runs the plan approved moment when the plan is approved or, on a track with no plan that started from a card, when the `build` stage starts, and this skill as the `ticket` stage of a run.
 - `cdv-open-pr` - finds or creates the card and calls the pull request open moment.
 - `cdv-rollout` and `cdv-prod` - call the merged or deployed moment and the production-step comment.
 - `cdv-debug` - hands a form ticket's triage and closing here when it fixes a bug.

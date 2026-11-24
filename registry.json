@@ -87,7 +87,7 @@
       "owner": "augusto-henriques",
       "description": "Start a feature or a fix larger than a one-liner with one command - read the request (a card link, a chat thread, a brief) and the repository, propose the run profile through its scripts (track small/medium/big, mode, chain, workspace, roles, optional steps), ask one question screen for medium and big work and none for small, write and validate the run profile, then run the chain (grilling, tlc-spec-lean plan, build and Verifier, review, fixes, browser QA, PR, pipeline, card) with no prompt per stage, stopping only where the profile says. Triggers on \"start this feature\", \"kickoff\", \"/cdv-kickoff\", \"começa essa feature\", \"vamos fazer esse card\", or a hand-off from cdv-debug or cdv-grilling. Do NOT use for a pure root-cause investigation with no build (cdv-debug), an open interview (cdv-grilling), a review of an existing branch (cdv-code-review), or a factory run (cdv-factory-small-feature).",
       "path": "skills/cdv-kickoff",
-      "contentHash": "9e7497689e119e660ddb7b21846847747842ea9c1f5dac30697605a96340a11d"
+      "contentHash": "1a89f48136b4b72c4e25553320ab8bd07c252c594ede15b6b8e9c9d37d305361"
     },
     {
       "name": "cdv-notion",
@@ -111,7 +111,7 @@
       "owner": "augusto-henriques",
       "description": "Own a Notion task card and a helpdesk form ticket from the request to the closing, in the card contract (references/card-contract.md): write the card at each moment of its event - request arrives, plan approved (the delivery zone and the plan as a child page), pull request open (the PRs line, the pull request property, the one-sentence summary), merged or deployed (the closing), validated by who asked - set the status of that moment, triage and close a form ticket, merge request cards that one delivery serves, and hold every write to card_contract.py check. Works through the cdv-notion client, in a repository or at user level. Called by cdv-kickoff, cdv-open-pr, cdv-debug, cdv-rollout and cdv-prod at their events; triggers on \"atualiza o card\", \"fecha o chamado\", \"escreve o card dessa entrega\", \"o que escrevo no ticket\", \"junta esses cards\". Do NOT use for the pull request description (cdv-finalize), a project page (cdv-notion-project), or the investigation report of a bug (cdv-debug keeps it in the chat).",
       "path": "skills/cdv-notion-ticket",
-      "contentHash": "8105d77b777b3f6319dff022ea067b4b3dfb8769d080d4e5d636f9d23984c898"
+      "contentHash": "73bb4929c9a9c8f7f4d0bffd4e2c5135774783ce134d3e9052e5e8ea046d791d"
     },
     {
       "name": "cdv-open-pr",
