@@ -97,6 +97,25 @@ class LintPrTest(unittest.TestCase):
                              "Ticket section holds no key matching ticket_key_pattern")
         self.assertPasses(description(ticket=None))
 
+    def test_the_key_pattern_is_read_as_the_rest_of_the_core_reads_it(self):
+        profile = self.tmp / ".claude" / "harness" / "profile.yaml"
+        pattern = "ABC-[0-9]+"
+        for value in (pattern, f'"{pattern}"', f"'{pattern}'", f"{pattern}  # the cards", f'"{pattern}"  # the "cards"',
+                      f"'{pattern}' # the team's cards", "ABC-[[:digit:]]+", '"ABC-[[:digit:]]{2}"', f"#12|{KEY}"):
+            with self.subTest(value=value):
+                profile.write_text(f"ticket_system: notion  # the tracker\nticket_key_pattern: {value}\n", encoding="utf-8")
+                if not value.startswith("#"):
+                    self.assertPasses(description())
+                    self.assertFailsOnly(description(ticket=f"[Exportar faturas]({NOTION_URL})"),
+                                         "Ticket section holds no key matching ticket_key_pattern")
+                else:  # the whole value is a comment: no pattern, so no key check
+                    self.assertPasses(description(ticket=f"[Exportar faturas]({NOTION_URL})"))
+                self.assertFailsOnly(description(ticket=f"[{KEY} — Exportar faturas](https://example.com/{KEY})"),
+                                     "Ticket section without")
+        profile.write_text('ticket_system: notion\nticket_key_pattern: "ABC #[0-9]+"  # a mark inside the quotes\n', encoding="utf-8")
+        self.assertPasses(description(ticket=f"[ABC #12 — Exportar faturas]({NOTION_URL})"))
+        self.assertFailsOnly(description(), "Ticket section holds no key matching ticket_key_pattern (ABC #[0-9]+)")
+
     def test_each_check_fails_alone(self):
         many_words = FIRST + " " + " ".join(["mais"] * 80) + "."
         cases = {

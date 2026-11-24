@@ -8,11 +8,13 @@
 
 set -uo pipefail
 
+# The value as bin/harness reads it: the text inside the quotes, or up to a ` #` comment.
 profile_value() {
   local key="$1" file value="" found
   for file in .claude/harness/profile.yaml .claude/harness/profile.local.yaml; do
     [ -f "$file" ] || continue
-    found="$(sed -n "s/^${key}: *//p" "$file" | head -n1 | sed -e 's/^["'\'']//' -e 's/["'\'']$//')"
+    found="$(sed -n "s/^${key}: *//p" "$file" | head -n1 | sed -E -e 's/^"(([^"\\]|\\.)*)".*/\1/' -e t \
+      -e "s/^'(([^']|'')*)'.*/\\1/" -e t -e 's/(^|[[:space:]])#.*//' -e 's/[[:space:]]+$//')"
     [ -n "$found" ] && value="$found"
   done
   printf '%s' "$value"
@@ -62,7 +64,7 @@ if grep -q '^## 🏷️ Ticket' "$FILE"; then
   if [ "$TICKET_SYSTEM" = "notion" ]; then ticket_url='https?://[^)]*notion\.(so|com)/'; else ticket_url='https?://[^)]*'; fi
   if printf '%s' "$ticket" | grep -qE "\\[([^]\\\\]|\\\\.)+\\]\\(${ticket_url}"; then say PASS "Ticket section links the ticket"; else say FAIL "Ticket section without a [KEY — name](ticket url) link"; fi
   if [ -n "$TICKET_KEY_PATTERN" ] && [ "$TICKET_KEY_PATTERN" != "none" ]; then
-    if printf '%s' "$ticket" | python3 -c 'import re, sys; sys.exit(0 if re.search(sys.argv[1], sys.stdin.read()) else 1)' "$TICKET_KEY_PATTERN"; then say PASS "Ticket section holds a key matching ticket_key_pattern"; else say FAIL "Ticket section holds no key matching ticket_key_pattern ($TICKET_KEY_PATTERN)"; fi
+    if printf '%s' "$ticket" | grep -qE -- "$TICKET_KEY_PATTERN"; then say PASS "Ticket section holds a key matching ticket_key_pattern"; else say FAIL "Ticket section holds no key matching ticket_key_pattern ($TICKET_KEY_PATTERN)"; fi
   fi
   if [ "$(grep -m1 -n '^## ' <(tac "$FILE") | cut -d: -f2-)" = "## 🏷️ Ticket" ]; then say PASS "Ticket is the last section"; else say FAIL "Ticket must be the last section"; fi
 fi
