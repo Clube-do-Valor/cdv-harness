@@ -145,6 +145,17 @@ class CreateInDoubt(Fail):
         super().__init__(code, f'In doubt: the create of {name} ({cause}): {self.advice}', IN_DOUBT, cause)
 
 
+class Unbuildable(Fail):
+    """A step Notion refused with a 400 that cannot be built from the schema read again: a property or an option it
+    names is unknown. It has that failure's message and exit code; Notion did nothing."""
+
+    def __init__(self, failure):
+        super().__init__(failure.code, failure.message, REFUSED_WRITE)
+
+
+UNBUILT = object()  # on_current_schema's `built` when the step is still to be built
+
+
 class NoSuchKey(Fail):
     """A ticket key that leads to no page: no connected data source has its prefix, or none of them has its number."""
 
@@ -1009,22 +1020,82 @@ class Notion:
         cached = None if refresh else self.cache.get(f'schema-{identifier}')
         if cached is None:
             cached = self.call('GET', f'/v1/data_sources/{identifier}')
-            self.cache.put(f'schema-{identifier}', cached)
-            self._fresh.add(identifier)
+            self.store_schema(identifier, cached)
         self._schemas[identifier] = cached
         return cached
 
+    def store_schema(self, identifier, schema):
+        """Keep a schema the API just gave: for this command, in the cache, and in the cached list of data sources,
+        whose title and key property come from it."""
+        self._schemas[identifier] = schema
+        self._fresh.add(identifier)
+        self.cache.put(f'schema-{identifier}', schema)
+        listed = self.cache.get('data_sources') or []
+        known = listed_entry(identifier, schema)
+        if any(entry.get('id') == identifier and entry != known for entry in listed):
+            self.cache.put('data_sources', [known if entry.get('id') == identifier else entry for entry in listed])
+        if self._sources is not None:
+            self._sources = [known if entry['id'] == identifier else entry for entry in self._sources]
+
+    # -- a cached schema that is out of date ------------------------------------------------
+    # One rule, here and nowhere else: what an unknown property or option stops - the client's own lookup, the
+    # API's 400, a row that does not hold a column - is done once more from the schema read again. The API is read
+    # at most once per command for each data source.
+
     def refresh_schema(self, schema):
-        """Re-read a data source's schema from the API, at most once per command, and bring `schema` (the
-        caller's copy) up to date in place. False when there is nothing to re-read: no id, or already fresh."""
+        """Bring `schema` (the caller's copy, which needs only its id) up to date in place with the schema as the
+        API gave it in this command, read now unless it already was. True when that changed the copy."""
         identifier = schema.get('id')
-        if not identifier or identifier in self._fresh:
+        if not identifier:
             return False
-        fresh = self.data_source(identifier, refresh=True)
-        if fresh is not schema:
-            schema.clear()
-            schema.update(fresh)
+        fresh = self.data_source(identifier, refresh=identifier not in self._fresh)
+        if fresh == schema:
+            return False
+        schema.clear()
+        schema.update(fresh)
         return True
+
+    def look_up(self, schema, find):
+        """The client's own lookup: find(schema) and, when it finds nothing, once more in the schema read again."""
+        found = find(schema)
+        if found is None and self.refresh_schema(schema):
+            found = find(schema)
+        return found
+
+    def on_current_schema(self, schema, build, send, lacks=None, built=UNBUILT):
+        """send(build()), a step built from `schema`, which may come from the cache. When Notion refuses it with a
+        400 (a read changes nothing, and neither does a write answered 400), or lacks(step, result) finds that what
+        came back does not hold a property the step reads, the schema is read again and the step built again; one
+        that comes out different is run once more. A property that is still unknown then fails as any unknown
+        property does, and a refusal that has another cause stands."""
+        if built is UNBUILT:
+            built = build()
+
+        def rebuild():
+            self.refresh_schema(schema)
+            return build()
+
+        try:
+            result = send(built)
+        except ApiError as refused:
+            if refused.status != 400:
+                raise
+            try:
+                again = rebuild()
+            except ApiError:
+                raise refused
+            except Fail as failure:
+                if failure.code != USAGE:
+                    raise refused  # the schema could not be read again
+                raise Unbuildable(failure)
+            if again == built:
+                raise refused
+            return send(again)
+        if lacks and lacks(built, result):
+            again = rebuild()
+            if again != built:
+                return send(again)
+        return result
 
     def refresh_data_sources(self):
         """The list of connected data sources re-read, at most once per command; None when it was already."""
@@ -1053,14 +1124,11 @@ class Notion:
             if source.get('object') != 'data_source':
                 continue
             if source.get('properties'):
-                self.cache.put(f"schema-{source['id']}", source)
-                self._schemas[source['id']] = source
-                self._fresh.add(source['id'])
+                self.store_schema(source['id'], source)
                 schema = source
             else:
                 schema = self.data_source(source['id'], refresh=True)
-            prefix, unique = unique_of(schema['properties'])
-            listed.append({'id': source['id'], 'title': plain(schema.get('title')), 'prefix': prefix, 'unique': unique})
+            listed.append(listed_entry(source['id'], schema))
         self.cache.put('data_sources', listed)
         self._sources = listed
         return listed
@@ -1097,9 +1165,19 @@ class Notion:
         raise NoSuchKey(REFUSED, f'no page with key {prefix}-{number}')
 
     def rows_by_key(self, source, number):
-        return self.call('POST', f"/v1/data_sources/{source['id']}/query",
-                         {'filter': {'property': source['unique'], 'unique_id': {'equals': number}}, 'page_size': 1}
-                         ).get('results', [])
+        schema = {'id': source['id']}  # filled when the key property the cached list names no longer works
+
+        def unique():
+            return unique_of(schema['properties'])[1] if 'properties' in schema else source['unique']
+
+        def ask(name):
+            if name is None:  # the data source has no unique id any more
+                return []
+            return self.call('POST', f"/v1/data_sources/{source['id']}/query",
+                             {'filter': {'property': name, 'unique_id': {'equals': number}}, 'page_size': 1}
+                             ).get('results', [])
+
+        return self.on_current_schema(schema, unique, ask)
 
     def resolve(self, text, want=None):
         """('page', page) or ('data_source', schema) for any reference form."""
@@ -1144,9 +1222,7 @@ class Notion:
             if kind == 'page':
                 return 'page', found
             if kind == 'data_source':
-                self._schemas[identifier] = found
-                self._fresh.add(identifier)
-                self.cache.put(f'schema-{identifier}', found)
+                self.store_schema(identifier, found)
                 return 'data_source', found
             sources = found.get('data_sources') or []
             if len(sources) == 1:
@@ -1333,9 +1409,7 @@ class Notion:
                 left, field = date_key.group(1), date_key.group(2)
             if left.startswith('userDefined:'):
                 left = left[len('userDefined:'):]
-            name = self.property_name(left, page_schema, quiet=True)
-            if name is None and page_schema.get('id'):
-                page_schema = self.data_source(page_schema['id'], refresh=True)  # the cached schema may be stale
+            name = self.look_up(page_schema, lambda schema: self.property_name(left, schema, quiet=True))
             name = name or self.property_name(left, page_schema, quiet=False)
             prop = page_schema['properties'][name]
             kind = prop.get('type')
@@ -1351,16 +1425,17 @@ class Notion:
 
     def option(self, name, prop, value, page_schema):
         kind = prop['type']
-        options = [o['name'] for o in (prop.get(kind) or {}).get('options', [])]
-        for candidate in options:
-            if candidate.casefold() == value.casefold():
-                return candidate
-        if page_schema.get('id'):
-            fresh = self.data_source(page_schema['id'], refresh=True)['properties'].get(name, prop)
-            for candidate in [o['name'] for o in (fresh.get(kind) or {}).get('options', [])]:
-                if candidate.casefold() == value.casefold():
-                    return candidate
-        raise Fail(USAGE, f"unknown option {value!r} for the {kind} property {name}; options: {', '.join(options)}")
+
+        def options(schema):
+            return [o['name'] for o in ((schema['properties'].get(name) or {}).get(kind) or {}).get('options', [])]
+
+        found = self.look_up(page_schema, lambda schema: next(
+            (o for o in options(schema) if o.casefold() == value.casefold()), None))
+        if found is not None:
+            return found
+        self.property_name(name, page_schema, quiet=False)  # the schema read again may not hold the property at all
+        raise Fail(USAGE, f"unknown option {value!r} for the {kind} property {name}; options: "
+                          f"{', '.join(options(page_schema))}")
 
     def typed(self, name, prop, value, page_schema):
         kind = prop.get('type')
@@ -1465,6 +1540,12 @@ def unique_of(properties):
         if prop.get('type') == 'unique_id':
             return (prop.get('unique_id') or {}).get('prefix'), name
     return None, None
+
+
+def listed_entry(identifier, schema):
+    """What the list of connected data sources keeps of one."""
+    prefix, unique = unique_of(schema['properties'])
+    return {'id': identifier, 'title': plain(schema.get('title')), 'prefix': prefix, 'unique': unique}
 
 
 def icon_of(value):
@@ -1885,7 +1966,12 @@ def cmd_update(client, args):
     page = client.page(args.ref)
     files = {flag: read_file(path) for flag, path in (('replace', args.replace_file), ('append', args.append_file),
                                                      ('prepend', args.prepend_file)) if path}
-    properties = client.build_properties(args.set or [], client.schema_for(page), page) if args.set else {}
+    schema = client.schema_for(page) if args.set else None
+
+    def build():
+        return client.build_properties(args.set, schema, page)
+
+    properties = build() if args.set else {}
     held = {}  # the uploaded files of each part of the body
     for flag in files:
         files[flag], held[flag] = hold_files(files[flag], f"--{flag}-file {getattr(args, flag + '_file')}")
@@ -1930,7 +2016,13 @@ def cmd_update(client, args):
             what.append('properties ' + ', '.join(properties))
         if args.icon:
             what.append('icon')
-        steps.append((' and '.join(what), lambda: write_properties(client, page, properties, args.icon), []))
+        def write_them():
+            if not properties:
+                return write_properties(client, page, {}, args.icon)
+            return client.on_current_schema(schema, build, lambda built: write_properties(client, page, built, args.icon),
+                                            built=properties)
+
+        steps.append((' and '.join(what), write_them, []))
     if args.edit:
         matched = [(number, old, new) for number, old, new, state in plan if state == 'matched']
         sent = [edit for edit in matched if edit[1] != edit[2]]  # an edit that only places a file writes no text
@@ -1948,6 +2040,8 @@ def cmd_update(client, args):
         try:
             write()
         except Fail as failure:
+            if isinstance(failure, Unbuildable) and not landed:
+                raise  # said as any unknown property is: nothing was written
             pending = list(dict.fromkeys(file_label(file.name, file.id) for file in placed))
             finish = None
             if placed and (failure.outcome or IN_DOUBT) == IN_DOUBT:
@@ -2121,19 +2215,25 @@ def cmd_create(client, args):
             payload['markdown_version'] = MARKDOWN_VERSION
         if icon:
             payload['icon'] = icon_of(icon) if icon_of(icon) != 'none' else None
-        title = ''
-        for name, value in payload['properties'].items():
-            if page_schema['properties'][name].get('type') == 'title':
-                title = ''.join(part['text']['content'] for part in value['title'])
-        payloads.append((payload, title, files))
+        # read from what is sent, not from the schema: a later page may have made the client read that again
+        title = next((''.join(part['text']['content'] for part in value['title'])
+                      for value in payload['properties'].values() if 'title' in value), '')
+        payloads.append((payload, title, files, assignments))
     refuse_placeholders(held)
     created, seen = [], set()  # urls reported, and the ids of the pages this run created or found
-    for number, (payload, title, files) in enumerate(payloads):
-        rest = [repr(t or '(untitled)') for _, t, _ in payloads[number + 1:]]
+    for number, (payload, title, files, assignments) in enumerate(payloads):
+        rest = [repr(t or '(untitled)') for _, t, *_ in payloads[number + 1:]]
         then = 'Then create only the pages not sent' if rest else ''
         try:
-            page = create_one(client, kind, parent, payload, title, started, seen, where)
+            page = client.on_current_schema(
+                page_schema, lambda: client.build_properties(assignments, page_schema),
+                lambda built: create_one(client, kind, parent, dict(payload, properties=built), title, started, seen, where),
+                built=payload['properties'])
         except Fail as failure:
+            if isinstance(failure, Unbuildable) and not created:  # said as any unknown property is: nothing was made
+                if len(payloads) > 1:
+                    raise Fail(USAGE, f'page {number + 1} of {len(payloads)}: {failure.message}; nothing was made')
+                raise
             finish = None
             if files and (failure.outcome or IN_DOUBT) == IN_DOUBT:
                 finish = ('If it was created: ' + files_left('<its url>', files, [file.id for file in files])
@@ -2191,11 +2291,16 @@ def find_created(client, kind, parent, title, started, doubt, seen=()):
     since = started.strftime('%Y-%m-%dT%H:%M:%S.000Z')
     bot = client.bot().get('id')
     if kind == 'data_source':
-        title_prop = next(n for n, p in parent['properties'].items() if p.get('type') == 'title')
-        candidates = client.call('POST', f"/v1/data_sources/{parent['id']}/query", {
-            'filter': {'and': [{'property': title_prop, 'title': {'equals': title}},
-                               {'timestamp': 'created_time', 'created_time': {'on_or_after': since}}]},
-            'page_size': 100}).get('results', [])
+        def title_property():
+            return next(n for n, p in parent['properties'].items() if p.get('type') == 'title')
+
+        def same_title(title_prop):
+            return client.call('POST', f"/v1/data_sources/{parent['id']}/query", {
+                'filter': {'and': [{'property': title_prop, 'title': {'equals': title}},
+                                   {'timestamp': 'created_time', 'created_time': {'on_or_after': since}}]},
+                'page_size': 100}).get('results', [])
+
+        candidates = client.on_current_schema(parent, title_property, same_title)
     else:
         candidates = [p for p in client.call('POST', '/v1/search', {
             'query': title, 'filter': {'property': 'object', 'value': 'page'}, 'page_size': 100}).get('results', [])
@@ -2429,24 +2534,32 @@ def compile_node(client, node, schema, sources):
 
 
 def where_property(schema, name, client=None):
+    """(name, property) of what --where, --order, --select and --group-by call `name`: a property of that name
+    (any case) first, else the built-in name - a page's own created or last edited time, of type `timestamp`, or the
+    unique id and the title property under `id`/`key` and `title`/`name`."""
+    def find(schema):
+        properties = schema['properties']
+        if name in properties:
+            return name, properties[name]
+        for candidate, prop in properties.items():
+            if candidate.casefold() == name.casefold():
+                return candidate, prop
+        lowered = name.casefold()
+        if lowered in ('created', 'created_time'):
+            return 'created_time', {'type': 'timestamp'}
+        if lowered in ('edited', 'last_edited', 'last_edited_time', 'updated'):
+            return 'last_edited_time', {'type': 'timestamp'}
+        for kind, aliases in (('unique_id', ('id', 'key')), ('title', ('title', 'name'))):
+            if lowered in aliases:
+                for candidate, prop in properties.items():
+                    if prop.get('type') == kind:
+                        return candidate, prop
+        return None
+
+    found = client.look_up(schema, find) if client else find(schema)
+    if found:
+        return found
     properties = schema['properties']
-    if name in properties:
-        return name, properties[name]
-    for candidate, prop in properties.items():
-        if candidate.casefold() == name.casefold():
-            return candidate, prop
-    lowered = name.casefold()
-    if lowered in ('created', 'created_time'):
-        return 'created_time', {'type': 'timestamp'}
-    if lowered in ('edited', 'last_edited', 'last_edited_time', 'updated'):
-        return 'last_edited_time', {'type': 'timestamp'}
-    for kind, aliases in (('unique_id', ('id', 'key')), ('title', ('title', 'name'))):
-        if lowered in aliases:
-            for candidate, prop in properties.items():
-                if prop.get('type') == kind:
-                    return candidate, prop
-    if client is not None and client.refresh_schema(schema):  # the cached schema may be stale: look once more
-        return where_property(schema, name, client)
     close = nearest(name, list(properties))
     hint = f"did you mean {' or '.join(close)}?" if close else f"properties: {', '.join(properties)}"
     raise Fail(USAGE, f'unknown property {name!r} in the condition; {hint}')
@@ -2577,26 +2690,51 @@ def row_values(client, row, columns, facts):
     return values
 
 
-def cmd_query(client, args):
-    kind, schema = client.resolve(args.ref, want='data_source')
-    if kind != 'data_source':
-        raise Fail(USAGE, f'{args.ref} is a page; `notion query` takes a data source')
-    body = {}
+def query_plan(client, args, schema):
+    """What `query` asks of the data source and reads from its rows, from the schema as it stands: the request's
+    body, the table's columns (None: --json without --select, the whole property set), --group-by's column, and
+    which of those names are the page's own facts."""
+    body, columns, facts, group = {}, None, set(), None
     if args.where:
         body['filter'] = compile_where(client, args.where, schema)
     if args.order:
         body['sorts'] = parse_order(schema, args.order, client)
-    columns, facts = None, set()
+
+    def column(wanted):
+        name, prop = where_property(schema, wanted, client)
+        if prop.get('type') == 'timestamp':  # a page's own fact (created, edited), when no property has the name
+            facts.add(name)
+        return name
+
     if args.select:
-        columns = []
-        for wanted in (c.strip().strip('"`') for c in args.select.split(',') if c.strip()):
-            name, prop = where_property(schema, wanted, client)
-            columns.append(name)
-            if prop.get('type') == 'timestamp':  # a page's own fact (created, edited), when no property has the name
-                facts.add(name)
-    group =where_property(schema, args.group_by, client)[0] if args.group_by else None
+        columns = [column(c.strip().strip('"`')) for c in args.select.split(',') if c.strip()]
+    if args.group_by:
+        group = column(args.group_by)
+    if columns is None and not args.json:
+        props = schema['properties']
+        columns = [n for n, p in props.items() if p.get('type') == 'unique_id'][:1]
+        columns += [n for n, p in props.items() if p.get('type') == 'title'][:1]
+        columns += [n for n, p in props.items() if p.get('type') == 'status'][:1]
+    return {'body': body, 'columns': columns, 'facts': facts, 'group': group}
+
+
+def cmd_query(client, args):
+    kind, schema = client.resolve(args.ref, want='data_source')
+    if kind != 'data_source':
+        raise Fail(USAGE, f'{args.ref} is a page; `notion query` takes a data source')
     max_rows = args.max_rows or MAX_ROWS
-    rows, more = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query", body, max_items=max_rows)
+
+    def ask(plan):
+        return plan, client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query", plan['body'], max_items=max_rows)
+
+    def lacks(plan, answer):
+        """Whether a row does not hold a property the output reads: the schema named it, so the schema is old."""
+        read = [] if args.count else [plan['group']] if plan['group'] else plan['columns'] or []
+        _, (rows, _) = answer
+        return any(name not in row.get('properties', {}) for row in rows for name in read if name not in plan['facts'])
+
+    plan, (rows, more) = client.on_current_schema(schema, lambda: query_plan(client, args, schema), ask, lacks)
+    columns, facts, group = plan['columns'], plan['facts'], plan['group']
     stopped = f'stopped paging at {max_rows} rows; more rows match (--max-rows N raises the cap)' if more else ''
     if args.count:
         if args.json:
@@ -2629,11 +2767,6 @@ def cmd_query(client, args):
         client.emit([{'id': r['id'], 'url': r.get('url'), 'key': client.key_of(r) or None,
                       'properties': row_values(client, r, columns, facts)} for r in shown])
     else:
-        if columns is None:
-            props = schema['properties']
-            columns = [n for n, p in props.items() if p.get('type') == 'unique_id'][:1]
-            columns += [n for n, p in props.items() if p.get('type') == 'title'][:1]
-            columns += [n for n, p in props.items() if p.get('type') == 'status'][:1]
         client.say(' | '.join(columns + ['url']))
         for row in shown:
             values = row_values(client, row, columns, facts)
@@ -2669,6 +2802,23 @@ def holding(page, needle, names):
         if prop.get('type') in ('title', 'rich_text') and needle in fold(plain(prop.get(prop['type']))):
             return name
     return None
+
+
+def search_rows(client, schema, words, limit):
+    """(the rows of a data source whose title or a text holds the words, whether it has more, the properties asked)."""
+    def text_properties():
+        return {n: p['type'] for n, p in schema['properties'].items() if p.get('type') in ('title', 'rich_text')}
+
+    def ask(asked):
+        conditions = [{'property': name, kind: {'contains': words}} for name, kind in asked.items()]
+        if not conditions:
+            return [], False, []
+        rows, more = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query",
+                                     {'filter': {'or': conditions} if len(conditions) > 1 else conditions[0]},
+                                     max_items=limit, whole=True)
+        return rows, more, list(asked)
+
+    return client.on_current_schema(schema, text_properties, ask)
 
 
 def cmd_search(client, args):
@@ -2720,14 +2870,7 @@ def cmd_search(client, args):
             searched.add(identifier)
             try:
                 schema = client.data_source(identifier)
-                props = schema['properties']
-                searchable = [n for n, p in props.items() if p.get('type') in ('title', 'rich_text')]
-                conditions = [{'property': n, props[n]['type']: {'contains': words}} for n in searchable]
-                if not conditions:
-                    continue
-                rows, more = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query",
-                                             {'filter': {'or': conditions} if len(conditions) > 1 else conditions[0]},
-                                             max_items=limit, whole=True)
+                rows, more, searchable = search_rows(client, schema, words, limit)
                 capped = capped or more
             except ApiError as failure:
                 # only a data source of the cached list that is gone is skipped; the one named by --in never is
@@ -3133,6 +3276,7 @@ def write_check(client, args):
     kind, schema = client.resolve(args.write_check, want='data_source')
     if kind != 'data_source':
         raise Fail(USAGE, '--write-check takes the data source to write the test card in')
+    client.refresh_schema(schema)  # a check reads the schema the workspace has now
     props = schema['properties']
     title_prop = next(n for n, p in props.items() if p.get('type') == 'title')
     started = NOW()

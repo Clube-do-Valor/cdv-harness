@@ -336,6 +336,9 @@ class FakeNotion:
         if match and m == "POST":
             if match.group(1) not in self.data_sources:
                 return error(404, "object_not_found", "Could not find data source.")
+            unknown = self.unknown_property(match.group(1), r.json or {})
+            if unknown:
+                return error(400, "validation_error", f"Could not find property with name or id: {unknown}")
             return 200, self.query(match.group(1), r.json or {})
         match = re.fullmatch(r"/v1/databases/([^/]+)", p)
         if match and m == "GET":
@@ -407,6 +410,33 @@ class FakeNotion:
         chunk = rows[start:start + size]
         more = start + size < len(rows)
         return {"object": "list", "results": chunk, "has_more": more, "next_cursor": str(start + size) if more else None}
+
+    def unknown_property(self, ds, body):
+        """The first name a filter or a sort gives that no property of the data source has, as name or id."""
+        schema = self.data_sources[ds]["properties"]
+        known = set(schema) | {p.get("id") for p in schema.values()}
+        queue = [body.get("filter") or {}] + list(body.get("sorts") or [])
+        while queue:
+            node = queue.pop(0)
+            queue += node.get("and", []) + node.get("or", [])
+            if "property" in node and node["property"] not in known:
+                return node["property"]
+        return None
+
+    @staticmethod
+    def refused_values(schema, written):
+        """The 400 a page write gets for a property that does not exist, a value of another type or a status that is
+        not one of the options."""
+        for name, value in written.items():
+            if name not in schema:
+                return error(400, "validation_error", f"{name} is not a property that exists.")
+            kind = schema[name]["type"]
+            if kind not in value:
+                return error(400, "validation_error", f"{name} is expected to be {kind}.")
+            if kind == "status" and value[kind] and "status" in schema[name]:
+                if value[kind]["name"] not in [o["name"] for o in schema[name]["status"]["options"]]:
+                    return error(400, "validation_error", f"Invalid status option for {name}.")
+        return None
 
     def matches(self, page, condition):
         """Only what key lookups and duplicate checks need; any other condition matches every row."""
@@ -626,6 +656,9 @@ class FakeNotion:
         if not page:
             return error(404, "object_not_found", f"Could not find page with ID: {identifier}.")
         schema = self.schema_of(page)
+        refused = self.refused_values(schema, body.get("properties") or {})
+        if refused:
+            return refused
         for name, written in (body.get("properties") or {}).items():
             kind = schema[name]["type"]
             value = page["properties"].setdefault(name, {"id": schema[name]["id"], "type": kind})
@@ -644,8 +677,12 @@ class FakeNotion:
         if "data_source_id" in parent:
             ds = parent["data_source_id"]
             schema = self.data_sources[ds]["properties"]
+            refused = self.refused_values(schema, body.get("properties") or {})
+            if refused:
+                return refused
             page = task_page(identifier, self.next_number, "", status=None, created_time=self.now)
             page["parent"] = {"type": "data_source_id", "data_source_id": ds, "database_id": DB_TASKS}
+            page["properties"] = {name: value for name, value in page["properties"].items() if name in schema}
             self.next_number += 1
             for name, written in (body.get("properties") or {}).items():
                 kind = schema[name]["type"]
@@ -3821,6 +3858,250 @@ class StaleCacheTest(ClientTestCase):
 
     def list_reads(self):
         return [c for c in self.fake.sent("POST", r"/v1/search") if (c.json or {}).get("filter", {}).get("value") == "data_source"]
+
+    # -- the one rule, over every step built from a cached schema --------------------------
+
+    def cached_before(self, change):
+        """A new workspace, its data source list and schemas cached, then changed behind the client's back."""
+        shutil.rmtree(self.home / ".cache", ignore_errors=True)
+        self.fake = FakeNotion()
+        self.page = self.fake.add_page(task_page(PAGE, 120, "Export invoices", done_at="2026-11-22"), "## Context\n")
+        self.fake.add_page(task_page(uid(0x121), 121, "Close the month", notes="Check every invoice twice"))
+        self.fake.add_page(child_page(PROJECT, "Billing revamp", WIKI))
+        billing = child_page(uid(0x9005), "Billing", WIKI)
+        billing["parent"] = {"type": "data_source_id", "data_source_id": DS_PROJECTS}
+        billing["properties"] = {"Project name": {"id": "title", "type": "title", "title": text("Billing")},
+                                 "Project ID": {"id": "pid", "type": "unique_id", "unique_id": {"prefix": "PRJ", "number": 5}}}
+        self.fake.add_page(billing)
+        self.statuses = []
+
+        def transport(*call):
+            answer = self.fake(*call)
+            self.statuses.append(answer[0])
+            return answer
+
+        self.n.TRANSPORT = transport
+        code, out, err = self.run_cli("fetch", key(120))
+        self.assertEqual(code, 0, err)
+        change()
+        self.fake.calls.clear()
+        self.statuses.clear()
+
+    def rename(self, old, new, ds=DS_TASKS):
+        def change():
+            source = self.fake.data_sources[ds]
+            self.fake.data_sources[ds] = dict(source, properties={
+                (new if name == old else name): (dict(prop, name=new) if name == old else prop)
+                for name, prop in source["properties"].items()})
+            for page in self.fake.pages.values():
+                if page["parent"].get("data_source_id") == ds:
+                    page["properties"] = {(new if n == old else n): value for n, value in page["properties"].items()}
+        return change
+
+    def delete(self, name):
+        def change():
+            del self.fake.data_sources[DS_TASKS]["properties"][name]
+            for page in self.fake.pages.values():
+                page["properties"].pop(name, None)
+        return change
+
+    def add_priority(self):
+        self.fake.data_sources[DS_TASKS]["properties"]["Priority"] = {
+            "id": "pri", "name": "Priority", "type": "select", "select": {"options": [option("High", 1)]}}
+
+    def rename_option(self, old, new):
+        def change():
+            for entry in self.fake.data_sources[DS_TASKS]["properties"]["Status"]["status"]["options"]:
+                entry["name"] = new if entry["name"] == old else entry["name"]
+        return change
+
+    def made(self):
+        return [p for p in self.fake.pages.values() if p["id"].startswith("000050")]
+
+    def body_file(self, content, name="body.md"):
+        path = self.tmp / name
+        path.write_text(content)
+        return str(path)
+
+    def pages_file(self, *properties):
+        return self.body_file(json.dumps([{"properties": p} for p in properties]), "pages.json")
+
+    def test_a_step_built_from_a_renamed_or_deleted_property_is_built_again_from_the_schema_read_again(self):
+        """The user did not name the old property: every step answers as it would with no cache, reads the schema
+        once, and leaves a cache the next command does not trip on."""
+        coll = COLLECTION + DS_TASKS
+        sites = [
+            ("search, a text property renamed", self.rename("Notes", "Remarks"), ("search", "invoice"), "matched: Remarks"),
+            ("search, a text property deleted", self.delete("Notes"), ("search", "invoice"), "Export invoices | https"),
+            ("search --in, renamed", self.rename("Notes", "Remarks"), ("search", "invoice", "--in", coll), "matched: Remarks"),
+            ("fetch by key, the unique id renamed", self.rename("Task ID", "Ticket"), ("fetch", key(120)), "key: " + key(120)),
+            ("search by key, the unique id renamed", self.rename("Task ID", "Ticket"), ("search", key(121)), "matched: key"),
+            ("update, a relation by key", self.rename("Project ID", "Number", DS_PROJECTS),
+             ("update", PAGE, "--set", "Project=" + "PRJ" + "-5"), page_url(uid(0x9005))),
+            ("query --where id", self.rename("Task ID", "Ticket"), ("query", coll, "--where", "id = 120"), key(120)),
+            ("query, the default columns", self.rename("Task name", "Name"), ("query", coll),
+             "Task ID | Name | Status | url\n" + key(120) + " | Export invoices | Done"),
+            ("query --select title", self.rename("Task name", "Name"), ("query", coll, "--select", "title"),
+             "Name | url\nExport invoices |"),
+            ("query --group-by title", self.rename("Task name", "Name"), ("query", coll, "--group-by", "title"),
+             "Export invoices 1"),
+            ("query --where title", self.rename("Task name", "Name"), ("query", coll, "--where", "title contains 'x'"),
+             "Export invoices"),
+            ("query --order title", self.rename("Task name", "Name"), ("query", coll, "--order", "title desc"),
+             "Export invoices"),
+            ("update --set title", self.rename("Task name", "Name"), ("update", PAGE, "--set", "title=Export bills"),
+             '"Name": "Export bills"'),
+            ("create --set title", self.rename("Task name", "Name"), ("create", "--parent", coll, "--set", "title=A card"),
+             "created https://www.notion.so/A-card-"),
+        ]
+        for name, change, command, said in sites:
+            with self.subTest(name):
+                self.cached_before(change)
+                code, out, err = self.run_cli(*command)
+                self.assertEqual(code, 0, out + err)
+                self.assertIn(said, out)
+                self.assertEqual(err, "")
+                self.assertLessEqual(self.statuses.count(400), 1)
+                self.assertLessEqual(len(self.fake.sent("GET", r"/v1/data_sources/[^/]+")), 2)
+                if command[0] == "create":
+                    self.assertEqual(len(self.made()), 1)
+                    continue
+                self.fake.calls.clear()
+                self.statuses.clear()
+                code, again, err = self.run_cli(*command)  # the cache was brought up to date: nothing is refused
+                self.assertEqual(code, 0, again + err)
+                self.assertNotIn(400, self.statuses)
+
+    def test_a_property_or_option_still_unknown_after_the_fresh_read_is_refused_as_any_unknown_one(self):
+        """The user named what the schema no longer has: exit 2, the message an unknown name gets, nothing written."""
+        coll = COLLECTION + DS_TASKS
+        renamed = self.rename("Notes", "Notes log")
+        asked = "unknown property 'Notes' in the condition; did you mean Notes log?"
+        written = "no property 'Notes' here; did you mean Notes log?"
+        lacks = ("query", coll, "--select", "Task name,Notes")
+        sites = [
+            ("query --where", renamed, ("query", coll, "--where", "Notes contains 'x'"), asked),
+            ("query --order", renamed, ("query", coll, "--order", "Notes desc"), asked),
+            ("query --select", renamed, lacks, asked),
+            ("query --select --json", renamed, lacks + ("--json",), asked),
+            ("query --group-by", renamed, ("query", coll, "--group-by", "Notes"), asked),
+            ("query --where and --select", renamed, ("query", coll, "--where", "Notes contains 'x'", "--select", "Tags"), asked),
+            ("update --set", renamed, ("update", PAGE, "--set", "Notes=x"), written),
+            ("update --set and a body", renamed, ("update", PAGE, "--set", "Notes=x", "--append-file", self.body_file("More")),
+             written),
+            ("update --set a date", self.rename("Done at", "Done on"), ("update", PAGE, "--set", "date:Done at:start=2026-11-23"),
+             "no property 'Done at' here; did you mean Done on"),
+            ("create under a collection", renamed, ("create", "--parent", coll, "--set", "title=A", "--set", "Notes=x"), written),
+            ("create under a title", renamed, ("create", "--parent", "Tasks", "--set", "title=A", "--set", "Notes=x"), written),
+            ("create --pages-file, its first page", renamed,
+             ("create", "--parent", coll, "--pages-file", self.pages_file({"title": "A", "Notes": "x"}, {"title": "B"})),
+             "page 1 of 2: " + written),
+            ("update --set an option that is gone", self.rename_option("Done", "Shipped"),
+             ("update", PAGE, "--set", "Status=Done"),
+             "unknown option 'Done' for the status property Status; options: Not started, In progress, Rollout, Shipped"),
+            ("create --set an option that is gone", self.rename_option("Done", "Shipped"),
+             ("create", "--parent", coll, "--set", "title=A", "--set", "Status=Done"),
+             "unknown option 'Done' for the status property Status"),
+        ]
+        for name, change, command, said in sites:
+            with self.subTest(name):
+                self.cached_before(change)
+                before = json.dumps(self.fake.pages)
+                code, out, err = self.run_cli(*command)
+                self.assertEqual((code, out), (2, ""), out + err)
+                self.assertIn(said, err)
+                self.assertNotIn("KeyError", err)
+                self.assertNotIn("In doubt", err)
+                self.assertEqual(json.dumps(self.fake.pages), before)  # nothing was written
+                self.assertLessEqual(len(self.writes()), 1)  # the one Notion refused, never sent again
+                self.assertEqual(len(self.schema_reads()), 1)
+        with self.subTest("create --pages-file, after a page landed"):
+            self.cached_before(renamed)
+            pages = self.pages_file({"title": "A"}, {"title": "B", "Notes": "x"}, {"title": "C"})
+            code, out, err = self.run_cli("create", "--parent", coll, "--pages-file", pages)
+            self.assertEqual(code, 4, out + err)
+            self.assertEqual(len(self.made()), 1)
+            for said in ("created 1 of 3", written, "Not created: 'B'", "Notion refused it", "not sent: 'C'"):
+                self.assertIn(said, err)
+
+    def test_a_property_or_option_added_after_the_cache_is_written_at_once(self):
+        coll = COLLECTION + DS_TASKS
+        parents = {"a title": "Tasks", "the collection form": coll, "a bare id": DS_TASKS, "a database id": DB_TASKS}
+        for name, parent in parents.items():
+            with self.subTest(create_under=name):
+                self.cached_before(self.add_priority)
+                code, out, err = self.run_cli("create", "--parent", parent, "--set", "title=A card", "--set", "Priority=High")
+                self.assertEqual(code, 0, out + err)
+                self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+                self.assertEqual(self.made()[0]["properties"]["Priority"]["select"]["name"], "High")
+                self.assertEqual(self.made()[0]["properties"]["Task name"]["title"][0]["plain_text"], "A card")
+        for place in (0, 1, 2):  # whichever page of the file first names it
+            with self.subTest("create --pages-file", page=place + 1):
+                self.cached_before(self.add_priority)
+                pages = [{"title": f"Card {i}"} for i in range(3)]
+                pages[place]["Priority"] = "High"
+                code, out, err = self.run_cli("create", "--parent", coll, "--pages-file", self.pages_file(*pages))
+                self.assertEqual(code, 0, out + err)
+                self.assertEqual([self.fake.title_of(p) for p in self.made()], ["Card 0", "Card 1", "Card 2"])
+        with self.subTest("update"):
+            self.cached_before(self.add_priority)
+            code, out, err = self.run_cli("update", PAGE, "--set", "Priority=High")
+            self.assertEqual(code, 0, out + err)
+            self.assertIn('"Priority": "High"', out)
+        with self.subTest("an added option"):
+            self.cached_before(self.rename_option("Done", "Shipped"))
+            code, out, err = self.run_cli("update", PAGE, "--set", "Status=Shipped")
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(len(self.schema_reads()), 1)
+
+    def test_a_later_page_of_a_file_is_built_again_after_the_schema_was_read_for_an_earlier_one(self):
+        """The title is renamed and a property added: page 2 makes the client read the schema, page 1 was built before."""
+        def change():
+            self.rename("Task name", "Name")()
+            self.add_priority()
+
+        self.cached_before(change)
+        pages = self.pages_file({"title": "One"}, {"title": "Two", "Priority": "High"})
+        code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--pages-file", pages)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([self.fake.title_of(p) for p in self.made()], ["One", "Two"])
+
+    def test_a_refusal_that_a_fresh_schema_does_not_explain_stands(self):
+        refusal = lambda r: error(400, "validation_error", "The body is too long.")
+        broken = lambda r: error(500, "internal_server_error", "Broken.")
+        sites = [
+            ("update", ("PATCH", r"/v1/pages/[^/]+"), ("update", PAGE, "--set", "Notes=x")),
+            ("create", ("POST", r"/v1/pages"), ("create", "--parent", COLLECTION + DS_TASKS, "--set", "title=A")),
+            ("query", ("POST", r"/v1/data_sources/[^/]+/query"), ("query", COLLECTION + DS_TASKS, "--where", "Notes = 'x'")),
+            ("search", ("POST", r"/v1/data_sources/[^/]+/query"), ("search", "invoice")),
+        ]
+        for name, endpoint, command in sites:
+            for reread in ("the schema reads the same", "the schema cannot be read again"):
+                with self.subTest(site=name, reread=reread):
+                    self.cached_before(lambda: None)
+                    self.fake.on(*endpoint, refusal)
+                    if reread == "the schema cannot be read again":
+                        self.fake.on("GET", r"/v1/data_sources/[^/]+", broken)
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual(code, 2, out + err)
+                    self.assertIn("The body is too long.", err)
+                    self.assertEqual(self.statuses.count(400), 1)
+
+    def test_the_duplicate_search_and_the_write_check_read_a_renamed_title_again(self):
+        with self.subTest("the search after a create in doubt"):
+            self.cached_before(self.rename("Task name", "Name"))
+            self.fake.on("POST", r"/v1/pages", lambda r: error(503, "service_unavailable", "Down."))
+            code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--set", "Notes=x", "--set", "title=A")
+            self.assertEqual(code, 1, out + err)
+            self.assertIn("In doubt", err)
+            self.assertNotIn("could not be looked for", err)
+        with self.subTest("doctor --write-check"):
+            self.cached_before(self.rename("Task name", "Name"))
+            self.fake.on("POST", r"/v1/search", lambda r: (200, {"object": "list", "results": [], "has_more": False,
+                                                                 "next_cursor": None}))
+            code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS, "--marker", "TEST MARK")
+            self.assertIn("write check create: ok", out, err)
+            self.assertNotIn(400, self.statuses)
 
     def test_query_rereads_the_schema_once_for_a_name_the_cache_lacks(self):
         flags = {"--where": "Priority = 'High'", "--select": "Task name,Priority", "--order": "Priority desc",
