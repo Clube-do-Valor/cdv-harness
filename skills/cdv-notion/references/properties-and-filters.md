@@ -80,6 +80,7 @@ Assignee has me
 
 - `Prop in (a, b, c)` becomes an `or` group of one single-value condition per value (`equals` for select, status, number, unique id, text and dates; `contains` for multi-select, person and relation), because those conditions take one value. On a type with no single-value equality (formula, rollup, files) it exits `2`.
 - The API nests groups two levels deep at most: `(A OR B) AND C` works, a group inside a group inside a group exits `2` naming the group. An `in (...)` counts as a group: `(A AND Status in ('Done', 'Rollout')) OR C` is three levels deep.
+- A date with no time is the whole day **in UTC**, for created and edited times and for date properties: `created = 2026-11-03` is from 00:00 to 24:00 UTC, so a card made at 22:00 on the 2nd in UTC-3 counts on the 3rd. `>` starts after the end of that day, `<=` includes all of it, and a date-time with no offset is UTC too. For a local day write the instants: `created >= 2026-11-03T00:00:00-03:00 AND created < 2026-11-04T00:00:00-03:00`. A date property that holds only a date counts as 00:00 UTC of that date, so an instant with an offset can leave that day's date-only rows out.
 - An unknown property, an operator the type does not have, or a value of the wrong type exits `2` naming the part; nothing is sent.
 - A status value that is not an option but is a status group name matches the whole group (Notion's rule).
 - Formula and rollup properties are not filtered by the condition: use `notion api POST /v1/data_sources/<id>/query --data '<filter json>'`.

@@ -30,6 +30,9 @@ Properties use the short format: --set 'Status=Done', --set 'date:Due:start=2026
 user://<uuid>, a name, an e-mail or `me`, relations as page references, checkbox __YES__/__NO__, lists
 as `a,b` or a JSON array. Bodies are Notion-flavored Markdown (markdown_version v2).
 
+A date with no time in --where (created >= 2026-11-01) is the whole day in UTC; write the instant with its
+offset (created >= 2026-11-01T00:00:00-03:00) for a local day.
+
 Exit codes: 0 done; 1 Notion refused or could not be reached; 2 the command is wrong; 3 no usable
 token; 4 done in part.
 

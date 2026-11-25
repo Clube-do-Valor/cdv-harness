@@ -1797,6 +1797,16 @@ class QueryTest(ClientTestCase):
                 self.assertEqual(code, 0, err)
                 self.assertEqual(self.last_filter(), expected)
 
+    def test_where_sends_a_date_as_it_was_written(self):
+        """Notion reads a date-only value as a UTC day and an instant by its offset: neither is changed on the way."""
+        for value in ("2026-11-03", "2026-11-03T00:00:00-03:00", "2026-11-03T00:00:00Z", "one_week_ago"):
+            with self.subTest(value=value):
+                code, out, err = self.run_cli("query", "Tasks", "--where", f"created >= {value} AND \"Done at\" < {value}")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.last_filter(), {"and": [
+                    {"timestamp": "created_time", "created_time": {"on_or_after": value}},
+                    {"property": "Done at", "date": {"before": value}}]})
+
     def test_query_sends_the_compiled_filter(self):
         code, out, err = self.run_cli("query", "Tasks", "--where",
                                       "Status = 'Done' AND Tags has 'Helpdesk' AND created >= 2026-11-01")
@@ -2870,6 +2880,12 @@ class SkillTextTest(unittest.TestCase):
             with self.subTest(topic=topic):
                 self.assertIn(topic, api_limits)
         self.assertIn("instead", api_limits)
+
+    def test_a_date_without_a_time_is_said_to_be_a_utc_day(self):
+        properties = (SKILL_DIR / "references" / "properties-and-filters.md").read_text(encoding="utf-8")
+        self.assertRegex(properties, r"A date with no time is the whole day \*\*in UTC\*\*")
+        self.assertRegex(properties, r"created >= 2026-11-03T00:00:00-03:00 AND created < 2026-11-04T00:00:00-03:00")
+        self.assertRegex(" ".join(load_client().__doc__.split()), r"date with no time in --where .* is the whole day in UTC")
 
     def test_changelog_and_catalog_list_cdv_notion(self):
         changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
