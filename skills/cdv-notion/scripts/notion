@@ -2658,6 +2658,19 @@ def cmd_query(client, args):
 # ---------------------------------------------------------------------------------------------
 
 
+SIMILAR = 'similar title'  # the API's title search also returns titles that only resemble the words
+
+
+def holding(page, needle, names):
+    """The first of the page's properties `names` that is a title or a text holding `needle` (folded), else None.
+    The text is read plain, as the filter matches it: a link's address is not a match and never splits one."""
+    for name in names:
+        prop = page.get('properties', {}).get(name) or {}
+        if prop.get('type') in ('title', 'rich_text') and needle in fold(plain(prop.get(prop['type']))):
+            return name
+    return None
+
+
 def cmd_search(client, args):
     words = ' '.join(args.words).strip()
     if not words:
@@ -2668,7 +2681,8 @@ def cmd_search(client, args):
     hits, capped = {}, False
 
     def add(page, matched):
-        if page['id'] not in hits and not page.get('in_trash'):
+        kept = hits.get(page['id'])  # a real match replaces a likeness, whichever came first
+        if (kept is None or kept[1] == SIMILAR != matched) and not page.get('in_trash'):
             hits[page['id']] = (page, matched)
 
     ref = parse_ref(words)
@@ -2695,8 +2709,9 @@ def cmd_search(client, args):
                                           max_items=limit, whole=True)
             capped = capped or more
             for page in found:
-                if page.get('object') == 'page':  # the API also returns titles that only resemble the words
-                    add(page, 'title' if fold(words) in fold(client.title_of(page)) else 'similar title')
+                if page.get('object') == 'page':  # a title that only resembles the words may still hold them in a text
+                    add(page, 'title' if fold(words) in fold(client.title_of(page))
+                        else holding(page, fold(words), page.get('properties', {})) or SIMILAR)
             queue = [s['id'] for s in client.data_sources()]
         needle = fold(words)
         searched = set()
@@ -2722,14 +2737,12 @@ def cmd_search(client, args):
                 queue = [s['id'] for s in client.data_sources() if s['id'] not in searched]
                 continue
             for row in rows:
-                # plain text, as the filter matched it: a link's address is not a match and never splits one
-                values = {n: plain(v.get(v.get('type'))) for n, v in row.get('properties', {}).items() if n in searchable}
-                matched = next((n for n in searchable if needle in fold(values.get(n))), None)
+                matched = holding(row, needle, searchable)
                 if matched:
                     add(row, matched)
     if not hits:
         client.say(f'no hit for {words!r}')
-    for page, matched in list(hits.values())[:limit]:
+    for page, matched in sorted(hits.values(), key=lambda hit: hit[1] == SIMILAR)[:limit]:  # likenesses last
         parent = page.get('parent', {})
         if parent.get('type') == 'data_source_id':
             where = client.data_source_title(parent['data_source_id'])

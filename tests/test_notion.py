@@ -2438,6 +2438,51 @@ class SearchTest(ClientTestCase):
         self.assertTrue(by_url[self.wiki["url"]].endswith("matched: title"))
         self.assertTrue(by_url[self.noted["url"]].endswith("matched: similar title"))
 
+    def test_a_hit_that_holds_the_words_in_a_text_is_never_called_a_similar_title(self):
+        """Wherever the page comes from - the title search, the rows of a data source, both, a key - the label
+        says what holds the words, and a mere likeness is printed after every real match."""
+        likeness = self.fake.add_page(child_page(uid(0x7003), "Invoyce notes", WIKI))
+        stale = dict(self.noted, properties=dict(self.noted["properties"], Notes={"id": "nt", "type": "rich_text",
+                                                                                  "rich_text": []}))
+        outside = task_page(uid(0x123), 123, "Shared elsewhere", notes="The invoice of March")
+        outside["parent"] = {"type": "page_id", "page_id": WIKI}
+
+        def answers(titles, rows):
+            self.fake.overrides.clear()
+            self.fake.on("POST", r"/v1/search", lambda r: (200, {"object": "list", "results": titles, "has_more": False,
+                                                                 "next_cursor": None}) if (r.json or {}).get("query") else None)
+            self.fake.on("POST", r"/v1/data_sources/([^/]+)/query", lambda r: (200, {
+                "object": "list", "results": rows if r.path.split("/")[3] == DS_TASKS else [], "has_more": False,
+                "next_cursor": None}) if "unique_id" not in json.dumps(r.json) else None)
+
+        table = [
+            ("the title search and the rows return it", [likeness, self.noted], [self.noted], self.noted, "Notes"),
+            ("no row query returns it", [likeness, self.noted], [], self.noted, "Notes"),
+            ("the title search holds an older copy of it", [likeness, stale], [self.noted], self.noted, "Notes"),
+            ("it is in no connected data source", [likeness, outside], [], outside, "Notes"),
+        ]
+        for name, titles, rows, page, label in table:
+            with self.subTest(name):
+                answers(titles, rows)
+                code, out, err = self.run_cli("search", "invoice")
+                self.assertEqual(code, 0, err)
+                hits = self.hits(out)
+                self.assertTrue(hits[0].endswith(f"matched: {label}") and page["url"] in hits[0], out)
+                self.assertTrue(hits[-1].endswith("matched: similar title") and likeness["url"] in hits[-1], out)
+                self.assertEqual(len(hits), 2, out)
+                code, out, err = self.run_cli("search", "invoice", "--limit", "1")  # the real match takes the place
+                self.assertIn(page["url"], self.hits(out)[0])
+                self.assertIn("1 more hits", out)
+        with self.subTest("a likeness comes after the matches of a later data source"):
+            answers([likeness], [self.page, self.noted])
+            code, out, err = self.run_cli("search", "invoice")
+            self.assertEqual([line.rsplit("matched: ", 1)[1] for line in self.hits(out)],
+                             ["Task name", "Notes", "similar title"], out)
+        with self.subTest("a hit by key keeps its label"):
+            answers([self.noted], [self.noted])
+            code, out, err = self.run_cli("search", key(121))
+            self.assertTrue(self.hits(out)[0].endswith("matched: key"), out)
+
     def test_search_says_at_least_when_a_source_was_cut_short(self):
         def tasks_answer(rows, more=False):
             def answer(r):
