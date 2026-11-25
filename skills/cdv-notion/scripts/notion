@@ -1646,6 +1646,11 @@ def cmd_create(client, args):
                                 where=where)
         seen.add(page.get('id'))
         created.append(page.get('url') or page.get('id', ''))
+        heading = dropped_heading(payload.get('markdown')) if title else ''
+        if heading:
+            client.warn(f'warning: Notion takes the only `#` heading of a body for a title when it is the first line, so '
+                        f'{heading!r} was left out of {created[-1]}: start a body at `##`, or add the heading with '
+                        '`notion update <page> --prepend-file F`')
         if uploads:
             try:
                 place_uploads(client, page['id'], uploads)
@@ -1670,6 +1675,23 @@ def create_one(client, kind, parent, payload, title, started, seen=(), where='')
                 'integration made since the minute the command started; check it is the new page)')
     client.say(f"created {page.get('url')} {client.key_of(page)}".rstrip() + note)
     return page
+
+
+def dropped_heading(markdown):
+    """The heading a create leaves out, '' when none: the API takes a body's `#` heading for a title, and drops
+    it, when it is the only one and the first line, even if the title was given."""
+    fence, lines = '', []
+    for line in (markdown or '').split('\n'):
+        ticks = re.match(r'\s*(`{3,})', line)
+        if fence:
+            fence = '' if ticks and len(ticks.group(1)) >= len(fence) else fence
+        elif ticks:
+            fence = ticks.group(1)
+            lines.append(line)
+        elif line.strip():
+            lines.append(line)
+    headings = [line for line in lines if re.match(r' {0,3}#\s+\S', line)]
+    return headings[0].strip() if len(headings) == 1 and lines[0] == headings[0] else ''
 
 
 def find_created(client, kind, parent, title, started, doubt, seen=()):

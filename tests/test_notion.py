@@ -1071,6 +1071,25 @@ class CreateTest(ClientTestCase):
         self.assertEqual(sent["properties"], {"title": {"title": [{"text": {"content": "Approved plan"}}]}})
         self.assertIn("created ", out)
 
+    def test_create_says_which_heading_notion_left_out(self):
+        """The API drops a body's only level-1 heading when it is the first line, title given or not."""
+        cases = [("# Only\n\nText.\n", "'# Only'"), ("\n# Only\n## Sub\n\n```\n# code\n```\n", "'# Only'"),
+                 ("# One\n\nText.\n\n# Two\n", None), ("Intro.\n\n# Mid\n", None), ("## Sub\n\nText.\n", None),
+                 ("```\n# code\n```\n", None), ("#tag text\n", None), ("", None)]
+        body = self.tmp / "body.md"
+        for markdown, heading in cases:
+            with self.subTest(markdown=markdown):
+                body.write_text(markdown)
+                code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=A card", "--body-file", body)
+                self.assertEqual(code, 0, err)
+                url = re.search(r"created (\S+)", out).group(1)
+                if heading:
+                    self.assertEqual(len(err.splitlines()), 1)
+                    self.assertIn(f"{heading} was left out of {url}", err)
+                    self.assertIn("--prepend-file", err)
+                else:
+                    self.assertEqual(err, "")
+
     def test_create_pages_file_three_pages(self):
         pages = self.tmp / "pages.json"
         pages.write_text(json.dumps([
