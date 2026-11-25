@@ -1072,7 +1072,7 @@ class CreateTest(ClientTestCase):
         self.assertIn("created ", out)
 
     def test_create_says_which_heading_notion_left_out(self):
-        """The API drops a body's only level-1 heading when it is the first line, title given or not."""
+        # The API drops a body's only level-1 heading when it is the first line, title given or not.
         cases = [("# Only\n\nText.\n", "'# Only'"), ("\n# Only\n## Sub\n\n```\n# code\n```\n", "'# Only'"),
                  ("# One\n\nText.\n\n# Two\n", None), ("Intro.\n\n# Mid\n", None), ("## Sub\n\nText.\n", None),
                  ("```\n# code\n```\n", None), ("#tag text\n", None), ("", None)]
@@ -1798,7 +1798,7 @@ class QueryTest(ClientTestCase):
                 self.assertEqual(self.last_filter(), expected)
 
     def test_where_sends_a_date_as_it_was_written(self):
-        """Notion reads a date-only value as a UTC day and an instant by its offset: neither is changed on the way."""
+        # Notion reads a date-only value as a UTC day and an instant by its offset: neither is changed on the way.
         for value in ("2026-11-03", "2026-11-03T00:00:00-03:00", "2026-11-03T00:00:00Z", "one_week_ago"):
             with self.subTest(value=value):
                 code, out, err = self.run_cli("query", "Tasks", "--where", f"created >= {value} AND \"Done at\" < {value}")
@@ -1876,7 +1876,7 @@ class QueryTest(ClientTestCase):
         self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
 
     def test_where_refuses_a_type_the_api_cannot_filter(self):
-        """A type with no filter (a place) is refused here: the API answers a page of alternatives that name none."""
+        # A type with no filter (a place) is refused here: the API answers a page of alternatives that name none.
         self.fake.data_sources[DS_TASKS]["properties"]["Where"] = {"id": "pl", "name": "Where", "type": "place", "place": {}}
         for where in ("Where is empty", "Where is not empty", "Where = 'x'"):
             with self.subTest(where=where):
@@ -1945,7 +1945,7 @@ class QueryTest(ClientTestCase):
 
 class JsonOutputTest(ClientTestCase):
     def test_json_stdout_is_one_document_for_every_verb_that_takes_json(self):
-        """Over every verb whose parser has --json: stdout parses as one JSON document, notes go to stderr."""
+        # Over every verb whose parser has --json: stdout parses as one JSON document, notes go to stderr.
         for i in range(60):
             self.fake.add_page(task_page(uid(0x10000 + i), 1000 + i, f"Row {i}", status="Rollout"))
         self.fake.on("POST", rf"/v1/data_sources/{DS_PROJECTS}/query",
@@ -2013,7 +2013,7 @@ class SearchTest(ClientTestCase):
         self.assertIn("matched: title", wiki)
 
     def test_search_says_when_a_title_only_resembles_the_words(self):
-        """The API's search ranks by likeness: it returns titles that hold none of the words as written."""
+        # The API's search ranks by likeness: it returns titles that hold none of the words as written.
         self.fake.on("POST", r"/v1/search", lambda r: (200, {"object": "list", "results": [self.wiki, self.noted],
                                                              "has_more": False, "next_cursor": None})
                      if (r.json or {}).get("query") else None)
@@ -2064,7 +2064,7 @@ class CommentsTest(ClientTestCase):
         self.assertEqual(sent["markdown"], "Merged **today**")
 
     def test_an_empty_comment_is_refused_and_not_sent(self):
-        """The API accepts an empty comment and posts it, so the client does not send one."""
+        # The API accepts an empty comment and posts it, so the client does not send one.
         blank = self.tmp / "blank.md"
         blank.write_text(" \n")
         for action, target in (("add", PAGE), ("reply", uid(0xCA)), ("edit", uid(0xC9))):
@@ -2133,7 +2133,7 @@ class FilesTest(ClientTestCase):
         return found
 
     def test_the_line_upload_prints_places_the_file_in_a_body(self):
-        """The markdown endpoints store file-upload:// as an empty block: the client gives the block its file."""
+        # The markdown endpoints store file-upload:// as an empty block: the client gives the block its file.
         image, note = self.tmp / "screen.png", self.tmp / "note.txt"
         image.write_bytes(b"png")
         note.write_bytes(b"text")
@@ -2654,7 +2654,7 @@ class DoctorTest(ClientTestCase):
         self.assertIn(f"write check create: ok ({test_page['url']})", out.splitlines())
 
     def test_doctor_write_check_mismatch_exits_1_and_trashes(self):
-        """A construct stored as anything but its own block fails the check, even when the text is the same."""
+        # A construct stored as anything but its own block fails the check, even when the text is the same.
         self.settings(test_marker="QA MARKER")
 
         def as_text(value):
