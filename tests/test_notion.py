@@ -979,8 +979,8 @@ class UpdateTest(ClientTestCase):
         self.assertEqual(patch["Done at"], {"date": {"start": "2026-11-24"}})
 
     def test_a_date_range_that_would_end_before_it_starts_is_refused(self):
-        """Whichever side is written and whichever is kept, in update, create and a pages file: exit 2, nothing sent,
-        both dates named, and how to set or clear the end. A range that does not go backwards is sent."""
+        # Whichever side is written and whichever is kept, in update, create and a pages file: exit 2, nothing sent,
+        # both dates named, and how to set or clear the end. A range that does not go backwards is sent.
         def stored(start, end=None, zone=None):
             self.page["properties"]["Done at"]["date"] = {"start": start, "end": end, "time_zone": zone} if start else None
 
@@ -1052,8 +1052,8 @@ class UpdateTest(ClientTestCase):
             self.assertEqual(code, 2, out + err)
 
     def test_the_word_null_is_never_sent_as_a_date(self):
-        """`date:<Property>:end=` clears the end; the empty end as it is printed, null, and its other spellings are
-        read the same in update, create, a pages file and --where, and none of them reaches Notion as a date."""
+        # `date:<Property>:end=` clears the end; the empty end as it is printed, null, and its other spellings are
+        # read the same in update, create, a pages file and --where, and none of them reaches Notion as a date.
         words = ("", "null", "NULL", "Null", "none", "None", " null ")
         for word in words:
             with self.subTest(end=word):
@@ -2414,8 +2414,8 @@ class QueryTest(ClientTestCase):
         self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
 
     def test_is_empty_takes_the_types_the_reference_lists_and_no_other(self):
-        """Over every property type: the reference's `is empty` row is what the client compiles, and every other
-        type is refused in words that say the condition, not the API, cannot filter it."""
+        # Over every property type: the reference's `is empty` row is what the client compiles, and every other
+        # type is refused in words that say the condition, not the API, cannot filter it.
         listed = ["title", "rich_text", "url", "email", "phone_number", "number", "select", "status", "multi_select", "date",
                   "people", "created_by", "last_edited_by", "relation", "files"]
         others = ["checkbox", "unique_id", "created_time", "last_edited_time", "formula", "rollup", "place", "button",
@@ -2525,8 +2525,8 @@ class QueryTest(ClientTestCase):
         self.page["properties"] = {names.get(n, n): v for n, v in self.page["properties"].items()}
 
     def test_a_property_named_like_a_built_in_column_prints_its_values(self):
-        """`ID` is the name Notion gives the unique id: in every output that reads a column by the property's name,
-        the property wins over the built-in and its value is there, whatever key the short format gives it."""
+        # `ID` is the name Notion gives the unique id: in every output that reads a column by the property's name,
+        # the property wins over the built-in and its value is there, whatever key the short format gives it.
         link, url = "https://example.com/pr/1", self.page["url"]
         coll = COLLECTION + DS_TASKS
         original = (dict(self.fake.data_sources[DS_TASKS]["properties"]), dict(self.page["properties"]))
@@ -2583,8 +2583,8 @@ class QueryTest(ClientTestCase):
                 self.assertIn(f"write check property ({name}): ok", out, err)
 
     def test_group_by_a_built_in_name_counts_by_the_page_s_own_value(self):
-        """--group-by reads every name --select takes, the same way: a built-in prints the page's own value, and a
-        property of that name wins. No row is ever counted empty because the name is not a property."""
+        # --group-by reads every name --select takes, the same way: a built-in prints the page's own value, and a
+        # property of that name wins. No row is ever counted empty because the name is not a property.
         self.fake.pages.clear()
         for i, (day, status) in enumerate([("01", "Done"), ("01", "Done"), ("02", "Rollout")]):
             row = self.fake.add_page(task_page(uid(0x10000 + i), 1000 + i, f"Row {i}", status=status,
@@ -2720,8 +2720,8 @@ class SearchTest(ClientTestCase):
         self.assertTrue(by_url[self.noted["url"]].endswith("matched: similar title"))
 
     def test_a_hit_that_holds_the_words_in_a_text_is_never_called_a_similar_title(self):
-        """Wherever the page comes from - the title search, the rows of a data source, both, a key - the label
-        says what holds the words, and a mere likeness is printed after every real match."""
+        # Wherever the page comes from - the title search, the rows of a data source, both, a key - the label
+        # says what holds the words, and a mere likeness is printed after every real match.
         likeness = self.fake.add_page(child_page(uid(0x7003), "Invoyce notes", WIKI))
         stale = dict(self.noted, properties=dict(self.noted["properties"], Notes={"id": "nt", "type": "rich_text",
                                                                                   "rich_text": []}))
@@ -2787,8 +2787,8 @@ class SearchTest(ClientTestCase):
                 self.assertIn("… at least 2 more hits (--limit N shows them)", out.splitlines())
 
     def test_a_search_that_cut_a_source_short_says_so_whatever_the_count_of_hits(self):
-        """Over every source (the title search, each data source, --in), with the merged hits above, at and below
-        --limit: a search that did not print or read everything says so, and one that did says nothing."""
+        # Over every source (the title search, each data source, --in), with the merged hits above, at and below
+        # --limit: a search that did not print or read everything says so, and one that did says nothing.
         within = ("search", "invoice", "--in", COLLECTION + DS_TASKS)
         merged = ("search", "invoice")
         silent = None
@@ -2931,8 +2931,8 @@ class CommentsTest(ClientTestCase):
         self.assertEqual(self.writes(), [])
 
     def test_a_comment_that_would_show_nothing_is_refused_and_any_text_is_sent(self):
-        """Characters with no shape and tags that show nothing by themselves are an empty comment, in add, reply and
-        edit, from --body and from --body-file; anything that shows is sent as written."""
+        # Characters with no shape and tags that show nothing by themselves are an empty comment, in add, reply and
+        # edit, from --body and from --body-file; anything that shows is sent as written.
         self.run_cli("comments", "add", PAGE, "--body", "First")
         comment = self.fake.comments[PAGE][0]
         targets = {"add": PAGE, "reply": comment["discussion_id"], "edit": comment["id"]}
@@ -4101,7 +4101,7 @@ class CacheTest(ClientTestCase):
 
 class SignedAddressTest(ClientTestCase):
     def test_no_cache_file_holds_a_signed_address(self):
-        """Every way the cache gets written, with a signed storage address everywhere the API can put one."""
+        # Every way the cache gets written, with a signed storage address everywhere the API can put one.
         def signed(what):
             return (f"https://files.example.com/{what}?X-Amz-Algorithm=AWS4&X-Amz-Credential=SYNTHETIC&"
                     "X-Amz-Security-Token=SYNTHETIC&X-Amz-Signature=0000&X-Amz-Expires=3600")
@@ -4204,8 +4204,8 @@ class PeopleCacheRaceTest(ClientTestCase):
         self.assertFalse(thread.is_alive())
 
     def test_a_session_that_writes_between_the_read_and_the_write_of_another_loses_nothing(self):
-        """Every cache file that is read, merged and written: the people, the kind of each id, and the list of
-        data sources a schema read again corrects."""
+        # Every cache file that is read, merged and written: the people, the kind of each id, and the list of
+        # data sources a schema read again corrects.
         def clean():
             shutil.rmtree(self.home / ".cache", ignore_errors=True)
 
@@ -4357,8 +4357,8 @@ class StaleCacheTest(ClientTestCase):
         return self.body_file(json.dumps([{"properties": p} for p in properties]), "pages.json")
 
     def test_a_step_built_from_a_renamed_or_deleted_property_is_built_again_from_the_schema_read_again(self):
-        """The user did not name the old property: every step answers as it would with no cache, reads the schema
-        once, and leaves a cache the next command does not trip on."""
+        # The user did not name the old property: every step answers as it would with no cache, reads the schema
+        # once, and leaves a cache the next command does not trip on.
         coll = COLLECTION + DS_TASKS
         sites = [
             ("search, a text property renamed", self.rename("Notes", "Remarks"), ("search", "invoice"), "matched: Remarks"),
@@ -4403,7 +4403,7 @@ class StaleCacheTest(ClientTestCase):
                 self.assertNotIn(400, self.statuses)
 
     def test_a_property_or_option_still_unknown_after_the_fresh_read_is_refused_as_any_unknown_one(self):
-        """The user named what the schema no longer has: exit 2, the message an unknown name gets, nothing written."""
+        # The user named what the schema no longer has: exit 2, the message an unknown name gets, nothing written.
         coll = COLLECTION + DS_TASKS
         renamed = self.rename("Notes", "Notes log")
         asked = "unknown property 'Notes' in the condition; did you mean Notes log?"
@@ -4485,7 +4485,7 @@ class StaleCacheTest(ClientTestCase):
             self.assertEqual(len(self.schema_reads()), 1)
 
     def test_a_later_page_of_a_file_is_built_again_after_the_schema_was_read_for_an_earlier_one(self):
-        """The title is renamed and a property added: page 2 makes the client read the schema, page 1 was built before."""
+        # The title is renamed and a property added: page 2 makes the client read the schema, page 1 was built before.
         def change():
             self.rename("Task name", "Name")()
             self.add_priority()
@@ -4518,8 +4518,8 @@ class StaleCacheTest(ClientTestCase):
                     self.assertEqual(self.statuses.count(400), 1)
 
     def test_only_the_write_is_sent_again_never_after_it_landed(self):
-        """The property lands, and the read that prints it back is answered 400 over a schema that now builds the
-        write differently: the write is not sent a second time."""
+        # The property lands, and the read that prints it back is answered 400 over a schema that now builds the
+        # write differently: the write is not sent a second time.
         self.cached_before(self.rename("Project", "PROJECT"))  # --set resolves it in any case, to another payload
         related = [uid(0x40000 + i) for i in range(26)]
         self.page["properties"]["Project"] = {"id": "pj", "type": "relation", "relation": [], "has_more": False}
@@ -4535,7 +4535,7 @@ class StaleCacheTest(ClientTestCase):
         self.assertNotEqual(code, 0, out)
 
     def test_a_check_that_fails_for_another_reason_leaves_the_refusal_as_it_was(self):
-        """A 403 or 404 is checked against the schema; when that read fails some other way, the refusal is what is said."""
+        # A 403 or 404 is checked against the schema; when that read fails some other way, the refusal is what is said.
         coll = COLLECTION + DS_TASKS
         sites = {"query": ("query", coll), "search --in": ("search", "invoice", "--in", coll),
                  "create": ("create", "--parent", coll, "--set", "title=A")}
@@ -4637,8 +4637,8 @@ class StaleCacheTest(ClientTestCase):
                                               "sources, read again, does not hold it), so it was not searched")
 
     def test_a_data_source_that_refuses_is_never_hidden_and_one_that_is_gone_is_said(self):
-        """Every place that asks a data source of the cached list, for both refusals: still listed, the command
-        exits 1 with the API's message; gone from the list read again, it is skipped with a note."""
+        # Every place that asks a data source of the cached list, for both refusals: still listed, the command
+        # exits 1 with the API's message; gone from the list read again, it is skipped with a note.
         query = ("POST", rf"/v1/data_sources/{DS_PROJECTS}/query")
         schema = ("GET", rf"/v1/data_sources/{DS_PROJECTS}")
         project = "PRJ" + "-5"
@@ -4702,8 +4702,8 @@ class StaleCacheTest(ClientTestCase):
                 self.assertIn(message, err)
 
     def test_a_cached_data_source_that_is_gone_keeps_the_advice_to_connect_it(self):
-        """Every command that is pointed at a data source, with its schema cached or not: the same answer, which
-        says the integration is not connected and how to connect it."""
+        # Every command that is pointed at a data source, with its schema cached or not: the same answer, which
+        # says the integration is not connected and how to connect it.
         body = self.tmp / "body.md"
         body.write_text("More")
         coll = COLLECTION + DS_TASKS
@@ -4750,7 +4750,7 @@ class StaleCacheTest(ClientTestCase):
                         self.assertIn(advice, err)
 
     def test_a_key_lookup_that_fails_is_never_taken_for_no_hit(self):
-        """search looks a key up first; only "no such key" lets it go on without that hit."""
+        # search looks a key up first; only "no such key" lets it go on without that hit.
         def lost(r):
             raise TimeoutError("timed out")
 
