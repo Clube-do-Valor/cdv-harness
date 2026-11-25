@@ -2357,6 +2357,17 @@ class DoctorTest(ClientTestCase):
         self.assertTrue(any("Tasks" in line and PREFIX in line for line in sources))
         self.assertTrue(any("Projects" in line and "PRJ" in line for line in sources))
 
+    def test_doctor_names_an_untitled_data_source(self):
+        self.fake.data_sources[DS_PROJECTS]["title"] = []
+        code, out, err = self.run_cli("doctor")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"data source: (untitled), prefix PRJ, {COLLECTION}{DS_PROJECTS}", out.splitlines())
+        code, out, err = self.run_cli("fetch", COLLECTION + DS_PROJECTS)
+        self.assertEqual(out.splitlines()[0], "data source: (untitled)")
+        code, out, err = self.run_cli("fetch", "no such title")
+        self.assertEqual(code, 2)
+        self.assertIn("connected data source (Tasks)", err)
+
     def test_doctor_missing_capability_exits_1(self):
         self.fake.on("GET", r"/v1/comments", lambda r: error(403, "restricted_resource", "Insufficient permissions."))
         self.fake.users_status = 403
@@ -2383,6 +2394,7 @@ class DoctorTest(ClientTestCase):
             self.assertRegex(out, rf"(?m)^write check {step}.*: ok")
         self.assertNotIn("FAILED", out)
         self.assertIn("| Column | Value |", self.fake.page_markdown(test_page["id"])["markdown"])  # what a read gives back
+        self.assertIn(f"write check create: ok ({test_page['url']})", out.splitlines())
 
     def test_doctor_write_check_mismatch_exits_1_and_trashes(self):
         """A construct stored as anything but its own block fails the check, even when the text is the same."""

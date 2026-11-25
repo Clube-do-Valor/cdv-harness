@@ -71,6 +71,7 @@ MAX_RETRIES = 5
 DEFAULT_ROWS = 50
 MAX_ROWS = 2000
 SCHEMA_BUDGET = 6000
+UNTITLED = '(untitled)'
 UPLOAD_LIMIT = 20 * 1024 * 1024
 
 DONE, REFUSED, USAGE, NO_TOKEN, PARTIAL = 0, 1, 2, 3, 4
@@ -852,7 +853,7 @@ class Notion:
             titled = self.data_source_titled(text)
             if titled:
                 return 'data_source', titled
-            names = ', '.join(s['title'] for s in self.data_sources())
+            names = ', '.join(s['title'] for s in self.data_sources() if s['title'])
             raise Fail(USAGE, f'{text!r} is not a page id, a url, a key or the title of a connected data source '
                               f'({names or "none connected"}); to find a page by its words use `notion search`')
         identifier = ref.value
@@ -1219,7 +1220,7 @@ def icon_of(value):
 def schema_lines(client, schema, budget=SCHEMA_BUDGET):
     props = schema.get('properties', {})
     prefix, unique = unique_of(props)
-    head = [f"data source: {plain(schema.get('title'))}", f"ref: {COLLECTION}{schema['id']}"]
+    head = [f"data source: {plain(schema.get('title')) or UNTITLED}", f"ref: {COLLECTION}{schema['id']}"]
     database = (schema.get('parent') or {}).get('database_id')
     if database:
         head.append(f'database: {database}')
@@ -2039,7 +2040,7 @@ def cmd_search(client, args):
         if kind == 'page':
             add(found, 'id')
         else:
-            client.say(f"{plain(found.get('title'))} | {COLLECTION}{found['id']} | data source | matched: id")
+            client.say(f"{plain(found.get('title')) or UNTITLED} | {COLLECTION}{found['id']} | data source | matched: id")
             return DONE
     else:
         if ref.kind == 'key':
@@ -2436,7 +2437,7 @@ def cmd_doctor(client, args):
         failed = True
         client.say('data source: none connected (connect the integration to the data sources in Notion)')
     for source in sources:
-        client.say(f"data source: {source['title']}, prefix {source.get('prefix') or 'none'}, {COLLECTION}{source['id']}")
+        client.say(f"data source: {source['title'] or UNTITLED}, prefix {source.get('prefix') or 'none'}, {COLLECTION}{source['id']}")
     return REFUSED if failed else DONE
 
 
@@ -2453,15 +2454,16 @@ def write_check(client, args):
     title = f"{marker} doctor {NOW().strftime('%Y-%m-%d %H:%M:%S')}"
     results, page = {}, None
 
-    def step(name, ok, detail=''):
+    def step(name, ok, detail='', where=''):
         results[name.split()[0]] = ok
-        client.say(f'write check {name}: ' + ('ok' if ok else f'FAILED{" (" + detail + ")" if detail else ""}'))
+        client.say(f'write check {name}: ' + (f'ok{" (" + where + ")" if where else ""}' if ok
+                                              else f'FAILED{" (" + detail + ")" if detail else ""}'))
         return ok
 
     try:
         page = client.call('POST', '/v1/pages', {'parent': {'data_source_id': schema['id']},
                                                   'properties': {title_prop: {'title': rich_text(title)}}})
-        step('create', client.title_of(page) == title, 'the title read back differs')
+        step('create', client.title_of(page) == title, f"the title read back differs, {page.get('url')}", where=page.get('url'))
     except Fail as failure:
         step('create', False, failure.message)
         return results
