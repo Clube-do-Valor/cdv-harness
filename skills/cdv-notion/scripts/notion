@@ -3578,16 +3578,21 @@ def trash_check_card(client, page, title, step):
 
 
 def trash_lost_check_card(client, schema, title, started, doubt, step):
-    """The card of a write check whose create ended in doubt: looked for by its title, which holds the time to
-    the second, and trashed; when it is not found, or cannot be looked for, its title is said."""
-    found, why = None, 'no card with that title was found'
+    """The card of a write check whose create ended in doubt: looked for by its title, which holds the day and the
+    time to the second, so a day is allowed for the difference between this machine's clock and Notion's, and
+    trashed; when it is not found, or cannot be looked for, its title is said."""
+    since = started - datetime.timedelta(days=1)
     for wait in (0, 2, 4):  # a query may not list a page at once
         if wait:
             SLEEP(wait)
+        found, why = None, 'no card with that title was found'
         try:
-            found = find_created(client, 'data_source', schema, title, started, doubt)
+            found = find_created(client, 'data_source', schema, title, since, doubt)
         except Exception as error:
-            why = f'it could not be looked for ({as_fail(error).cause})'
+            failure = as_fail(error)
+            why = f'it could not be looked for ({failure.cause})'
+            if failure.code == NO_TOKEN or isinstance(failure, ApiError) and failure.status in (400, 403, 404):
+                break  # waiting does not change the answer
         if found is not None and client.title_of(found) == title:
             client.say(f"write check create: the card was made and was found by its title, {url_of(found)}")
             return trash_check_card(client, found, title, step)

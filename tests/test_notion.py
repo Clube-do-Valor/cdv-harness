@@ -4553,6 +4553,43 @@ class DoctorTest(ClientTestCase):
                         self.assertRegex(out, r"(?m)^write check trash: FAILED")
                         self.assertIn(f"look for a card titled {title!r} in {where} and trash it by hand", out)
 
+        # a clock ahead of Notion's, or behind it, never hides the card: its title is its own
+        for minutes in (-120, -2, 2, 120, 600):
+            with self.subTest(clock_ahead=minutes):
+                self.fake.overrides.clear()
+                self.fake.pages = {PAGE: self.page}
+                clock = datetime.datetime(2026, 11, 22, 9, 30, 15, tzinfo=datetime.timezone.utc) + datetime.timedelta(minutes=minutes)
+                with mock.patch.object(self.n, "NOW", lambda clock=clock: clock):
+                    self.fake.on("POST", r"/v1/pages", lambda r: (self.fake.create_page(r.json), ends_in("503")(r))[1])
+                    self.fake.on("POST", query, lambda r: (200, {"results": [pg for pg in self.fake.pages.values() if pg["created_time"] >= r.json[
+                        "filter"]["and"][1]["created_time"]["on_or_after"]], "has_more": False}) if checks(r) else None)
+                    code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out + err)
+                self.assertRegex(out, r"(?m)^write check trash: ok")
+                self.assertEqual([pg["in_trash"] for pg in self.fake.pages.values() if pg["id"] != PAGE], [True])
+        # what is said is the last lookup's result, and what waiting does not change is not asked again
+        for answers, asked, said in (([403], 1, "could not be looked for"), ([401], 1, "could not be looked for"), ([404], 1, "could not be looked for"),
+                                     ([503] * 3, 5, "no card with that title was found"), ([], 3, "no card with that title was found"),
+                                     ([503] * 9, 9, "could not be looked for")):
+            with self.subTest(lookups=answers):
+                self.fake.overrides.clear()
+                lookups = []
+
+                def look(r, answers=answers, lookups=lookups):
+                    if checks(r):
+                        lookups.append(r)
+                        if len(lookups) <= len(answers):
+                            return error(answers[len(lookups) - 1], "synthetic_failure", "Synthetic failure.")
+                        return 200, {"results": [], "has_more": False}
+
+                self.fake.on("POST", r"/v1/pages", ends_in("503"))
+                self.fake.on("POST", query, look)
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out + err)
+                self.assertRegex(out, rf"(?m)^write check trash: FAILED \(.*{said}")
+                self.assertEqual(len(lookups), asked)  # a read is tried three times on a 503
+                self.assertIn(f"look for a card titled {title!r}", out)
+
         # the card was made and answered, and the request that trashes it is lost: the card is named
         for kind in (*LOST, *UNREADABLE, *OTHER_SHAPE, "400", "503"):
             with self.subTest(trash=kind):
