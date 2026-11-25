@@ -982,7 +982,7 @@ class TextLinksTest(ClientTestCase):
                 run(" by "), run("wiki", "https://example.com/A_(b) c"), run("plain bold", bold=True)]
         shown = ("See [the docs](https://example.com/docs) and [draft] a_b *c* [a bold](https://example.com/x) word mail "
                  "[ana@example.com](mailto:ana@example.com) in [Glossary](" + page_url(WIKI) + ") about Billing revamp by "
-                 "[wiki](https://example.com/A_%28b%29%20c)plain bold")
+                 "[wiki](https://example.com/A_(b)\\ c)plain bold")
         self.page["properties"]["Notes"]["rich_text"] = runs
         self.page["properties"]["Task name"]["title"] = [run("Export ["), run("invoices", "https://example.com/i"), run("]")]
         title = "Export [[invoices](https://example.com/i)]"
@@ -1010,6 +1010,49 @@ class TextLinksTest(ClientTestCase):
         self.assertEqual([(r["plain_text"], r["href"]) for r in stored],
                          [("See ", None), ("the [old] docs", "https://example.com/docs?a=1&b=(2)"), (", ", None),
                           ("ana@example.com", "mailto:ana@example.com"), (" [draft] (x) ", None), ("Glossary", page_url(WIKI))])
+
+    def test_any_runs_printed_and_written_back_store_the_same_runs(self):
+        u, v = "https://example.com/a", "https://example.com/b"
+        wiki, mail = "https://example.org/wiki/Name_(thing)", "mailto:ana@example.com"
+        table = [  # (the runs as (text, address), how they are printed)
+            ("a lone [ in a link's text", [("see ", None), ("a [ b", u)], r"see [a \[ b](" + u + ")"),
+            ("a lone ] in a link's text", [("a ] b", u)], r"[a \] b](" + u + ")"),
+            ("] then [ in a link's text", [("x][y", u)], r"[x\]\[y](" + u + ")"),
+            ("brackets nested in a link's text", [("[[x]]", u)], r"[\[\[x\]\]](" + u + ")"),
+            ("balanced brackets stay as they are", [("the [old] docs", u)], "[the [old] docs](" + u + ")"),
+            ("a backslash in a link's text", [("C:\\dir", u)], r"[C:\\dir](" + u + ")"),
+            ("a backslash ending a link's text", [("a\\", u)], r"[a\\](" + u + ")"),
+            ("a backslash before a bracket", [("a\\[b\\]", u)], r"[a\\\[b\\\]](" + u + ")"),
+            ("link syntax in a link's text", [("a](" + v + ")", u)], r"[a\](" + v + r")](" + u + ")"),
+            ("an address with balanced parentheses", [("Name", wiki)], "[Name](" + wiki + ")"),
+            ("an address with an unbalanced )", [("x", "https://example.org/a)b")], r"[x](https://example.org/a\)b)"),
+            ("an address with an unbalanced (", [("x", "https://example.org/a(b")], r"[x](https://example.org/a\(b)"),
+            ("balanced and unbalanced parentheses", [("x", "https://example.org/a_(b)_c)")], r"[x](https://example.org/a_(b)_c\))"),
+            ("a backslash and a space in an address", [("x", "https://example.org/a\\b c")], r"[x](https://example.org/a\\b\ c)"),
+            ("brackets in an address", [("x", "https://example.org/a[1]")], "[x](https://example.org/a[1])"),
+            ("a mailto address", [("write", mail)], "[write](" + mail + ")"),
+            ("two links side by side", [("a", u), ("b", v)], "[a](" + u + ")[b](" + v + ")"),
+            ("a link at the start", [("a", u), (" tail", None)], "[a](" + u + ") tail"),
+            ("a link at the end", [("head ", None), ("a", u)], "head [a](" + u + ")"),
+            ("a link alone", [("a", u)], "[a](" + u + ")"),
+            ("plain text stays literal", [("a\\b [x] ] [ \\ ", None), ("l", u), (" ] \\[ (y) ", None)],
+             "a\\b [x] ] [ \\ [l](" + u + ") ] \\[ (y) "),
+            ("text that only looks like a link", [("[z](relative) [x] (y) [w](ftp://example.com/w)", None)],
+             "[z](relative) [x] (y) [w](ftp://example.com/w)"),
+        ]
+        for name, spec, printed in table:
+            with self.subTest(name):
+                runs = [run(said, address) for said, address in spec]
+                self.page["properties"]["Notes"]["rich_text"] = runs
+                code, out, err = self.run_cli("fetch", PAGE, "--props-only")
+                self.assertEqual(code, 0, err)
+                value = self.props_of(out)["Notes"]
+                self.assertEqual(value, printed)
+                self.page["properties"]["Notes"]["rich_text"] = []
+                code, out, err = self.run_cli("update", PAGE, "--set", "Notes=" + value)
+                self.assertEqual(code, 0, err)
+                stored = self.page["properties"]["Notes"]["rich_text"]
+                self.assertEqual([(r["plain_text"], r["href"]) for r in stored], spec)
 
     def test_a_written_link_becomes_a_linked_run_in_update_create_and_a_pages_file(self):
         link = {"text": {"content": "docs", "link": {"url": "https://example.com/docs"}}}

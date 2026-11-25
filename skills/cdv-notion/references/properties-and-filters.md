@@ -8,7 +8,7 @@ The client reads and writes properties in the short format the Notion MCP used, 
 
 | Type | Printed as |
 |---|---|
-| title, text | the text, with each link as `[text](url)` and everything else literal (nothing escaped) |
+| title, text | the text, with each link as `[text](url)` and everything else literal (nothing outside a link is escaped; inside a link see below) |
 | number | the number |
 | select, status | the option name, or `null` |
 | multi-select | `["A", "B"]` |
@@ -40,7 +40,7 @@ A property named `id` or `url` (any case) is printed as `userDefined:<name>`, an
 | page title (page parent) | `title` | `--set 'title=Approved plan'` |
 
 - `title` (or `name`) also names a data source's title property, whatever it is called.
-- A text value that was read and written back keeps its links. Text that only looks like a link, `[text](https://…)` typed as it is, becomes one; a link whose text holds a lone `[` or `]` is printed but not read back as a link. Bold, italic, code and mentions inside a text property are read as plain text ([api-limits.md](api-limits.md)). The `title:` line of a fetch, and every condition, use the plain text.
+- A text value that was read and written back keeps its links. Text that only looks like a link, `[text](https://…)` typed as it is, becomes one (the address must start with `http://`, `https://` or `mailto:`; `[z](relative)` stays text). Inside a link, what would end it is escaped with a backslash: in the text a `[` or `]` that is not one balanced pair, and every `\` (`[a \[ b](https://…)`, `[C:\\dir](https://…)`); in the address a space, a `\` and a parenthesis that is not one balanced pair (`https://example.org/wiki/Name_(thing)` is printed as it is, `https://example.org/a\)b` has an unbalanced `)`). Written by hand, a backslash before anything else is a backslash. Text outside a link is never escaped, so a value read back is the same as long as plain text does not itself hold `[text](https://…)`. Bold, italic, code and mentions inside a text property are read as plain text ([api-limits.md](api-limits.md)). The `title:` line of a fetch, and every condition, use the plain text.
 - An unknown property or option exits `2` and lists the nearest names; nothing is written. The schema is re-read once before refusing, so an option created a minute ago is found.
 - A person given by name or e-mail is looked up among the people the API lists and the people seen in rows read. Several matches exit `2` listing each one's name, e-mail and `user://` id, and nothing is sent: pass the id. An exact e-mail or a `user://` id is never ambiguous. The same holds for `has` in `--where`.
 - A list replaces the whole value: to add a tag, write the current tags and the new one.
