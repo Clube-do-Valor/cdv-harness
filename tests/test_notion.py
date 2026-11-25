@@ -4056,6 +4056,110 @@ class PeopleCacheRaceTest(ClientTestCase):
         self.assertEqual(sorted(saved), sorted([JOANA, BRUNO]))
         self.assertEqual(sorted(first.people()), sorted([JOANA, BRUNO]))
 
+    def saved(self, name):
+        return json.loads((self.home / ".cache" / "cdv-notion" / f"{name}.json").read_text())
+
+    def write_between_the_read_and_the_write(self, name, first, first_writes, second, second_writes):
+        """first_writes(first) runs, and right before it writes the cache file `name`, with everything it merges
+        already read, second_writes(second) runs on another thread: to its end, or until it waits for a lock."""
+        settled = threading.Event()  # the second session wrote, or is waiting for the first one
+        locks = self.n.fcntl
+
+        def flock(handle, how):
+            try:
+                locks.flock(handle, how | locks.LOCK_NB)
+            except BlockingIOError:
+                settled.set()
+                locks.flock(handle, how)
+
+        def second_session():
+            try:
+                second_writes(second)
+            finally:
+                settled.set()
+
+        thread = threading.Thread(target=second_session)
+        put = first.cache.put
+
+        def write(written, value):
+            if written == name and not thread.ident:
+                thread.start()
+                self.assertTrue(settled.wait(60), "the second session neither wrote nor waited")
+            put(written, value)
+
+        first.cache.put = write
+        self.n.fcntl = mock.Mock(flock=flock, LOCK_EX=locks.LOCK_EX)
+        try:
+            first_writes(first)
+        finally:
+            self.n.fcntl = locks
+        self.assertTrue(thread.ident, f"{name} was not written")
+        thread.join(60)
+        self.assertFalse(thread.is_alive())
+
+    def test_a_session_that_writes_between_the_read_and_the_write_of_another_loses_nothing(self):
+        """Every cache file that is read, merged and written: the people, the kind of each id, and the list of
+        data sources a schema read again corrects."""
+        def clean():
+            shutil.rmtree(self.home / ".cache", ignore_errors=True)
+
+        with self.subTest("two new people"):
+            clean()
+            self.write_between_the_read_and_the_write(
+                "people", self.n.Notion(), lambda s: s.remember(USERS[BRUNO]), self.n.Notion(), lambda s: s.remember(GUEST))
+            self.assertEqual(sorted(self.saved("people")), sorted([JOANA, BRUNO]))
+        with self.subTest("a person the other session updated since this one read the cache is not written back old"):
+            clean()
+            self.n.Notion().remember(person(BRUNO, "Bruno Old"))
+            first = self.n.Notion()
+            first.people()
+            self.n.Notion().remember(person(BRUNO, "Bruno Costa", "bruno@example.com"))
+            first.remember(GUEST)
+            self.assertEqual(self.saved("people")[BRUNO], {"name": "Bruno Costa", "type": "person",
+                                                           "email": "bruno@example.com"})
+            self.assertEqual(first.people()[BRUNO]["name"], "Bruno Costa")
+        with self.subTest("an e-mail the other session learned stays when this one sees the person without it"):
+            clean()
+            first = self.n.Notion()
+            first.people()
+            self.n.Notion().remember(person(ANA, "Ana Lima", "ana@example.com"))
+            first.remember(person(ANA, "Ana Lima Souza"))
+            self.assertEqual(self.saved("people")[ANA], {"name": "Ana Lima Souza", "type": "person",
+                                                         "email": "ana@example.com"})
+        with self.subTest("the kind of each id"):
+            clean()
+            self.write_between_the_read_and_the_write(
+                "kinds", self.n.Notion(), lambda s: s.resolve(PAGE), self.n.Notion(), lambda s: s.resolve(DS_TASKS))
+            self.assertEqual(self.saved("kinds"), {PAGE: "page", DS_TASKS: "data_source"})
+        with self.subTest("the list of data sources"):
+            clean()
+            self.n.Notion().data_sources()
+            renamed = {DS_TASKS: "Cards", DS_PROJECTS: "Initiatives"}
+
+            def reads_again(identifier):
+                self.fake.data_sources[identifier] = dict(self.fake.data_sources[identifier], title=text(renamed[identifier]))
+                return lambda session: session.data_source(identifier, refresh=True)
+
+            first_writes, second_writes = reads_again(DS_TASKS), reads_again(DS_PROJECTS)
+            self.write_between_the_read_and_the_write(
+                "data_sources", self.n.Notion(), first_writes, self.n.Notion(), second_writes)
+            self.assertEqual(sorted(entry["title"] for entry in self.saved("data_sources")), ["Cards", "Initiatives"])
+
+    def test_without_flock_or_a_lock_file_the_cache_is_written_as_before(self):
+        def refused(handle, how):
+            raise OSError("no locks here")
+
+        for name, locks in (("no fcntl", None), ("a file system with no locks", mock.Mock(flock=refused, LOCK_EX=2))):
+            with self.subTest(name):
+                shutil.rmtree(self.home / ".cache", ignore_errors=True)
+                self.n.fcntl = locks
+                first, second = self.n.Notion(), self.n.Notion()
+                self.assertEqual((first.people(), second.people()), ({}, {}))
+                second.remember(GUEST)
+                first.remember(USERS[BRUNO])
+                self.assertEqual(sorted(json.loads((self.home / ".cache" / "cdv-notion" / "people.json").read_text())),
+                                 sorted([JOANA, BRUNO]))
+
 
 class StaleCacheTest(ClientTestCase):
     """What the cache holds can be older than the workspace: a read re-reads it once before it refuses."""

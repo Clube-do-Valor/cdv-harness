@@ -43,6 +43,7 @@ settings in ~/.config/cdv-notion/config.json ({"me": "<your e-mail>", "stamp_com
 import argparse
 import bisect
 import collections
+import contextlib
 import datetime
 import difflib
 import getpass
@@ -61,6 +62,11 @@ import urllib.request
 import uuid
 import zoneinfo
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # no flock here: a cache file is still written whole, and of two writes at once one may be lost
+    fcntl = None
 
 API_HOST = 'api.notion.com'
 API_ROOT = f'https://{API_HOST}'
@@ -385,6 +391,24 @@ class Cache:
             os.replace(scratch, target)
         except OSError:
             pass  # a cache that cannot be written is only slower
+
+    def update(self, name, merge):
+        """Write merge(what the file holds, or None), unless that is None. The file is read, merged and written
+        under its lock, so what another session writes at the same time is never lost; where there is no lock to
+        take, it goes on without one."""
+        lock = None
+        try:
+            if fcntl:
+                with contextlib.suppress(OSError):
+                    self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    lock = open(self.dir / f'.{name}.lock', 'a')
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+            value = merge(self.get(name))
+            if value is not None:
+                self.put(name, value)
+        finally:
+            if lock:
+                lock.close()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -911,16 +935,24 @@ class Notion:
     def remember(self, user):
         if not isinstance(user, dict) or not user.get('id') or not user.get('name'):
             return
-        known = self.people()
+        known, identifier = self.people(), user['id']
+        before = known.get(identifier) or {}
         entry = {'name': user['name'], 'type': user.get('type', 'person')}
-        email = (user.get('person') or {}).get('email') or (known.get(user['id']) or {}).get('email')
-        if email:
-            entry['email'] = email
-        if known.get(user['id']) != entry:
-            known[user['id']] = entry
-            for other, seen in (self.cache.get('people') or {}).items():  # another session may have written meanwhile
-                known.setdefault(other, seen)
-            self.cache.put('people', known)
+        email = (user.get('person') or {}).get('email')
+        if email or before.get('email'):
+            entry['email'] = email or before['email']
+        if before == entry:
+            return
+
+        def merge(saved):
+            # another session may have written since this one read the file: what it holds wins, for everyone but
+            # the person just seen, whose e-mail it may know when this answer does not give it
+            known.update(saved or {})
+            kept = email or (known.get(identifier) or {}).get('email') or before.get('email')
+            known[identifier] = dict(entry, email=kept) if kept else entry
+            return known
+
+        self.cache.update('people', merge)
 
     def list_users(self):
         """(people known after listing, None) or, when a page of the list fails, (the people of the pages read
@@ -1031,10 +1063,14 @@ class Notion:
         self._schemas[identifier] = schema
         self._fresh.add(identifier)
         self.cache.put(f'schema-{identifier}', schema)
-        listed = self.cache.get('data_sources') or []
         known = listed_entry(identifier, schema)
-        if any(entry.get('id') == identifier and entry != known for entry in listed):
-            self.cache.put('data_sources', [known if entry.get('id') == identifier else entry for entry in listed])
+
+        def correct(listed):
+            if any(entry.get('id') == identifier and entry != known for entry in listed or []):
+                return [known if entry.get('id') == identifier else entry for entry in listed]
+            return None
+
+        self.cache.update('data_sources', correct)
         if self._sources is not None:
             self._sources = [known if entry['id'] == identifier else entry for entry in self._sources]
 
@@ -1130,7 +1166,7 @@ class Notion:
             else:
                 schema = self.data_source(source['id'], refresh=True)
             listed.append(listed_entry(source['id'], schema))
-        self.cache.put('data_sources', listed)
+        self.cache.update('data_sources', lambda _: listed)  # not between another session's read and write of it
         self._sources = listed
         return listed
 
@@ -1218,8 +1254,7 @@ class Notion:
                     continue
                 raise
             if kinds.get(identifier) != kind:
-                kinds[identifier] = kind
-                self.cache.put('kinds', kinds)
+                self.cache.update('kinds', lambda saved: dict(saved or {}, **{identifier: kind}))
             if kind == 'page':
                 return 'page', found
             if kind == 'data_source':
