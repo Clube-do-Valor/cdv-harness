@@ -2692,7 +2692,7 @@ def compile_condition(client, schema, name, operator, values):
         if kind in ('checkbox', 'unique_id', 'timestamp', 'created_time', 'last_edited_time', 'formula', 'rollup'):
             raise refuse()
         if kind not in EMPTY_TYPES:
-            raise Fail(USAGE, f'{prop_name} is a {kind} property, which the API cannot filter; nothing was sent')
+            raise Fail(USAGE, f'{prop_name} is a {kind} property, which the condition cannot filter; nothing was sent')
         return dict(head, **{key: {'is_empty' if operator == 'is empty' else 'is_not_empty': True}})
 
     def leaf(op, value):
@@ -3030,9 +3030,13 @@ def cmd_search(client, args):
 # ---------------------------------------------------------------------------------------------
 
 
+EMPTY_TAG = re.compile(r'</?(?:br|p|div|span|empty-block)(?:\s[^<>]*)?/?>', re.I)  # tags that show nothing by themselves
+
+
 def comment_body(args):
     text = args.body if args.body is not None else read_file(args.body_file)
-    if not text.strip():  # the API would post an empty comment
+    shown = EMPTY_TAG.sub('', text)
+    if all(char.isspace() or unicodedata.category(char) in ('Cc', 'Cf') for char in shown):  # the API would post it
         raise Fail(USAGE, 'the comment is empty; nothing was sent')
     return text
 

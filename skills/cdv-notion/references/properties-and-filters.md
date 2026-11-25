@@ -94,7 +94,7 @@ Assignee has me
 | person, created by | `has`/`contains`/`=` `!=` `in (...)` with `me`, a name, an e-mail or `user://` | `contains`, `does_not_contain` with the user id |
 | relation | `has`/`contains`/`=` `!=` `in (...)` with a page reference | `contains`, `does_not_contain` with the page id |
 | checkbox | `=` `!=` with `__YES__`/`__NO__` | `equals`, `does_not_equal` |
-| every type but checkbox, unique id, timestamps, place, button | `is empty`, `is not empty` | `is_empty`, `is_not_empty` |
+| title, text, url, e-mail, phone, number, select, status, multi-select, date, person, created by, edited by, relation, files (no other type) | `is empty`, `is not empty` | `is_empty`, `is_not_empty` |
 
 - `Prop in (a, b, c)` becomes an `or` group of one single-value condition per value (`equals` for select, status, number, unique id, text and dates; `contains` for multi-select, person and relation), because those conditions take one value. On a type with no single-value equality (formula, rollup, files) it exits `2`.
 - The API nests groups two levels deep at most: `(A OR B) AND C` works, a group inside a group inside a group exits `2` naming the group. An `in (...)` counts as a group: `(A AND Status in ('Done', 'Rollout')) OR C` is three levels deep.

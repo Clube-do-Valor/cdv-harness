@@ -2413,6 +2413,30 @@ class QueryTest(ClientTestCase):
                 self.assertIn("Where is a place property, which the", err)
         self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
 
+    def test_is_empty_takes_the_types_the_reference_lists_and_no_other(self):
+        """Over every property type: the reference's `is empty` row is what the client compiles, and every other
+        type is refused in words that say the condition, not the API, cannot filter it."""
+        listed = ["title", "rich_text", "url", "email", "phone_number", "number", "select", "status", "multi_select", "date",
+                  "people", "created_by", "last_edited_by", "relation", "files"]
+        others = ["checkbox", "unique_id", "created_time", "last_edited_time", "formula", "rollup", "place", "button",
+                  "verification"]
+        schema = self.fake.data_sources[DS_TASKS]["properties"]
+        for kind in listed + others:
+            schema[f"P {kind}"] = {"id": f"p-{kind}", "name": f"P {kind}", "type": kind, kind: {}}
+        for kind in listed + others:
+            with self.subTest(kind):
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("query", COLLECTION + DS_TASKS, "--count", "--where", f'"P {kind}" is empty')
+                self.assertEqual(code, 0 if kind in listed else 2, err)
+                self.assertNotIn("the API cannot filter", err)
+                if kind in ("place", "button", "verification"):
+                    self.assertIn(f"P {kind} is a {kind} property, which the condition cannot filter", err)
+        row = next(line for line in (SKILL_DIR / "references" / "properties-and-filters.md").read_text().splitlines()
+                   if "`is_empty`, `is_not_empty`" in line)
+        words = dict(zip(listed, ["title", "text", "url", "e-mail", "phone", "number", "select", "status", "multi-select",
+                                  "date", "person", "created by", "edited by", "relation", "files"]))
+        self.assertEqual(row.split("|")[1].strip(), ", ".join(words.values()) + " (no other type)")
+
     def rows(self, statuses):
         for i, status in enumerate(statuses):
             self.fake.add_page(task_page(uid(0x10000 + i), 1000 + i, f"Row {i}", status=status))
@@ -2905,6 +2929,35 @@ class CommentsTest(ClientTestCase):
                     self.assertEqual(code, 2)
                     self.assertIn("nothing was sent", err)
         self.assertEqual(self.writes(), [])
+
+    def test_a_comment_that_would_show_nothing_is_refused_and_any_text_is_sent(self):
+        """Characters with no shape and tags that show nothing by themselves are an empty comment, in add, reply and
+        edit, from --body and from --body-file; anything that shows is sent as written."""
+        self.run_cli("comments", "add", PAGE, "--body", "First")
+        comment = self.fake.comments[PAGE][0]
+        targets = {"add": PAGE, "reply": comment["discussion_id"], "edit": comment["id"]}
+        blank = [chr(0x200B), chr(0xFEFF), chr(0x2060), chr(0x200D) + " \n" + chr(0xA0), "<p />", "<p></p>", "<br>", "<br/>",
+                 "<empty-block/>", '<span color="red"></span>', "<DIV>\n<br />\n</DIV>", " <p>" + chr(0x200B) + "</p> "]
+        shown = ["a", "a" + chr(0x200B) + "b", "<p>kept</p>", '<span underline="true">x</span>', "`<p />`", "<br> after",
+                 '<mention-user url="user://' + ANA + '"/>', "<paragraph/>", "<", "👍"]
+        path = self.tmp / "comment.md"
+        for action, target in targets.items():
+            for source in ("--body", "--body-file"):
+                for body in blank:
+                    with self.subTest(action=action, source=source, blank=ascii(body)):
+                        path.write_text(body, encoding="utf-8")
+                        self.fake.calls.clear()
+                        code, out, err = self.run_cli("comments", action, target, source,
+                                                      body if source == "--body" else path)
+                        self.assertEqual((code, out), (2, ""), err)
+                        self.assertIn("the comment is empty; nothing was sent", err)
+                        self.assertEqual(self.writes(), [])
+        for body in shown:
+            with self.subTest(sent=ascii(body)):
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("comments", "add", PAGE, "--body", body)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.writes()[-1].json["markdown"], body)
 
     def test_comment_display_name_by_token_kind(self):
         self.settings(me="ana@example.com")
