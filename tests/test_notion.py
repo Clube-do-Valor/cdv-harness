@@ -978,6 +978,117 @@ class UpdateTest(ClientTestCase):
         patch = self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]
         self.assertEqual(patch["Done at"], {"date": {"start": "2026-11-24"}})
 
+    def test_a_date_range_that_would_end_before_it_starts_is_refused(self):
+        """Whichever side is written and whichever is kept, in update, create and a pages file: exit 2, nothing sent,
+        both dates named, and how to set or clear the end. A range that does not go backwards is sent."""
+        def stored(start, end=None, zone=None):
+            self.page["properties"]["Done at"]["date"] = {"start": start, "end": end, "time_zone": zone} if start else None
+
+        days = ("2026-11-17", "2026-11-28")
+        timed = ("2026-11-17T09:00:00-03:00", "2026-11-28T18:00:00-03:00")
+        kept = "the new start {0} is after the end the property keeps, {1}"
+        moved_end = "the new end {1} is before the start the property keeps, {0}"
+        both = "the start {0} is after the end {1}"
+        refused = [
+            ("a start past a range of days", days, ["Done at=2026-12-10"], kept, ("2026-12-10", days[1])),
+            ("the same with :start", days, ["date:Done at:start=2026-11-29"], kept, ("2026-11-29", days[1])),
+            ("a time past a range of days", days, ["Done at=2026-11-29T08:00:00-03:00"], kept,
+             ("2026-11-29T08:00:00-03:00", days[1])),
+            ("a day past a range of times", timed, ["Done at=2026-11-29"], kept, ("2026-11-29", timed[1])),
+            ("a time past a time of the same day", timed, ["Done at=2026-11-28T19:00:00-03:00"], kept,
+             ("2026-11-28T19:00:00-03:00", timed[1])),
+            ("the offsets decide, not the digits", timed, ["Done at=2026-11-28T17:00:00-05:00"], kept,
+             ("2026-11-28T17:00:00-05:00", timed[1])),
+            ("an end before the start kept", days, ["date:Done at:end=2026-11-10"], moved_end, (days[0], "2026-11-10")),
+            ("a start and an end written backwards", days,
+             ["date:Done at:start=2026-12-10", "date:Done at:end=2026-12-01"], both, ("2026-12-10", "2026-12-01")),
+        ]
+        for name, before, assignments, said, dates in refused:
+            with self.subTest(name):
+                stored(*before)
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("update", PAGE, *[part for a in assignments for part in ("--set", a)])
+                self.assertEqual((code, out), (2, ""), err)
+                self.assertIn("date:Done at: " + said.format(*dates), err)
+                self.assertIn("nothing was sent", err)
+                self.assertIn("date:Done at:end=<date>", err)
+                self.assertIn("date:Done at:end= (an empty value)", err)
+                self.assertEqual(self.writes(), [])
+        backwards = {"date:Done at:start": "2026-12-10", "date:Done at:end": "2026-12-01"}
+        for name, command in {
+                "create": ("create", "--parent", "Tasks", "--set", "title=A", "--set", "date:Done at:start=2026-12-10",
+                           "--set", "date:Done at:end=2026-12-01"),
+                "a pages file": ("create", "--parent", "Tasks", "--pages-file", str(self.tmp / "pages.json"))}.items():
+            with self.subTest(name):
+                (self.tmp / "pages.json").write_text(json.dumps(
+                    [{"properties": {"title": "A"}}, {"properties": dict(backwards, title="B")}]))
+                self.fake.calls.clear()
+                code, out, err = self.run_cli(*command)
+                self.assertEqual((code, out), (2, ""), err)
+                self.assertIn("date:Done at: the start 2026-12-10 is after the end 2026-12-01", err)
+                self.assertEqual(self.writes(), [])
+        sent = [
+            ("a start on the day the range ends", days, "Done at=2026-11-28", ("2026-11-28", days[1])),
+            ("a time on the day the range ends", days, "Done at=2026-11-28T23:00:00-03:00",
+             ("2026-11-28T23:00:00-03:00", days[1])),
+            ("a day on the day a range of times ends", timed, "Done at=2026-11-28", ("2026-11-28", timed[1])),
+            ("an instant before the end in another offset", timed, "Done at=2026-11-28T15:00:00-05:00",
+             ("2026-11-28T15:00:00-05:00", timed[1])),
+            ("an end on the day the range starts", days, "date:Done at:end=2026-11-17", (days[0], "2026-11-17")),
+        ]
+        for name, before, assignment, (start, end) in sent:
+            with self.subTest(name):
+                stored(*before)
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("update", PAGE, "--set", assignment)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": {"start": start, "end": end}})
+        with self.subTest("a time with no offset is in the range's time zone"):
+            stored("2026-11-17T09:00:00", "2026-11-28T18:00:00", "America/Sao_Paulo")
+            code, out, err = self.run_cli("update", PAGE, "--set", "Done at=2026-11-28T17:00:00")
+            self.assertEqual(code, 0, err)
+            stored("2026-11-17T09:00:00", "2026-11-28T18:00:00", "America/Sao_Paulo")
+            code, out, err = self.run_cli("update", PAGE, "--set", "Done at=2026-11-28T19:00:00")
+            self.assertEqual(code, 2, out + err)
+
+    def test_the_word_null_is_never_sent_as_a_date(self):
+        """`date:<Property>:end=` clears the end; the empty end as it is printed, null, and its other spellings are
+        read the same in update, create, a pages file and --where, and none of them reaches Notion as a date."""
+        words = ("", "null", "NULL", "Null", "none", "None", " null ")
+        for word in words:
+            with self.subTest(end=word):
+                self.page["properties"]["Done at"]["date"] = {"start": "2026-11-17", "end": "2026-11-28", "time_zone": None}
+                for assignments, expected in (([f"date:Done at:end={word}"], {"start": "2026-11-17"}),
+                                              (["Done at=2026-12-10", f"date:Done at:end={word}"], {"start": "2026-12-10"})):
+                    self.page["properties"]["Done at"]["date"] = {"start": "2026-11-17", "end": "2026-11-28", "time_zone": None}
+                    code, out, err = self.run_cli("update", PAGE, *[p for a in assignments for p in ("--set", a)])
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": expected})
+            for field in ("start", None):
+                with self.subTest(start=word, field=field):
+                    left = "date:Done at:start" if field else "Done at"
+                    code, out, err = self.run_cli("update", PAGE, "--set", f"{left}={word}")
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": None})
+            with self.subTest("create", end=word):
+                code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=A", "--set",
+                                              "date:Done at:start=2026-11-20", "--set", f"date:Done at:end={word}")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": {"start": "2026-11-20"}})
+            for where in (f"\"Done at\" = '{word}'", f"created >= '{word}'", f"\"Done at\" in ('2026-11-20', '{word}')"):
+                with self.subTest(where=where):
+                    self.fake.calls.clear()
+                    code, out, err = self.run_cli("query", "Tasks", "--where", where)
+                    self.assertEqual(code, 2, out + err)
+                    self.assertIn("is empty", err)
+                    self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
+        pages = self.tmp / "pages.json"
+        pages.write_text(json.dumps([{"properties": {"title": "A", "date:Done at:start": "2026-11-20",
+                                                     "date:Done at:end": None}}]))
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--pages-file", str(pages))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": {"start": "2026-11-20"}})
+
     def test_update_prints_properties_as_stored(self):
         code, out, err = self.run_cli("update", PAGE, "--set", "Status=rollout", "--set", "Notes=Weekly export")
         self.assertEqual(code, 0, err)

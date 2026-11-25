@@ -39,6 +39,8 @@ A property named `id` or `url` (any case) is printed as `userDefined:<name>`, an
 | files | `file-upload://<id>` from `notion upload`, or a public url | `--set 'Files=file-upload://<id>'` |
 | page title (page parent) | `title` | `--set 'title=Approved plan'` |
 
+- **A date range is kept.** Writing only the start (`Prop=<date>` or `date:<Property>:start=<date>`) keeps the end the property has, and writing only the end keeps its start. To clear the end, write it with an empty value: `--set 'date:Done at:end='`, alone or beside a new start. An empty start (`--set 'Done at='`) clears the whole date.
+- A write whose range would end before it starts exits `2`, sends nothing and names both dates: a start moved past the end the property keeps, an end before the start it keeps, or the two written in the wrong order. A date with no time is its whole day, so a start on the day the range ends is accepted; a time with no offset is in the property's time zone, else UTC.
 - `title` (or `name`) also names a data source's title property, whatever it is called.
 - A text value that was read and written back keeps its text and its links ([links in text](#links-in-text)). Bold, italic, code and mentions inside a text property are read as plain text ([api-limits.md](api-limits.md)). The `title:` line of a fetch, and every condition, use the plain text.
 - An unknown property or option exits `2` and lists the nearest names; nothing is written. The schema is read again once before refusing, so an option created a minute ago is found, and a property renamed since the schema was cached is refused with its new name among the nearest ones ([setup.md](setup.md#the-cache-cachecdv-notion)).
@@ -98,6 +100,7 @@ Assignee has me
 - The API nests groups two levels deep at most: `(A OR B) AND C` works, a group inside a group inside a group exits `2` naming the group. An `in (...)` counts as a group: `(A AND Status in ('Done', 'Rollout')) OR C` is three levels deep.
 - A date with no time is the whole day **in UTC**, for created and edited times and for date properties: `created = 2026-11-03` is from 00:00 to 24:00 UTC, so a card made at 22:00 on the 2nd in UTC-3 counts on the 3rd. `>` starts after the end of that day, `<=` includes all of it, and a date-time with no offset is UTC too. For a local day write the instants: `created >= 2026-11-03T00:00:00-03:00 AND created < 2026-11-04T00:00:00-03:00`. A date property that holds only a date counts as 00:00 UTC of that date, so an instant with an offset can leave that day's date-only rows out.
 - An unknown property, an operator the type does not have, or a value of the wrong type exits `2` naming the part; nothing is sent.
+- A date is never compared with an empty value: to find rows with no date write `"Done at" is empty` (an empty value, or the word of one, exits `2`).
 - A status value that is not an option but is a status group name matches the whole group (Notion's rule).
 - Formula and rollup properties are not filtered by the condition: use `notion api POST /v1/data_sources/<id>/query --data '<filter json>'`.
 

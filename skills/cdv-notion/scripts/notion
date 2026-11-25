@@ -59,6 +59,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zoneinfo
 from pathlib import Path
 
 API_HOST = 'api.notion.com'
@@ -1486,22 +1487,29 @@ class Notion:
         raise Fail(USAGE, f'{name} is a {kind} property; write it with `notion api PATCH /v1/pages/<id>` and the API shape')
 
     def typed_date(self, name, fields, page):
-        start, end = fields.get('start'), fields.get('end')
-        if start is not None and start.strip() in ('', 'null', 'none'):
+        start, end = (None if fields.get(field) is None else fields[field].strip() for field in ('start', 'end'))
+        if start is not None and no_date(start):
             return {'date': None}
         current = ((page or {}).get('properties', {}).get(name) or {}).get('date') or {}
-        if start is None and end is not None:
+        start_kept, end_kept = start is None, end is None
+        if start_kept and not end_kept:
             start = current.get('start')
             if not start:
                 raise Fail(USAGE, f'date:{name}:end needs a start: the page has none, so pass date:{name}:start too')
         if start is None:
             raise Fail(USAGE, f'date:{name} needs :start')
         value = {'start': start}
-        if end is None:  # only :start given: move the start, keep the range and its time zone
+        if end_kept:  # only :start given: move the start, keep the range and its time zone
             end = current.get('end')
             if current.get('time_zone') and 'T' in start:
                 value['time_zone'] = current['time_zone']
-        if end:
+        if end and not no_date(end):
+            if ends_before_it_starts(start, end, current.get('time_zone') if start_kept or end_kept else None):
+                said = (f'the new start {start} is after the end the property keeps, {end}' if end_kept and end
+                        else f'the new end {end} is before the start the property keeps, {start}' if start_kept
+                        else f'the start {start} is after the end {end}')
+                raise Fail(USAGE, f'date:{name}: {said}; nothing was sent. Set the end with date:{name}:end=<date>, on or '
+                                  f'after the start, or clear it with date:{name}:end= (an empty value)')
             value['end'] = end
         return {'date': value}
 
@@ -1545,6 +1553,32 @@ class Notion:
         if len(exact) == 1:
             return exact
         return [(i, p) for i, p in people.items() if needle in fold(p.get('name')) or needle in fold(p.get('email'))]
+
+
+def no_date(value):
+    """Whether what was written for a date stands for none. The documented form is the empty value; `null`, as an
+    empty end is printed, and `none` are read as it and never sent as a date."""
+    return value.strip().casefold() in ('', 'null', 'none')
+
+
+def ends_before_it_starts(start, end, zone=None):
+    """Whether a date range ends before it starts. A plain date is its whole day, so against one only the days
+    are compared; a time with no offset is in the range's time zone, else UTC. False for what is not a date,
+    which Notion judges."""
+    try:
+        first, last = (datetime.date.fromisoformat(v) if len(v) == 10
+                       else datetime.datetime.fromisoformat(v.replace('Z', '+00:00')) for v in (start, end))
+    except ValueError:
+        return False
+    if not (isinstance(first, datetime.datetime) and isinstance(last, datetime.datetime)):
+        first, last = (m.date() if isinstance(m, datetime.datetime) else m for m in (first, last))
+        return last < first
+    try:
+        local = zoneinfo.ZoneInfo(zone) if zone else datetime.timezone.utc
+    except (ValueError, zoneinfo.ZoneInfoNotFoundError):
+        local = datetime.timezone.utc
+    first, last = (m if m.tzinfo else m.replace(tzinfo=local) for m in (first, last))
+    return last < first
 
 
 def unique_of(properties):
@@ -2661,7 +2695,13 @@ def compile_condition(client, schema, name, operator, values):
         ops = dict(DATE_OPS, **{'in': 'equals'})
         if operator not in ops:
             raise refuse()
-        return either(ops[operator], str)
+
+        def to_date(value):
+            if no_date(value):
+                raise Fail(USAGE, f'{prop_name}: {value!r} is not a date; to find no date write `{name} is empty` in the '
+                                  'condition. Nothing was sent')
+            return value
+        return either(ops[operator], to_date)
     if kind in ('people', 'created_by', 'last_edited_by'):
         ops = {'=': 'contains', 'contains': 'contains', '!=': 'does_not_contain', 'in': 'contains'}
         if operator not in ops:
