@@ -43,15 +43,12 @@ settings in ~/.config/cdv-notion/config.json ({"me": "<your e-mail>", "stamp_com
 import argparse
 import datetime
 import difflib
-import errno
 import getpass
 import http.client
 import json
 import mimetypes
 import os
 import re
-import socket
-import ssl
 import subprocess
 import sys
 import time
@@ -122,8 +119,7 @@ class ApiError(Fail):
 
 
 class WriteInDoubt(Fail):
-    """A write whose request left and that no answer settles (any 5xx, a timeout, a connection lost after
-    it was established): Notion may have applied it."""
+    """A write whose request left and that no answer settles (see write_outcome): Notion may have applied it."""
 
     def __init__(self, what, path, body=None, status=None):
         self.what, self.status, self.path, self.body = what, status, path, body or {}
@@ -154,15 +150,22 @@ class Unsent(ConnectionError):
 def write_outcome(status=None, error=None):
     """What a write that did not come back with a success did, decided here and nowhere else.
 
-    NOT_SENT: the connection could not be established (urllib's Unsent, a refused connection); nothing
-    reached Notion. REFUSED_WRITE: Notion answered 4xx (a 429 once its retries are used up); nothing
-    changed. IN_DOUBT: the request left and no answer says what happened - any 5xx, a timeout, a connection
-    lost after it was established, or any error that does not say whether the request left."""
+    NOT_SENT: the connection could not be established (Unsent, a refused connection); nothing reached Notion.
+    REFUSED_WRITE: Notion answered 4xx (a 429 once its retries are used up); nothing changed. IN_DOUBT: the
+    request left and no answer says what happened - any 5xx, a redirect, a success whose body is not JSON, a
+    timeout, a connection lost after it was established (a TLS error while the answer is read included), or
+    any error that does not say whether the request left."""
     if error is not None:
         return NOT_SENT if isinstance(error, (Unsent, ConnectionRefusedError)) else IN_DOUBT
     if status is not None and 400 <= status < 500:
         return REFUSED_WRITE
     return IN_DOUBT
+
+
+def said_by(error):
+    """An exception in one line: its name, unless it is one of the transport's own, and what it says."""
+    said = ' '.join(str(error).split())
+    return said if said and type(error) in (ConnectionError, Unsent) else f'{type(error).__name__}: {said}'.rstrip(': ')
 
 
 def is_write(method, path):
@@ -187,11 +190,14 @@ def origin(url):
 
 
 class SameHostRedirects(urllib.request.HTTPRedirectHandler):
-    """Follow a redirect, but carry the token only when the scheme, the host and the port all stay the same:
-    never to another host or port, and never from https to http. A relative redirect stays (urllib has
-    already joined it to the request's url)."""
+    """Follow a redirect of a GET, but carry the token only when the scheme, the host and the port all stay the
+    same: never to another host or port, and never from https to http. A relative redirect stays (urllib has
+    already joined it to the request's url). Any other method is not followed: urllib would send a POST again
+    as a GET, whose answer says nothing about the write."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.get_method() not in ('GET', 'HEAD'):
+            return None
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None and (origin(newurl) is None or origin(newurl) != origin(req.full_url)):
             for name in list(new.headers):
@@ -200,35 +206,63 @@ class SameHostRedirects(urllib.request.HTTPRedirectHandler):
         return new
 
 
-_OPENER = urllib.request.build_opener(SameHostRedirects())
+class Dialled:
+    """A connection whose connect() says Unsent when it fails - the name, the route, the refusal, the TLS
+    handshake, a timeout - because only there is it certain that no byte of the request left."""
+
+    def connect(self):
+        try:
+            super().connect()
+        except OSError as error:
+            raise Unsent(said_by(error))
 
 
-def never_left(reason):
-    """Whether urllib's reason proves the request never left: the name did not resolve, the connection was
-    refused, no route reached the host, or the certificate was refused before anything was sent. A reset,
-    any other TLS or socket error, or a timeout may have come after the request left."""
-    if isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)):
-        return True
-    return isinstance(reason, OSError) and reason.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH)
+class DialledHTTP(Dialled, http.client.HTTPConnection):
+    pass
+
+
+class DialledHTTPS(Dialled, http.client.HTTPSConnection):
+    pass
+
+
+class DialHTTP(urllib.request.HTTPHandler):
+    def do_open(self, http_class, req, **options):
+        return super().do_open(DialledHTTP, req, **options)
+
+
+class DialHTTPS(urllib.request.HTTPSHandler):
+    def do_open(self, http_class, req, **options):
+        return super().do_open(DialledHTTPS, req, **options)
+
+
+_OPENER = urllib.request.build_opener(SameHostRedirects(), DialHTTP(), DialHTTPS())
+
+
+def answer_body(error):
+    """The body of an answer that is not a success; its status is the answer, so a body lost on the way is empty."""
+    try:
+        return error.read()
+    except (OSError, http.client.HTTPException):
+        return b''
 
 
 def urllib_transport(method, url, headers, body=None, timeout=60):
+    """(status, headers, body), or Unsent when the connection could not be established, TimeoutError when no
+    answer came in time, and ConnectionError for any other failure: once connected, the request may have left."""
     request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
     try:
         with _OPENER.open(request, timeout=timeout) as response:
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as error:
-        return error.code, dict((error.headers or {}).items()), error.read()
-    except urllib.error.URLError as error:  # raised while connecting or sending the request
-        if isinstance(error.reason, (socket.timeout, TimeoutError)):
-            raise TimeoutError(str(error.reason))
-        if never_left(error.reason):
-            raise Unsent(str(error.reason))
-        raise ConnectionError(str(error.reason))
-    except (socket.timeout, TimeoutError) as error:
-        raise TimeoutError(str(error))
-    except http.client.HTTPException as error:  # the server closed or broke its answer after the request left
-        raise ConnectionError(f'{type(error).__name__}: {error}')
+        return error.code, dict((error.headers or {}).items()), answer_body(error)
+    except (OSError, http.client.HTTPException) as error:
+        # urllib wraps what connecting and sending raise in a URLError, and lets the rest (reading) through raw
+        reason = error.reason if isinstance(error, urllib.error.URLError) else error
+        if isinstance(reason, Unsent):
+            raise reason
+        if isinstance(reason, TimeoutError):
+            raise TimeoutError(str(reason))
+        raise ConnectionError(said_by(reason) if isinstance(reason, Exception) else str(reason))
 
 
 TRANSPORT = urllib_transport
@@ -575,7 +609,7 @@ class Notion:
             return Fail(REFUSED, with_words(cause, outcome), outcome, cause)
         if error is not None:
             what = ('api.notion.com did not answer in time' if isinstance(error, TimeoutError)
-                    else f'the connection failed after the request may have left ({error})')
+                    else f'the connection failed after the request may have left ({said_by(error)})')
             return WriteInDoubt(what, path)
         if retries is not None:
             cause = f'Notion kept answering {status} (rate limited) on {path} after {retries} retries'
@@ -583,7 +617,8 @@ class Notion:
                 return WriteInDoubt(f'Notion kept answering {status} after {retries} retries', path, parsed, status)
             return Fail(REFUSED, with_words(cause, outcome) + '; wait a minute and run it again', outcome, cause)
         if outcome == IN_DOUBT:
-            return WriteInDoubt(f'Notion answered {status}', path, parsed, status)
+            unread = ' with a body that is not JSON' if 200 <= status < 300 else ''
+            return WriteInDoubt(f'Notion answered {status}{unread}', path, parsed, status)
         return ApiError(status, parsed.get('code', ''), parsed.get('message', ''), parsed, path, outcome)
 
     def send(self, method, path, body=None, query=None, raw=None, content_type=None, write=None):
@@ -617,10 +652,14 @@ class Notion:
                     SLEEP(server)
                     continue
                 raise Fail(REFUSED, f'api.notion.com did not answer {method} {path} in time')
-            except ConnectionError as error:
+            except (OSError, http.client.HTTPException) as error:
                 if write:
                     raise self.write_failed(path, error=error)
-                raise Fail(REFUSED, f'could not reach api.notion.com: {error}')
+                raise Fail(REFUSED, f'could not reach api.notion.com: {said_by(error)}')
+            except Exception as error:
+                if write:  # whatever else the transport raised does not say that the request never left
+                    raise self.write_failed(path, error=error)
+                raise
             parsed = self.parse(payload)
             if status == 529 and write:  # "overloaded" is a 5xx: the write may have been applied, so never resend it
                 raise self.write_failed(path, status, parsed)
@@ -643,7 +682,21 @@ class Notion:
                                      f'expired or mistyped): {LOGIN_HINT} again', write_outcome(401) if write else None)
             if write and not 200 <= status < 300 and write_outcome(status) == IN_DOUBT:
                 raise self.write_failed(path, status, parsed)
+            if 200 <= status < 300 and not self.is_answer(payload):
+                # A proxy's page, or the API's answer cut short: it does not say whether the write was applied.
+                if write:
+                    raise self.write_failed(path, status, {})
+                raise Fail(REFUSED, f'Notion answered {status} on {method} {path} with a body that is not JSON; '
+                                    'a proxy or a sign-in page may stand between this machine and api.notion.com')
             return status, parsed
+
+    @staticmethod
+    def is_answer(payload):
+        """Whether the body of a success is one the API sends: a JSON object, or a list of them."""
+        try:
+            return isinstance(json.loads(payload), (dict, list))
+        except ValueError:
+            return False
 
     @staticmethod
     def parse(payload):
