@@ -124,7 +124,7 @@ def with_words(cause, outcome):
 class ApiError(Fail):
     def __init__(self, status, code, message, body, path, outcome=None):
         self.status, self.api_code, self.api_message, self.body, self.path = status, code, message, body, path
-        cause = f'Notion answered {status} {code} on {path}: {message}'
+        cause = f"Notion answered {' '.join(filter(None, (str(status), code)))} on {path}" + (f': {message}' if message else '')
         super().__init__(USAGE if status == 400 else REFUSED, with_words(cause, outcome), outcome, cause)
 
 
@@ -2367,6 +2367,7 @@ def report_writes(kind, done, label, failure, rest, total=None, where='', misses
     else:
         advice = (f'it may have been created and may still appear, so look for a page titled {label} in {where} '
                   'before creating it again' if create
+                  else 'it may have been applied, and nothing uses it' if kind == 'upload'
                   else 'it may have been applied, so fetch the page and check it before running that part again')
         failed = f'In doubt: {label} ({failure.cause}): {advice}'
         again = ('Rerun with only the pages not sent' if create else 'Rerun only what was not sent') if rest else ''
@@ -3326,12 +3327,18 @@ def cmd_upload(client, args):
             f'Content-Type: {mime}\r\n\r\n').encode('utf-8') + path.read_bytes() + f'\r\n--{boundary}--\r\n'.encode('utf-8')
     try:
         created = client.call('POST', '/v1/file_uploads', {'filename': path.name, 'content_type': mime})
-        sent = client.call('POST', f"/v1/file_uploads/{created['id']}/send", raw=data,
-                           content_type=f'multipart/form-data; boundary={boundary}')
     except ApiError as error:
         if error.status == 400:
             error.code = REFUSED  # the plan's Surface: a file the API refuses exits 1
         raise
+    try:
+        sent = client.call('POST', f"/v1/file_uploads/{created['id']}/send", raw=data,
+                           content_type=f'multipart/form-data; boundary={boundary}')
+    except Fail as failure:
+        report = report_writes('upload', [f"the upload object {created['id']}, on no page, which expires by itself"], f'the content of {path.name}',
+                               failure, [], where=path.name, finish='Run `notion upload` again: it makes a new one')
+        report.code = NO_TOKEN if failure.code == NO_TOKEN else REFUSED  # the same: the object is nothing to go on from
+        raise report
     reference = f"file-upload://{created['id']}"
     client.say(f"uploaded {path.name} ({sent.get('status', 'sent')}): within one hour, put this line in a body "
                '(`notion create` or `notion update`, which place the file)')

@@ -1943,6 +1943,34 @@ class WriteOutcomeTest(ClientTestCase):
                 self.assertIn("In doubt: 'Nowhere'", err)
                 self.assertNotIn("None", out + err)
 
+    def test_an_upload_whose_content_does_not_arrive_says_what_was_made(self):
+        shot = self.tmp / "screen.png"
+        shot.write_bytes(b"png")
+        for outcome, case in WRITE_OUTCOMES.items():
+            with self.subTest(outcome=outcome):
+                self.fake.overrides.clear()
+                self.fake.calls.clear()
+                self.fake.on("POST", r"/v1/file_uploads/[^/]+/send", ends_in(outcome))
+                code, out, err = self.run_cli("upload", shot)
+                self.assertEqual((code, out), (1, ""), err)
+                upload = self.fake.sent("POST", r"/v1/file_uploads/[^/]+/send")[0].path.split("/")[3]
+                self.assert_case(case, err, landed=True)
+                self.assertIn(f"written: the upload object {upload}, on no page, which expires by itself. ", err)
+                label = {"refused": "Not written", "not sent": "Not sent", "in doubt": "In doubt"}[case]
+                self.assertIn(f"{label}: the content of screen.png (", err)
+                self.assertIn("Run `notion upload` again", err)
+                self.assertEqual(len(self.fake.sent("POST", r"/v1/file_uploads")), 1)
+        self.fake.on("POST", r"/v1/file_uploads/[^/]+/send", lambda r: error(401, "unauthorized", "No."))
+        self.assertEqual(self.run_cli("upload", shot)[0], 3)
+
+    def test_an_answer_with_no_code_or_message_is_said_in_whole_words(self):
+        self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", lambda r: (302, b""))
+        code, out, err = self.run_cli("query", COLLECTION + DS_TASKS)
+        self.assertEqual((code, err), (1, f"Notion answered 302 on /v1/data_sources/{DS_TASKS}/query\n"))
+        self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", lambda r: error(403, "restricted_resource", "No."))
+        code, out, err = self.run_cli("query", COLLECTION + DS_TASKS)
+        self.assertEqual((code, err), (1, f"Notion answered 403 restricted_resource on /v1/data_sources/{DS_TASKS}/query: No.\n"))
+
     def serve_once(self, answer, reset=False):
         """A local server that reads one request, sends `answer` and closes, with a reset when asked to: its port,
         and the list of the requests it read."""
