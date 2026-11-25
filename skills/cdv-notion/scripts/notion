@@ -1491,11 +1491,9 @@ class Notion:
     def property_name(self, wanted, page_schema, quiet):
         """The schema's name for `wanted`; None (quiet) or a USAGE failure naming the nearest names."""
         properties = page_schema['properties']
-        if wanted in properties:
-            return wanted
-        for name in properties:
-            if name.casefold() == wanted.casefold():
-                return name
+        called = property_called(properties, wanted)
+        if called:
+            return called
         if wanted.casefold() in ('title', 'name'):
             for name, prop in properties.items():
                 if prop.get('type') == 'title':
@@ -1518,8 +1516,6 @@ class Notion:
             date_key = re.fullmatch(r'date:(.+):(start|end|is_datetime)', left)
             if date_key:
                 left, field = date_key.group(1), date_key.group(2)
-            if left.startswith('userDefined:'):
-                left = left[len('userDefined:'):]
             name = self.look_up(page_schema, lambda schema: self.property_name(left, schema, quiet=True))
             name = name or self.property_name(left, page_schema, quiet=False)
             prop = page_schema['properties'][name]
@@ -1686,10 +1682,24 @@ def unique_of(properties):
     return None, None
 
 
+USER_DEFINED = 'userDefined:'
+
+
 def short_label(name):
     """The short format's key for a property: `id` and `url` are the page's own, so a property of one of those
     names (any case) is under userDefined:<name>."""
-    return f'userDefined:{name}' if name.lower() in ('id', 'url') else name
+    return USER_DEFINED + name if name.lower() in ('id', 'url') else name
+
+
+def property_called(properties, wanted):
+    """The name of the property a command calls `wanted`: by that name, by it in any case, or by it under the
+    userDefined: prefix short_label() prints; None when there is none."""
+    plain_name = wanted[len(USER_DEFINED):] if wanted.casefold().startswith(USER_DEFINED.casefold()) else wanted
+    for said in dict.fromkeys((wanted, plain_name)):
+        for name in (said, *(name for name in properties if name.casefold() == said.casefold())):
+            if name in properties:
+                return name
+    return None
 
 
 def value_named(values, name):
@@ -2851,11 +2861,9 @@ def where_property(schema, name, client=None):
     unique id and the title property under `id`/`key` and `title`/`name`."""
     def find(schema):
         properties = schema['properties']
-        if name in properties:
-            return name, properties[name]
-        for candidate, prop in properties.items():
-            if candidate.casefold() == name.casefold():
-                return candidate, prop
+        called = property_called(properties, name)
+        if called:
+            return called, properties[called]
         lowered = name.casefold()
         if lowered in ('created', 'created_time'):
             return 'created_time', {'type': 'timestamp'}
@@ -3220,8 +3228,8 @@ def cmd_search(client, args):
         client.say(' | '.join(filter(None, [key, title, page.get('url', ''), where, f'matched: {matched}'])))
     if len(hits) > limit:
         client.say(f"… {'at least ' if capped else ''}{len(hits) - limit} more hits (--limit N shows them)")
-    elif capped:  # the rows not read may be hits already counted, or none: only "at least 0" is sure
-        client.say('… at least 0 more hits: a source was cut short, so more may match (a higher --limit reads further)')
+    elif capped:  # the rows not read may be hits already counted, or none: no number is sure
+        client.say('… more may match: a source was cut short (a higher --limit reads further)')
     return DONE
 
 

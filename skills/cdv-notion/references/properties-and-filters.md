@@ -21,7 +21,7 @@ The client reads and writes properties in the short format the Notion MCP used, 
 | formula, rollup | the computed value (read-only) |
 | files | the file names |
 
-A property named `id` or `url` (any case) is printed as `userDefined:<name>`, and may be written either way.
+A property named `id` or `url` (any case) is printed as `userDefined:<name>`, and that name is taken wherever a property name is (`--set`, `--where`, `--order`, `--select`, `--group-by`), as the plain one is.
 
 ## Writing: `--set 'Prop=value'`
 

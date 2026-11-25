@@ -2814,6 +2814,32 @@ class QueryTest(ClientTestCase):
                 code, out, err = self.run_cli("query", coll, "--select", ",".join(groups), "--json")
                 self.assertEqual(json.loads(out)[0]["properties"], stored)
 
+    def test_the_name_a_built_in_clash_is_printed_under_is_taken_everywhere(self):
+        self.page["properties"]["Pull Request"] = {"id": "pr", "type": "url", "url": "https://example.com/pr/1"}
+        self.named_like_built_ins(Task_ID="ID", Notes="url", Pull_Request="userDefined:odd", Done_at="Id")
+        coll, query = COLLECTION + DS_TASKS, rf"/v1/data_sources/{DS_TASKS}/query"
+        code, out, err = self.run_cli("query", coll, "--json")
+        printed = [name for name in json.loads(out)[0]["properties"] if name.startswith("userDefined:")]
+        self.assertEqual(sorted(printed), ["userDefined:ID", "userDefined:odd", "userDefined:url"])
+        real = {"userDefined:ID": "ID", "userDefined:url": "url", "userDefined:odd": "userDefined:odd", "userdefined:URL": "url"}
+        for name, prop in real.items():
+            with self.subTest(name):
+                code, out, err = self.run_cli("query", coll, "--where", f"{name} is not empty" if prop != "ID" else f"{name} = 120")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.fake.sent("POST", query)[-1].json["filter"]["property"], prop)
+                code, out, err = self.run_cli("query", coll, "--order", f"{name} desc", "--select", name)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.fake.sent("POST", query)[-1].json["sorts"], [{"property": prop, "direction": "descending"}])
+                self.assertEqual(out.splitlines()[0], f"{prop} | url")
+                self.assertNotIn("(empty)", self.run_cli("query", coll, "--group-by", name)[1])
+                if prop != "ID":  # the unique id is computed
+                    code, out, err = self.run_cli("update", PAGE, "--set", f"{name}=https://example.com/2")
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(list(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]), [prop])
+        for where in (("--where", "userDefined:nothing = 1"), ("--order", "userDefined:nothing"), ("--select", "userDefined:created"), ("--group-by", "userDefined:")):
+            with self.subTest(where):  # the prefix names a property, never a built-in column
+                self.assertEqual(self.run_cli("query", coll, *where)[0], 2)
+
     def test_the_write_check_reads_back_a_property_named_like_a_built_in_column(self):
         for name in ("ID", "url"):
             with self.subTest(checkbox=name):
@@ -3036,7 +3062,7 @@ class SearchTest(ClientTestCase):
         within = ("search", "invoice", "--in", COLLECTION + DS_TASKS)
         merged = ("search", "invoice")
         silent = None
-        unsure = "… at least 0 more hits: a source was cut short, so more may match (a higher --limit reads further)"
+        unsure = "… more may match: a source was cut short (a higher --limit reads further)"
         invoices = [task_page(uid(0x30000 + i), 4000 + i, f"Invoice {i}") for i in range(130)]
         trashed = [dict(row, in_trash=True) for row in invoices]
 
