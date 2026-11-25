@@ -180,8 +180,8 @@ def write_outcome(status=None, error=None):
 
     NOT_SENT: the connection could not be established (Unsent, a refused connection); nothing reached Notion.
     REFUSED_WRITE: Notion answered 4xx (a 429 once its retries are used up); nothing changed. IN_DOUBT: the
-    request left and no answer says what happened - any 5xx, a redirect, a success whose body is not JSON, a
-    timeout, a connection lost after it was established (a TLS error while the answer is read included), or
+    request left and no answer says what happened - any 5xx, a redirect, a success whose body is not what that
+    write answers (answers_write), a timeout, a connection lost after it was established (a TLS error while the answer is read included), or
     any error that does not say whether the request left."""
     if error is not None:
         return NOT_SENT if isinstance(error, (Unsent, ConnectionRefusedError)) else IN_DOUBT
@@ -197,7 +197,29 @@ def said_by(error):
 
 
 def is_write(method, path):
-    return method != 'GET' and not path.endswith('/query') and path != '/v1/search'
+    return method not in ('GET', 'HEAD') and not path.endswith('/query') and path != '/v1/search'
+
+
+def answers_write(path, said):
+    """Whether a success has the shape that write's endpoint returns, the only proof that the write was applied: an API
+    object with an id, or, from an endpoint that answers a list (a block's children, one this client does not know),
+    a list of results."""
+    if not isinstance(said, dict) or not isinstance(said.get('object'), str) or said['object'] == 'error':
+        return False
+    if isinstance(said.get('id'), str) and said['id']:
+        return True
+    one = re.match(r'/v1/(pages|blocks|comments|file_uploads)(/|$)', path) and not path.endswith('/children')
+    return not one and isinstance(said.get('results'), list)
+
+
+def extra_of(answer):
+    """What the API adds to an error (`additional_data`), {} when it is not an object."""
+    extra = answer.get('additional_data')
+    return extra if isinstance(extra, dict) else {}
+
+
+def url_of(page):
+    return page.get('url') or page_link(page['id'])
 
 
 # ---------------------------------------------------------------------------------------------
@@ -778,7 +800,7 @@ class Notion:
                 return WriteInDoubt(f'Notion kept answering {status} after {retries} retries', path, parsed, status)
             return Fail(REFUSED, with_words(cause, outcome) + '; wait a minute and run it again', outcome, cause)
         if outcome == IN_DOUBT:
-            unread = ' with a body that is not JSON' if 200 <= status < 300 else ''
+            unread = ' with a body that is not what that write answers' if 200 <= status < 300 else ''
             return WriteInDoubt(f'Notion answered {status}{unread}', path, parsed, status)
         return ApiError(status, parsed.get('code', ''), parsed.get('message', ''), parsed, path, outcome)
 
@@ -825,7 +847,7 @@ class Notion:
             if status == 529 and write:  # "overloaded" is a 5xx: the write may have been applied, so never resend it
                 raise self.write_failed(path, status, parsed)
             if status in (429, 529):
-                reason = (parsed.get('additional_data') or {}).get('rate_limit_reason', '')
+                reason = extra_of(parsed).get('rate_limit_reason', '')
                 if limited >= MAX_RETRIES or reason == 'public_api_request_blocked':
                     if write:
                         raise self.write_failed(path, status, parsed, retries=limited)
@@ -843,21 +865,23 @@ class Notion:
                                      f'expired or mistyped): {LOGIN_HINT} again', write_outcome(401) if write else None)
             if write and not 200 <= status < 300 and write_outcome(status) == IN_DOUBT:
                 raise self.write_failed(path, status, parsed)
-            if 200 <= status < 300 and not self.is_answer(payload):
+            if 200 <= status < 300 and method != 'HEAD' and not self.is_answer(payload, path if write else None):
                 # A proxy's page, or the API's answer cut short: it does not say whether the write was applied.
                 if write:
-                    raise self.write_failed(path, status, {})
+                    raise self.write_failed(path, status, parsed)
                 raise Fail(REFUSED, f'Notion answered {status} on {method} {path} with a body that is not JSON; '
                                     'a proxy or a sign-in page may stand between this machine and api.notion.com')
             return status, parsed
 
     @staticmethod
-    def is_answer(payload):
-        """Whether the body of a success is one the API sends: a JSON object, or a list of them."""
+    def is_answer(payload, written=None):
+        """Whether the body of a success is one the API sends: a JSON object, or a list of them; for the write to
+        the path `written`, the object that write answers."""
         try:
-            return isinstance(json.loads(payload), (dict, list))
+            said = json.loads(payload)
         except ValueError:
             return False
+        return isinstance(said, (dict, list)) if written is None else answers_write(written, said)
 
     @staticmethod
     def parse(payload):
@@ -878,7 +902,7 @@ class Notion:
                     return int(seconds) if seconds.is_integer() else seconds
                 except ValueError:
                     break
-        given = (parsed.get('additional_data') or {}).get('retry_after')
+        given = extra_of(parsed).get('retry_after')
         if isinstance(given, (int, float)):
             return given
         return min(2 ** attempt, 60)
@@ -2372,8 +2396,8 @@ def cmd_create(client, args):
                           + (f'. {then}' if then else ''))
             raise report_writes('create', created, repr(title or '(untitled)'), failure, rest, total=len(payloads),
                                 where=where, finish=finish)
-        seen.add(page.get('id'))
-        created.append(page.get('url') or page.get('id', ''))
+        seen.add(page['id'])
+        created.append(url_of(page))
         heading = dropped_heading(payload.get('markdown')) if title else ''
         if heading:
             client.warn(f'warning: Notion takes the only `#` heading of a body for a title when it is the first line, so '
@@ -2398,7 +2422,7 @@ def create_one(client, kind, parent, payload, title, started, seen=(), where='')
             raise CreateInDoubt(doubt, title, where)
         note = (f' ({doubt.what}; not sent again: found by its title among the pages this '
                 'integration made since the minute the command started; check it is the new page)')
-    client.say(f"created {page.get('url')} {client.key_of(page)}".rstrip() + note)
+    client.say(f"created {url_of(page)} {client.key_of(page)}".rstrip() + note)
     return page
 
 
@@ -2412,10 +2436,12 @@ def dropped_heading(markdown):
 
 def find_created(client, kind, parent, title, started, doubt, seen=()):
     """The page a create in doubt may have made: never one this run already created or found (`seen`)."""
-    committed = (doubt.body.get('additional_data') or {}).get('committed_resource_id')
-    if committed and committed not in seen:
+    committed = extra_of(doubt.body).get('committed_resource_id')
+    if isinstance(committed, str) and committed not in seen:
         try:
-            return client.call('GET', f'/v1/pages/{committed}')
+            page = client.call('GET', f'/v1/pages/{committed}')
+            if page.get('id'):
+                return page
         except ApiError:
             pass
     if not title:
@@ -2439,7 +2465,7 @@ def find_created(client, kind, parent, title, started, doubt, seen=()):
             if p.get('parent', {}).get('page_id') == parent['id']]
     # The filter is not trusted alone: each candidate is checked here too, its creator and its time.
     for candidate in candidates:
-        if candidate.get('id') in seen:
+        if candidate.get('id') in (None, *seen):
             continue  # a page this run created or already took for another create in doubt
         if ((candidate.get('created_by') or {}).get('id') == bot and client.title_of(candidate) == title
                 and created_at_or_after(candidate, started)):
@@ -3123,7 +3149,7 @@ def cmd_comments(client, args):
     if signed:
         payload['display_name'] = signed
     stored = client.call('POST', '/v1/comments', payload)
-    client.say(f"comment {stored.get('id')} in discussion {stored.get('discussion_id')}")
+    client.say(f"comment {stored['id']}" + (f" in discussion {stored['discussion_id']}" if stored.get('discussion_id') else ''))
     return DONE
 
 
@@ -3389,7 +3415,7 @@ def cmd_doctor(client, args):
 
 def trash_check_card(client, page, title, step):
     """Trash the write check's card and read it back; when that fails, say which card to trash by hand."""
-    by_hand = f"trash the card {title!r} by hand: {page.get('url')}"
+    by_hand = f"trash the card {title!r} by hand: {url_of(page)}"
     try:
         client.call('PATCH', f"/v1/pages/{page['id']}", {'in_trash': True})
         trashed = client.call('GET', f"/v1/pages/{page['id']}").get('in_trash')
@@ -3410,7 +3436,7 @@ def trash_lost_check_card(client, schema, title, started, doubt, step):
         except Fail as failure:
             why = f'it could not be looked for ({failure.cause})'
         if found is not None and client.title_of(found) == title:
-            client.say(f"write check create: the card was made and was found by its title, {found.get('url')}")
+            client.say(f"write check create: the card was made and was found by its title, {url_of(found)}")
             return trash_check_card(client, found, title, step)
     where = f"data source {plain(schema.get('title')) or schema['id']} ({COLLECTION}{schema['id']})"
     step('trash', False, f'{why}; it may still appear, so look for a card titled {title!r} in {where} and trash it by hand')
@@ -3440,7 +3466,7 @@ def write_check(client, args):
     try:
         page = client.call('POST', '/v1/pages', {'parent': {'data_source_id': schema['id']},
                                                   'properties': {title_prop: {'title': rich_text(title)}}})
-        step('create', client.title_of(page) == title, f"the title read back differs, {page.get('url')}", where=page.get('url'))
+        step('create', client.title_of(page) == title, f'the title read back differs, {url_of(page)}', where=url_of(page))
     except WriteInDoubt as doubt:
         step('create', False, doubt.message)
         trash_lost_check_card(client, schema, title, started.replace(second=0, microsecond=0), doubt, step)

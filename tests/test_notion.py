@@ -1753,7 +1753,8 @@ class CreateTest(ClientTestCase):
 WRITE_OUTCOMES = {  # how a write's request ends -> which of the three cases the client must say it is
     "400": "refused", "429": "refused", "500": "in doubt", "502": "in doubt", "503": "in doubt",
     "504": "in doubt", "529": "in doubt", "timeout": "in doubt", "reset": "in doubt", "unreachable": "not sent",
-    "302": "in doubt", "200 not json": "in doubt", "200 cut": "in doubt", "200 empty": "in doubt", "200 scalar": "in doubt",
+    "302": "in doubt", "200 {}": "in doubt", "200 []": "in doubt", "200 message": "in doubt", "200 error": "in doubt",
+    "200 no id": "in doubt", "200 null id": "in doubt", "200 list": "in doubt", "200 id alone": "in doubt", "200 not json": "in doubt", "200 cut": "in doubt", "200 empty": "in doubt", "200 scalar": "in doubt",
     "tls eof": "in doubt", "tls other": "in doubt", "incomplete": "in doubt", "disconnected": "in doubt",
     "broken answer": "in doubt", "pipe": "in doubt", "os error": "in doubt", "any other": "in doubt",
 }
@@ -1773,6 +1774,12 @@ UNREADABLE = {  # a success whose body is not the API's answer
     "200 not json": b"<html>Sign in to the network</html>", "200 cut": b'{"object": "page", "id"', "200 empty": b"", "200 scalar": b'"ok"',
 }
 
+OTHER_SHAPE = {  # a success whose body is JSON, and not what a write to a page, a block, a comment or an upload answers
+    "200 {}": {}, "200 []": [], "200 message": {"message": "sign in"}, "200 no id": {"object": "page", "url": "https://example.com/"},
+    "200 error": {"object": "error", "id": uid(0xE0), "status": 503, "code": "busy", "additional_data": "none"},
+    "200 null id": {"object": "page", "id": None}, "200 list": {"object": "list", "results": []}, "200 id alone": {"id": uid(0xE1)},
+}
+
 
 def ends_in(outcome):
     """A fake answer for a write: a status, a success that cannot be read, a connection lost after the request
@@ -1782,6 +1789,8 @@ def ends_in(outcome):
             raise LOST[outcome]
         if outcome in UNREADABLE:
             return 200, UNREADABLE[outcome]
+        if outcome in OTHER_SHAPE:
+            return 200, OTHER_SHAPE[outcome]
         if outcome == "unreachable":
             raise ConnectionRefusedError(111, "Connection refused")
         status = int(outcome)
@@ -1859,6 +1868,40 @@ class WriteOutcomeTest(ClientTestCase):
                 for words in ("Notion refused it and nothing changed" if doc == "SKILL.md" else "refused",
                               "never left", "in doubt", "any 5xx", "a timeout", "after the request left"):
                     self.assertIn(words.casefold(), said.casefold())
+
+    def test_what_a_write_answers_is_judged_by_its_endpoint(self):
+        answers = [  # path, answer, whether it proves the write
+            ("/v1/pages", {"object": "page", "id": uid(1)}, True), (f"/v1/pages/{PAGE}/markdown", {"object": "page_markdown", "id": uid(1)}, True),
+            (f"/v1/blocks/{PAGE}/children", {"object": "list", "results": []}, True), (f"/v1/blocks/{PAGE}/children", {"object": "list"}, False),
+            (f"/v1/blocks/{PAGE}", {"object": "list", "results": []}, False), ("/v1/comments", {"object": "list", "results": []}, False),
+            ("/v1/data_sources", {"object": "data_source", "id": uid(1)}, True), ("/v1/something", {"object": "list", "results": []}, True),
+            ("/v1/something", {"object": "list", "results": "none"}, False), ("/v1/something", {"object": "ok"}, False),
+            ("/v1/pages", {"object": "page", "id": ""}, False), ("/v1/pages", {"object": "page", "id": 7}, False), ("/v1/pages", "page", False),
+        ]
+        for path, answer, proves in answers:
+            with self.subTest(path=path, answer=answer):
+                self.assertEqual(self.n.answers_write(path, answer), proves)
+        self.assertFalse(self.n.is_write("HEAD", "/v1/pages"))
+        # a partial object is a page or a comment like any other, and nothing is printed as None
+        self.fake.on("POST", r"/v1/pages", lambda r: (200, {"object": "page", "id": uid(0x31)}))
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Partial")
+        self.assertEqual((code, out.strip()), (0, "created " + page_url(uid(0x31))), err)
+        self.fake.on("POST", r"/v1/comments", lambda r: (200, {"object": "comment", "id": uid(0x32)}))
+        code, out, err = self.run_cli("comments", "add", PAGE, "--body", "Ready")
+        self.assertEqual((code, out.strip()), (0, "comment " + uid(0x32)), err)
+        # the answer of another shape is shown by `api`, and a create whose answer names a page reads that page
+        self.fake.on("POST", r"/v1/comments", lambda r: (200, {"message": "sign in"}))
+        code, out, err = self.run_cli("api", "POST", "/v1/comments", "--data", "{}")
+        self.assertEqual((code, json.loads(out)), (1, {"message": "sign in"}), err)
+        for named in (uid(0x33), [uid(0x33)], {"id": uid(0x33)}):
+            with self.subTest(committed=named):
+                self.fake.on("GET", rf"/v1/pages/{uid(0x33)}", lambda r: (200, {}))
+                self.fake.on("POST", r"/v1/pages", lambda r, named=named: (503, dict(error(503, "x", "y")[1], additional_data={
+                    "committed_resource_id": named})))
+                code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Nowhere")
+                self.assertEqual(code, 1)
+                self.assertIn("In doubt: 'Nowhere'", err)
+                self.assertNotIn("None", out + err)
 
     def serve_once(self, answer, reset=False):
         """A local server that reads one request, sends `answer` and closes, with a reset when asked to: its port,
@@ -1972,7 +2015,7 @@ class WriteOutcomeTest(ClientTestCase):
         note = self.tmp / "note.md"
         note.write_text("Shipped.\n")
         before = self.fake.markdown[PAGE]
-        lost = {kind: ends_in(kind) for kind in (*LOST, *UNREADABLE)}
+        lost = {kind: ends_in(kind) for kind in (*LOST, *UNREADABLE, *OTHER_SHAPE)}
         for kind, fails in lost.items():
             with self.subTest(update=kind):
                 self.fake.overrides.clear()
@@ -3162,7 +3205,8 @@ class FilesTest(ClientTestCase):
         body = self.tmp / "body.md"
         # a block that took its file and still holds the placeholder
         body.write_text(f"![a](file-upload://{one})\n\n![b](file-upload://{two})\n")
-        self.fake.on("PATCH", r"/v1/blocks/[^/]+", lambda r: (200, {}) if two in json.dumps(r.json) else None)
+        self.fake.on("PATCH", r"/v1/blocks/[^/]+", lambda r: (200, self.fake.blocks[r.path.split("/")[3]])
+                     if two in json.dumps(r.json) else None)
         code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
         self.assertEqual(code, 4, err)
         self.assertIn(f"file 'a' ({one}) placed in block", err)
@@ -3956,7 +4000,7 @@ class DoctorTest(ClientTestCase):
             state["lookups"] += checks(r)
             return (200, {"results": [], "has_more": False}) if checks(r) and state["lookups"] < 3 else None
 
-        for kind in ("500", "502", "503", "504", "529", *LOST, *UNREADABLE):
+        for kind in ("500", "502", "503", "504", "529", *LOST, *UNREADABLE, *OTHER_SHAPE):
             for landed, lookup in ((True, "found"), (True, "late"), (True, "403"), (True, "timeout"), (False, "found")):
                 with self.subTest(create=kind, landed=landed, lookup=lookup):
                     self.fake.overrides.clear()
@@ -3992,7 +4036,7 @@ class DoctorTest(ClientTestCase):
                         self.assertIn(f"look for a card titled {title!r} in {where} and trash it by hand", out)
 
         # the card was made and answered, and the request that trashes it is lost: the card is named
-        for kind in (*LOST, *UNREADABLE, "400", "503"):
+        for kind in (*LOST, *UNREADABLE, *OTHER_SHAPE, "400", "503"):
             with self.subTest(trash=kind):
                 self.fake.overrides.clear()
                 self.fake.pages = {PAGE: self.page}
@@ -4781,6 +4825,16 @@ class ApiTest(ClientTestCase):
                 self.assertEqual(code, 2)
                 self.assertIn("/v1/", err)
         self.assertEqual(self.fake.calls, [])
+
+    def test_api_head_is_a_read(self):
+        for body in (b"", b"not json"):
+            self.fake.on("HEAD", rf"/v1/pages/{PAGE}", lambda r, body=body: (200, body))
+            code, out, err = self.run_cli("api", "HEAD", f"/v1/pages/{PAGE}")
+            self.assertEqual((code, err), (0, ""))
+        self.fake.on("HEAD", rf"/v1/pages/{PAGE}", lambda r: (503, b""))
+        code, out, err = self.run_cli("api", "HEAD", f"/v1/pages/{PAGE}")
+        self.assertEqual((code, self.sleeps), (1, [1, 2]), err)
+        self.assertNotIn("in doubt", err)
 
     def test_api_exit_codes(self):
         code, out, err = self.run_cli("api", "GET", f"/v1/pages/{PAGE}")
