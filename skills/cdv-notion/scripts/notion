@@ -398,16 +398,75 @@ def rich_text(value, url=None):
     return [{'text': dict(piece, link={'url': url}) if url else piece} for piece in pieces]
 
 
-# [text](address) in a text value: the address is http, https or mailto. The text holds one level of balanced
-# brackets as they are; any other bracket, and a backslash, is written \[ \] \\ (a backslash before anything else
-# is a backslash). The address holds one level of balanced parentheses as they are; any other parenthesis, a
-# backslash and a space are written \( \) \\ and a backslash and the space. Text outside a link is never escaped.
-_TEXT = r'[^\[\]\\]|\\[\\\[\]]|\\(?![\\\[\]])'
-_ADDRESS = r'[^\s()\\]|\\[\\()\s]|\\(?![\\()\s])|\([^\s()\\]*\)'
-LINK_RE = re.compile(r'\[((?:' + _TEXT + r'|\[(?:' + _TEXT + r')*\])+)\]\(((?:https?://|mailto:)(?:' + _ADDRESS + r')+)\)')
+# [text](address) in a text value is a link. The address is written as it is when it starts with http://, https://,
+# mailto: or tel:, and between < and > when it is anything else; a path inside Notion (/…) is written in full.
+# Inside a link: in the text, a bracket that is not one balanced pair and every backslash are written \[ \] \\ (a
+# backslash before anything else is a backslash); in the address, a parenthesis that is not one balanced pair, a
+# backslash and a space are written \( \) \\ and a backslash and the space. Outside a link: a backslash before the [ of
+# what would read as a link makes it plain text, backslashes right before that [ or right before a link are doubled,
+# and nothing else is escaped.
+NOTION_HOST = 'https://app.notion.com'
+RAW_ADDRESS = re.compile(r'https?://|mailto:|tel:')
+INSIDE_NOTION = re.compile(r'/[0-9a-f]{32}(?:#[0-9a-f]{32})?')
 _PLAIN_TEXT = re.compile(r'(?:[^\[\]\\]|\[[^\[\]\\]*\])+')
 _TEXT_ESCAPE = re.compile(r'\\([\\\[\]])')
 _ADDRESS_ESCAPE = re.compile(r'\\([\\()\s])')
+
+
+class LinkScan:
+    """Finds the links of a value that is fed one character at a time, from its end to its start, so that each
+    character is looked at once. What a `[` opens depends only on the text at its right. A position is the number of
+    characters at the right of a character; an escaped character is one with an odd number of backslashes before it."""
+
+    def __init__(self):
+        self.chars = []
+        self.closing, self.parens = [], []  # the ] and the ) that nothing has opened yet, nearest last
+        self.space = -1  # the nearest space that is not escaped
+        self.ends = {}  # the ( of an address -> its )
+
+    def link(self):
+        """The (], ) of the link that a `[` fed now would open, or None."""
+        if not self.closing:
+            return None
+        close = self.closing[-1]
+        return (close, self.ends[close - 1]) if close < len(self.chars) - 1 and close - 1 in self.ends else None
+
+    def feed(self, char, escaped=False):
+        at = len(self.chars)
+        self.chars.append(char)
+        if escaped:
+            return
+        if char == ']':
+            self.closing.append(at)
+        elif char == '[':
+            if self.closing:
+                self.closing.pop()
+        elif char == ')':
+            self.parens.append(at)
+        elif char == '(':
+            if self.parens:
+                end = self.parens.pop()
+                if self.space < end and self.is_address(end, at):
+                    self.ends[at] = end
+        elif char.isspace():
+            self.space = at
+
+    def is_address(self, end, at):
+        size = at - end - 1
+        head = ''.join(reversed(self.chars[max(end + 1, at - 8):at]))
+        if head[:1] == '<':
+            return size > 2 and self.chars[end + 1] == '>'
+        raw = RAW_ADDRESS.match(head)
+        return bool(raw) and size > raw.end()
+
+
+def escaped_flags(value):
+    """For each character of the value, whether an odd number of backslashes stands right before it."""
+    flags, odd = [], False
+    for char in value:
+        flags.append(odd and char != '\\')
+        odd = not odd if char == '\\' else False
+    return flags
 
 
 def link_text(said):
@@ -417,43 +476,98 @@ def link_text(said):
 
 def link_address(url):
     """The address of a link as it is written: one level of balanced parentheses as they are, the rest escaped."""
-    return re.sub(r'(\([^\s()\\]*\))|([\\()\s])', lambda m: m.group(1) or '\\' + m.group(2), url)
+    path = url.startswith('/') and not url.startswith('//')
+    if path:
+        url = NOTION_HOST + url
+    said = re.sub(r'(\([^\s()\\]*\))|([\\()\s])', lambda m: m.group(1) or '\\' + m.group(2), url)
+    if path:
+        return said
+    raw = RAW_ADDRESS.match(url)
+    if raw and len(url) > raw.end() and not (url.startswith(NOTION_HOST) and INSIDE_NOTION.fullmatch(url[len(NOTION_HOST):])):
+        return said
+    return f'<{said}>'
+
+
+def address_of(written):
+    """The reverse of link_address(). The API takes a path back only as /<32 hex>; it also returns longer ones, such
+    as /p/<32 hex>?pvs=…, and refuses them, so those stay the full address of the same page."""
+    if written.startswith('<'):
+        return _ADDRESS_ESCAPE.sub(r'\1', written[1:-1])
+    url = _ADDRESS_ESCAPE.sub(r'\1', written)
+    inside = url[len(NOTION_HOST):] if url.startswith(NOTION_HOST) else ''
+    return inside if INSIDE_NOTION.fullmatch(inside) else url
 
 
 def linked(rich):
-    """The text of a title or text property with each linked run as [text](url) and everything else literal.
-    Runs of one link (a bold word inside it splits it) are one link; a mention is its plain text. An address
-    inside Notion comes as a path and is printed in full, so that a written value keeps it."""
-    out, link = [], None  # link: the address and the text of the link being read
+    """The text of a title or text property with each linked run as [text](address) and everything else as it is
+    (see LinkScan and the note above it). Runs of one link (a bold word inside it splits it) are one link; a mention
+    is its plain text. linked_text() gives the same runs back (a path address_of() keeps in full excepted)."""
+    runs = []  # [address or None, text], neighbours of one address together
     for part in rich or []:
         said = part.get('plain_text') or (part.get('text') or {}).get('content', '')
         url = ((part.get('text') or {}).get('link') or {}).get('url') if part.get('type', 'text') == 'text' else None
         if not said:
             continue
+        if runs and runs[-1][0] == (url or None):
+            runs[-1][1] += said
+        else:
+            runs.append([url or None, said])
+    if len(runs) == 1 and not runs[0][0] and '](' not in runs[0][1]:
+        return runs[0][1]
+    scan, out, before_link = LinkScan(), [], False
+    for url, said in reversed(runs):
         if url:
-            if not re.match(r'(?:https?:|mailto:)', url):
-                url = urllib.parse.urljoin(PAGE_URL, url)
-            if link and link[0] == url:
-                link[1] += said
-                continue
-        if link:
-            out.append(f'[{link_text(link[1])}]({link_address(link[0])})')
-        link = [url, said] if url else None
-        if not url:
-            out.append(said)
-    if link:
-        out.append(f'[{link_text(link[1])}]({link_address(link[0])})')
-    return ''.join(out)
+            written = f'[{link_text(said)}]({link_address(url)})'
+            for char, escaped in zip(reversed(written), reversed(escaped_flags(written))):
+                scan.feed(char, escaped)
+            out.append(written)
+            before_link = True
+            continue
+        flags, at, double = escaped_flags(said), len(said) - 1, before_link
+        while at >= 0:
+            char = said[at]
+            if double and char == '\\':
+                char = '\\\\'  # a backslash right before a link, or before a [ that was made plain text
+                scan.feed('\\')
+                scan.feed('\\')
+            elif char == '[' and scan.link():
+                scan.feed('[', True)
+                scan.feed('\\')
+                char, double = '\\[', True
+            else:
+                scan.feed(char, flags[at])
+                double = False
+            out.append(char)
+            at -= 1
+        before_link = False
+    return ''.join(reversed(out))
 
 
 def linked_text(value):
-    """The reverse of linked(): a value as rich text, each [text](http…) a linked run."""
-    runs, at = [], 0
-    for match in LINK_RE.finditer(value):
-        runs += rich_text(value[at:match.start()]) + rich_text(_TEXT_ESCAPE.sub(r'\1', match.group(1)),
-                                                              _ADDRESS_ESCAPE.sub(r'\1', match.group(2)))
-        at = match.end()
-    return runs + rich_text(value[at:])
+    """The reverse of linked(): a value as rich text, each [text](address) a linked run."""
+    if '](' not in value:
+        return rich_text(value)
+    scan, flags, last, found = LinkScan(), escaped_flags(value), len(value) - 1, []
+    for at in range(last, -1, -1):
+        link = scan.link() if value[at] == '[' else None
+        if link:
+            found.append((at, last - link[0], last - link[1]))
+        scan.feed(value[at], flags[at])
+    runs, said, at = [], [], 0
+    for start, close, end in reversed(found):
+        if start < at:
+            continue  # inside a link already read
+        slashes = 0
+        while start - slashes > at and value[start - slashes - 1] == '\\':
+            slashes += 1
+        said.append(value[at:start - slashes] + '\\' * (slashes // 2))
+        if slashes % 2:  # plain text that looks like a link
+            said.append('[')
+            at = start + 1
+            continue
+        runs += rich_text(''.join(said)) + rich_text(_TEXT_ESCAPE.sub(r'\1', value[start + 1:close]), address_of(value[close + 2:end]))
+        said, at = [], end + 1
+    return runs + rich_text(''.join(said) + value[at:])
 
 
 def fold(value):

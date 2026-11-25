@@ -14,6 +14,7 @@ import importlib.util
 import io
 import json
 import os
+import random
 import re
 import shutil
 import socket
@@ -23,6 +24,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -982,10 +984,10 @@ class TextLinksTest(ClientTestCase):
         runs = [run("See "), run("the docs", "https://example.com/docs"), run(" and [draft] a_b *c* "),
                 run("a ", "https://example.com/x"), run("bold", "https://example.com/x", bold=True), run(" word"),
                 run(" mail "), run("ana@example.com", "mailto:ana@example.com"), run(" in "),
-                run("Glossary", "/p/" + hex32(WIKI)), run(" about "), run("Billing revamp", page_url(PROJECT), kind="mention"),
+                run("Glossary", "/p/" + hex32(WIKI) + "?pvs=25"), run(" about "), run("Billing revamp", page_url(PROJECT), kind="mention"),
                 run(" by "), run("wiki", "https://example.com/A_(b) c"), run("plain bold", bold=True)]
         shown = ("See [the docs](https://example.com/docs) and [draft] a_b *c* [a bold](https://example.com/x) word mail "
-                 "[ana@example.com](mailto:ana@example.com) in [Glossary](" + page_url(WIKI) + ") about Billing revamp by "
+                 "[ana@example.com](mailto:ana@example.com) in [Glossary](" + page_url(WIKI) + "?pvs=25) about Billing revamp by "
                  "[wiki](https://example.com/A_(b)\\ c)plain bold")
         self.page["properties"]["Notes"]["rich_text"] = runs
         self.page["properties"]["Task name"]["title"] = [run("Export ["), run("invoices", "https://example.com/i"), run("]")]
@@ -1043,6 +1045,42 @@ class TextLinksTest(ClientTestCase):
              "a\\b [x] ] [ \\ [l](" + u + ") ] \\[ (y) "),
             ("text that only looks like a link", [("[z](relative) [x] (y) [w](ftp://example.com/w)", None)],
              "[z](relative) [x] (y) [w](ftp://example.com/w)"),
+            ("plain text that reads as a link", [("[x](" + u + ")", None)], r"\[x](" + u + ")"),
+            ("plain text that reads as a link, after a backslash", [("\\[x](" + u + ")", None)], r"\\\[x](" + u + ")"),
+            ("plain text that reads as a link, after two backslashes", [("a\\\\[x](" + u + ") b", None)], "a" + "\\" * 5 + "[x](" + u + ") b"),
+            ("plain text that reads as a link to a mail, a telephone", [("[x](mailto:a@example.com) [y](tel:+1)", None)],
+             r"\[x](mailto:a@example.com) \[y](tel:+1)"),
+            ("plain text that reads as a link between < and >", [("[x](<anything>)", None)], r"\[x](<anything>)"),
+            ("a bracket and a backslash right before a link", [("folder [x\\", None), ("a", u)], "folder [x\\\\[a](" + u + ")"),
+            ("two backslashes right before a link", [("x\\\\", None), ("a", u)], "x" + "\\" * 4 + "[a](" + u + ")"),
+            ("a backslash alone before a link", [("\\", None), ("a", u), ("\\", None), ("b", v), ("\\", None)],
+             "\\\\[a](" + u + ")\\\\[b](" + v + ")\\"),
+            ("a bracket that the text after a link would close", [("[x ", None), ("a", u), (" y](" + v + ")", None)],
+             r"\[x [a](" + u + ") y](" + v + ")"),
+            ("a bracket that the address of a link would close", [("[x ", None), ("a", "https://e.com/](https://z)"), (" b", None)],
+             r"\[x [a](https://e.com/](https://z)) b"),
+            ("plain text around a link reads as an address", [("[x](https://e.com/", None), ("a", u), (")", None)],
+             r"\[x](https://e.com/[a](" + u + "))"),
+            ("plain text around a link reads as an address between < and >", [("[x](<", None), ("a", u), (">)", None)],
+             r"\[x](<[a](" + u + ")>)"),
+            ("nested brackets that read as a link", [("[[x]](" + u + ") [a [b] c](" + v + ")", None)],
+             r"\[[x]](" + u + r") \[a [b] c](" + v + ")"),
+            ("two links in a row, both plain", [("[x](" + u + ")[y](" + v + ")", None)], r"\[x](" + u + r")\[y](" + v + ")"),
+            ("an escaped bracket in plain text is nothing to escape", [(r"a \[b\] \] c", None)], r"a \[b\] \] c"),
+            ("text with an unfinished link", [("[x](https://e.com [y](mailto:) [](" + u + ")", None)],
+             "[x](https://e.com [y](mailto:) [](" + u + ")"),
+            ("a telephone", [("call", "tel:+15550100")], "[call](tel:+15550100)"),
+            ("another scheme", [("x", "notion://app/y"), (" ", None), ("y", "sftp://example.com/a"), (" ", None), ("z", "linear://example.com/a")],
+             "[x](<notion://app/y>) [y](<sftp://example.com/a>) [z](<linear://example.com/a>)"),
+            ("an address with no scheme", [("x", "example.com"), ("y", "user@example.com"), ("z", "//example.com/x")],
+             "[x](<example.com>)[y](<user@example.com>)[z](<//example.com/x>)"),
+            ("an address urllib cannot read", [("x", "//[x"), ("y", "http://[x")], "[x](<//[x>)[y](http://[x)"),
+            ("a scheme with nothing after it", [("x", "mailto:"), ("y", "https://")], "[x](<mailto:>)[y](<https://>)"),
+            ("spaces, parentheses and backslashes between < and >", [("x", "a )(b\\"), ("y", "<z>")], r"[x](<a\ \)\(b\\>)[y](<<z>>)"),
+            ("a path inside Notion", [("page", "/" + hex32(WIKI)), (" ", None), ("block", "/" + hex32(WIKI) + "#" + hex32(PAGE))],
+             "[page](https://app.notion.com/" + hex32(WIKI) + ") [block](https://app.notion.com/" + hex32(WIKI) + "#" + hex32(PAGE) + ")"),
+            ("the full address of the same page", [("page", "https://app.notion.com/" + hex32(WIKI)), ("p", page_url(WIKI))],
+             "[page](<https://app.notion.com/" + hex32(WIKI) + ">)[p](" + page_url(WIKI) + ")"),
         ]
         for name, spec, printed in table:
             with self.subTest(name):
@@ -1057,6 +1095,82 @@ class TextLinksTest(ClientTestCase):
                 self.assertEqual(code, 0, err)
                 stored = self.page["properties"]["Notes"]["rich_text"]
                 self.assertEqual([(r["plain_text"], r["href"]) for r in stored], spec)
+
+    def test_every_list_of_runs_survives_printing_and_reading(self):
+        # A fuzz that favours brackets, parentheses and backslashes next to links, and whole links as plain text.
+        dice = random.Random(20261125)
+        bits = ["[", "]", "(", ")", "\\", "\\\\", "[", "](", ")", "<", ">", " ", "x", "é", "\n", "](https://e.com/", "https://",
+                "mailto:", "tel:", "[a](https://e.com/b)", "](<", ">)", "/" + hex32(WIKI), "https://app.notion.com/" + hex32(WIKI)]
+        starts = ["https://e.com/", "http://", "mailto:", "tel:", "notion://", "/", "//", "", "/" + hex32(WIKI), "https://app.notion.com/"]
+
+        def made(limit):
+            return "".join(dice.choice(bits) for _ in range(dice.randint(1, limit)))
+
+        def merged(runs):
+            out = []
+            for said, url in runs:
+                if out and out[-1][1] == url:
+                    out[-1] = (out[-1][0] + said, url)
+                else:
+                    out.append((said, url))
+            return out
+
+        def writable(url):  # the one change: a path the API refuses is the full address of the same page
+            path = url and url.startswith("/") and not url.startswith("//")
+            return "https://app.notion.com" + url if path and not re.fullmatch(r"/[0-9a-f]{32}(#[0-9a-f]{32})?", url) else url
+
+        escaped = 0
+        for number in range(6000):
+            spec = [(made(6), None) if dice.random() < 0.5 else (made(4), dice.choice(starts) + made(3)) for _ in range(dice.randint(1, 5))]
+            runs = merged([(said, url or None) for said, url in spec])
+            printed = self.n.linked([run(said, url) for said, url in runs])
+            read = merged([(r["text"]["content"], (r["text"].get("link") or {}).get("url")) for r in self.n.linked_text(printed)])
+            self.assertEqual(read, merged([(said, writable(url)) for said, url in runs]), (number, runs, printed))
+            if [url for _, url in runs] == [None]:  # plain text alone: escaped only where something in it looks like a link
+                if not re.search(r"\[[\s\S]+\]\((?:https?://|mailto:|tel:|<)", runs[0][0]):
+                    self.assertEqual(printed, runs[0][0])
+                escaped += printed != runs[0][0]
+        self.assertGreater(escaped, 20, "the fuzz never met plain text that looks like a link")
+
+    def test_a_long_value_is_read_and_printed_in_linear_time(self):
+        size = 200000
+        shapes = {"\\[": "\\[", "[": "[", "]": "]", "[[]": "[[]", "backslashes": "\\", "\\[\\": "\\[\\", "](": "](", "[](": "[](",
+                  "[a](": "[a](", "[a](https://": "[a](https://", "[a](https://e.com/(": "[a](https://e.com/(", "(": "(", ")": ")",
+                  "[a](<": "[a](<", "[a](https://e.com/b)": "[a](https://e.com/b)", "\\[a](https://e.com/b)": "\\[a](https://e.com/b)",
+                  "words": "some words ", "[a] ": "[a] ", "[a](https://e.com/\\ ": "[a](https://e.com/\\ ", "](https://e.com)": "](https://e.com)"}
+        for name, shape in shapes.items():
+            value = "[a](https://e.com/b) " + (shape * (size // len(shape) + 1))[:size] + "[a](https://e.com/b)"
+            with self.subTest(shape=name):
+                began = time.process_time()  # the process's own time: the machine's load does not count
+                runs = self.n.linked_text(value)
+                printed = self.n.linked([run(r["text"]["content"], (r["text"].get("link") or {}).get("url")) for r in runs])
+                spent = time.process_time() - began
+                self.assertLess(spent, 5, "the scan is not linear")
+                again = self.n.linked_text(printed)
+                self.assertEqual([(r["text"]["content"], r["text"].get("link")) for r in again],
+                                 [(r["text"]["content"], r["text"].get("link")) for r in self.joined(runs)])
+
+    def joined(self, runs):
+        """The runs as one reading gives them: neighbours of one address together, in pieces of 2,000."""
+        out = []
+        for r in runs:
+            url = (r["text"].get("link") or {}).get("url")
+            if out and out[-1][1] == url:
+                out[-1][0] += r["text"]["content"]
+            else:
+                out.append([r["text"]["content"], url])
+        return [piece for said, url in out for piece in self.n.rich_text(said, url)]
+
+    def test_reading_never_fails_on_what_a_card_holds(self):
+        addresses = ["//[x", "http://[x", "https://[::1", "//", "/", "?", "#", "[", "](", ")", "(", "\\", " ", "<", "<>", "::", "%", "https://a:b/",
+                     "javascript:x", "data:,x", "mailto:", "tel:", "\u0000", "\n"]
+        for address in addresses:
+            with self.subTest(address=address):
+                self.page["properties"]["Notes"]["rich_text"] = [run("before "), run("label", address), run(" after")]
+                for verb in (("fetch", PAGE), ("query", "Tasks", "--select", "Notes"), ("query", "Tasks", "--json")):
+                    code, out, err = self.run_cli(*verb)
+                    self.assertEqual(code, 0, err)
+                    self.assertIn("label", out)
 
     def test_a_written_link_becomes_a_linked_run_in_update_create_and_a_pages_file(self):
         link = {"text": {"content": "docs", "link": {"url": "https://example.com/docs"}}}

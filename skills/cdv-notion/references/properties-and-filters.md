@@ -8,7 +8,7 @@ The client reads and writes properties in the short format the Notion MCP used, 
 
 | Type | Printed as |
 |---|---|
-| title, text | the text, with each link as `[text](url)` and everything else literal (nothing outside a link is escaped; inside a link see below) |
+| title, text | the text as it is, with each link as `[text](address)`; only text that would read as a link is escaped ([links in text](#links-in-text)) |
 | number | the number |
 | select, status | the option name, or `null` |
 | multi-select | `["A", "B"]` |
@@ -27,7 +27,7 @@ A property named `id` or `url` (any case) is printed as `userDefined:<name>`, an
 
 | Type | Write | Example |
 |---|---|---|
-| title, text | the text (split in 2,000-character pieces); `[text](https://…)` becomes a link (`http`, `https` or `mailto`) | `--set 'Notes=See [the runbook](https://example.com/runbook)'` |
+| title, text | the text (split in 2,000-character pieces); `[text](https://…)` becomes a link ([links in text](#links-in-text)) | `--set 'Notes=See [the runbook](https://example.com/runbook)'` |
 | number | a number; empty clears | `--set 'Estimate=3'` |
 | select, status | an existing option, any case; empty clears | `--set 'Status=Done'` |
 | multi-select | `a,b` or a JSON array; existing options only | `--set 'Tags=Backend,Helpdesk'` |
@@ -40,12 +40,28 @@ A property named `id` or `url` (any case) is printed as `userDefined:<name>`, an
 | page title (page parent) | `title` | `--set 'title=Approved plan'` |
 
 - `title` (or `name`) also names a data source's title property, whatever it is called.
-- A text value that was read and written back keeps its links. Text that only looks like a link, `[text](https://…)` typed as it is, becomes one (the address must start with `http://`, `https://` or `mailto:`; `[z](relative)` stays text). Inside a link, what would end it is escaped with a backslash: in the text a `[` or `]` that is not one balanced pair, and every `\` (`[a \[ b](https://…)`, `[C:\\dir](https://…)`); in the address a space, a `\` and a parenthesis that is not one balanced pair (`https://example.org/wiki/Name_(thing)` is printed as it is, `https://example.org/a\)b` has an unbalanced `)`). Written by hand, a backslash before anything else is a backslash. Text outside a link is never escaped, so a value read back is the same as long as plain text does not itself hold `[text](https://…)`. Bold, italic, code and mentions inside a text property are read as plain text ([api-limits.md](api-limits.md)). The `title:` line of a fetch, and every condition, use the plain text.
+- A text value that was read and written back keeps its text and its links ([links in text](#links-in-text)). Bold, italic, code and mentions inside a text property are read as plain text ([api-limits.md](api-limits.md)). The `title:` line of a fetch, and every condition, use the plain text.
 - An unknown property or option exits `2` and lists the nearest names; nothing is written. The schema is re-read once before refusing, so an option created a minute ago is found.
 - A person given by name or e-mail is looked up among the people the API lists and the people seen in rows read. Several matches exit `2` listing each one's name, e-mail and `user://` id, and nothing is sent: pass the id. An exact e-mail or a `user://` id is never ambiguous. The same holds for `has` in `--where`.
 - A list replaces the whole value: to add a tag, write the current tags and the new one.
 - Formula, rollup, unique id, created and edited time and by are computed by Notion: writing them exits `2`.
 - `--pages-file` takes `[{"properties": {"Task name": "A", "Tags": ["Backend"], "Completed?": true}, "content": "<markdown>", "icon": "🧾"}, …]`: the same keys as `--set`, values as strings, lists, booleans or numbers.
+
+### Links in text
+
+A link in a title or text value (and in a comment, when it is printed) is `[text](address)`. What is printed and given back to `--set` stores the same text and the same links. What is escaped, and nothing else:
+
+| Where | Written | Example |
+|---|---|---|
+| plain text that would read as a link | a backslash before its `[` | `\[text](https://example.com)` is the text `[text](https://example.com)`, not a link: write it this way to store the characters |
+| backslashes right before that `[`, or right before a link | doubled | `C:\\[docs](https://example.com)` is the text `C:\` and a link |
+| the text of a link: a `[` or `]` that is not one balanced pair, and then every `\` too | `\[` `\]` `\\` | `[a \[ b](https://example.com)`, `[C:\\dir](https://example.com)`; `[the [old] docs](https://example.com)` needs nothing |
+| the address of a link: a space, a `\`, and a parenthesis that is not one balanced pair | a backslash before it | `[x](https://example.org/a\)b)`; `[x](https://example.org/wiki/Name_(thing))` needs nothing |
+| an address that does not start with `http://`, `https://`, `mailto:` or `tel:` | between `<` and `>` | `[open](<notion://example/page>)`, `[site](<example.com>)` |
+
+- Any other text is literal: `[draft]`, `[x] (y)`, `[z](relative)`, `[w](ftp://example.com)`, `a \[b\]` and a backslash anywhere else stay as they are, read and written.
+- A link to a page inside Notion is stored as a path and printed in full, `[page](https://app.notion.com/<32 hex>)`; written back it is the path again. A path with a query (`/p/<32 hex>?pvs=…`) is returned by the API and refused when written, so it is written back as the full address of the same page.
+- Notion stores `http`, `https`, `mailto:`, `tel:`, a bare domain or e-mail (`example.com`, `ana@example.com`), `notion:`, and most other schemes when what follows `://` is a domain (`sftp://example.com/a`, `linear://example.com/a`). It refuses (400, nothing changed) `ftp:`, `file:`, `javascript:`, `data:`, `sms:`, an app link with no domain (`slack://channel?id=…`) and any other path or anchor. It rewrites some addresses on its own: a capital scheme or host in lower case, `https://example.com` with a final `/`, a space as `%20`, a backslash as `/`.
 
 ## The `--where` language
 
