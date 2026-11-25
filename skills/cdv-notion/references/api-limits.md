@@ -7,7 +7,7 @@ The public REST API covers almost everything the Notion MCP did, but not all of 
 | Read resolved comments: `GET /v1/comments` returns only open discussions | Say that resolved threads are not visible to the integration; ask the user to paste what matters from them, or reopen the thread in Notion |
 | Resolve a discussion, or reopen one | Ask the user to resolve it in Notion; a reply (`notion comments reply`) can say it is settled |
 | Start a discussion anchored to a selected text | Comment on the page (`notion comments add`) quoting the passage, or reply to an existing thread |
-| Search page bodies: `POST /v1/search` matches titles only | `notion search` also looks in each connected data source's title and text properties; for the body, narrow with `notion query`, then `notion fetch` the candidates and read them |
+| Search page bodies: `POST /v1/search` matches titles only, and also returns titles that only resemble the words (printed `matched: similar title`) | `notion search` also looks in each connected data source's title and text properties; for the body, narrow with `notion query`, then `notion fetch` the candidates and read them |
 | Edit or delete another author's comment: a token edits only its own comments | Reply in the same discussion with the correction (`notion comments reply <discussion>`) |
 | Keep the person as the author: page authorship and every edit show the integration | Fill `Requester` / `Assignee`-style properties explicitly, and sign comments (`me` in the settings); the history stays the integration's |
 | List guests in `GET /v1/users` | `notion users find` also knows everyone seen in person properties of rows already read; pass `user://<uuid>` when you have it |

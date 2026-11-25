@@ -2196,8 +2196,8 @@ def cmd_search(client, args):
             found, _ = client.pages_of('POST', '/v1/search', {'query': words, 'filter': {'property': 'object', 'value': 'page'}},
                                        max_items=limit)
             for page in found:
-                if page.get('object') == 'page':
-                    add(page, 'title')
+                if page.get('object') == 'page':  # the API also returns titles that only resemble the words
+                    add(page, 'title' if fold(words) in fold(client.title_of(page)) else 'similar title')
             queue = [s['id'] for s in client.data_sources()]
         needle = fold(words)
         searched = set()

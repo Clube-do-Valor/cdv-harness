@@ -2002,6 +2002,17 @@ class SearchTest(ClientTestCase):
         wiki = [h for h in hits if self.wiki["url"] in h][0]
         self.assertIn("matched: title", wiki)
 
+    def test_search_says_when_a_title_only_resembles_the_words(self):
+        """The API's search ranks by likeness: it returns titles that hold none of the words as written."""
+        self.fake.on("POST", r"/v1/search", lambda r: (200, {"object": "list", "results": [self.wiki, self.noted],
+                                                             "has_more": False, "next_cursor": None})
+                     if (r.json or {}).get("query") else None)
+        code, out, err = self.run_cli("search", "invoice glossary")
+        self.assertEqual(code, 0, err)
+        by_url = {url: line for line in self.hits(out) for url in (self.wiki["url"], self.noted["url"]) if url in line}
+        self.assertTrue(by_url[self.wiki["url"]].endswith("matched: title"))
+        self.assertTrue(by_url[self.noted["url"]].endswith("matched: similar title"))
+
     def test_search_key_first_and_page_url(self):
         code, out, err = self.run_cli("search", key(121))
         self.assertEqual(code, 0, err)
