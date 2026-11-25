@@ -30,6 +30,9 @@ Properties use the short format: --set 'Status=Done', --set 'date:Due:start=2026
 user://<uuid>, a name, an e-mail or `me`, relations as page references, checkbox __YES__/__NO__, lists
 as `a,b` or a JSON array. Bodies are Notion-flavored Markdown (markdown_version v2).
 
+A date with no time in --where (created >= 2026-11-01) is the whole day in UTC; write the instant with its
+offset (created >= 2026-11-01T00:00:00-03:00) for a local day.
+
 Exit codes: 0 done; 1 Notion refused or could not be reached; 2 the command is wrong; 3 no usable
 token; 4 done in part.
 
@@ -38,17 +41,18 @@ settings in ~/.config/cdv-notion/config.json ({"me": "<your e-mail>", "stamp_com
 "test_marker": "<title prefix of write-check cards>"}).
 """
 import argparse
+import bisect
+import collections
+import contextlib
 import datetime
 import difflib
-import errno
 import getpass
 import http.client
+import itertools
 import json
 import mimetypes
 import os
 import re
-import socket
-import ssl
 import subprocess
 import sys
 import time
@@ -57,7 +61,13 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import zoneinfo
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # no flock here: a cache file is still written whole, and of two writes at once one may be lost
+    fcntl = None
 
 API_HOST = 'api.notion.com'
 API_ROOT = f'https://{API_HOST}'
@@ -71,6 +81,7 @@ MAX_RETRIES = 5
 DEFAULT_ROWS = 50
 MAX_ROWS = 2000
 SCHEMA_BUDGET = 6000
+UNTITLED = '(untitled)'
 UPLOAD_LIMIT = 20 * 1024 * 1024
 
 DONE, REFUSED, USAGE, NO_TOKEN, PARTIAL = 0, 1, 2, 3, 4
@@ -113,13 +124,12 @@ def with_words(cause, outcome):
 class ApiError(Fail):
     def __init__(self, status, code, message, body, path, outcome=None):
         self.status, self.api_code, self.api_message, self.body, self.path = status, code, message, body, path
-        cause = f'Notion answered {status} {code} on {path}: {message}'
+        cause = f"Notion answered {' '.join(filter(None, (str(status), code)))} on {path}" + (f': {message}' if message else '')
         super().__init__(USAGE if status == 400 else REFUSED, with_words(cause, outcome), outcome, cause)
 
 
 class WriteInDoubt(Fail):
-    """A write whose request left and that no answer settles (any 5xx, a timeout, a connection lost after
-    it was established): Notion may have applied it."""
+    """A write whose request left and that no answer settles (see write_outcome): Notion may have applied it."""
 
     def __init__(self, what, path, body=None, status=None):
         self.what, self.status, self.path, self.body = what, status, path, body or {}
@@ -143,17 +153,37 @@ class CreateInDoubt(Fail):
         super().__init__(code, f'In doubt: the create of {name} ({cause}): {self.advice}', IN_DOUBT, cause)
 
 
+class NotConnected(Fail):
+    """What the command was pointed at cannot be read: the message says how to connect it."""
+
+
+class Unbuildable(Fail):
+    """A step Notion refused with a 400 that cannot be built from the schema read again: a property or an option it
+    names is unknown. It has that failure's message and exit code; Notion did nothing."""
+
+    def __init__(self, failure):
+        super().__init__(failure.code, failure.message, REFUSED_WRITE)
+
+
+UNBUILT = object()  # on_current_schema's `built` when the step is still to be built
+
+
+class NoSuchKey(Fail):
+    """A ticket key that leads to no page: no connected data source has its prefix, or none of them has its number."""
+
+
 class Unsent(ConnectionError):
-    """The connection to the API could not be established: the request never left this machine."""
+    """No connection to the API was established: the request never left this machine."""
 
 
 def write_outcome(status=None, error=None):
     """What a write that did not come back with a success did, decided here and nowhere else.
 
-    NOT_SENT: the connection could not be established (urllib's Unsent, a refused connection); nothing
-    reached Notion. REFUSED_WRITE: Notion answered 4xx (a 429 once its retries are used up); nothing
-    changed. IN_DOUBT: the request left and no answer says what happened - any 5xx, a timeout, a connection
-    lost after it was established, or any error that does not say whether the request left."""
+    NOT_SENT: no connection was established (Unsent, a refused connection); nothing reached Notion.
+    REFUSED_WRITE: Notion answered 4xx (a 429 once its retries are used up); nothing changed. IN_DOUBT: the
+    request left and no answer says what happened - any 5xx, a redirect, a success whose body is not what that
+    write answers (answers_write), a timeout, a connection lost after it was established (a TLS error while the answer is read included), or
+    any error that does not say whether the request left."""
     if error is not None:
         return NOT_SENT if isinstance(error, (Unsent, ConnectionRefusedError)) else IN_DOUBT
     if status is not None and 400 <= status < 500:
@@ -161,8 +191,41 @@ def write_outcome(status=None, error=None):
     return IN_DOUBT
 
 
+def said_by(error):
+    """An exception in one line: its name, unless it is one of the transport's own, and what it says."""
+    said = ' '.join(str(error).split())
+    return said if said and type(error) in (ConnectionError, Unsent) else f'{type(error).__name__}: {said}'.rstrip(': ')
+
+
+def as_fail(error):
+    """An exception as a Fail: what follows a write that landed catches every one, so that none hides what landed."""
+    return error if isinstance(error, Fail) else Fail(REFUSED, said_by(error))
+
+
 def is_write(method, path):
-    return method != 'GET' and not path.endswith('/query') and path != '/v1/search'
+    return method not in ('GET', 'HEAD') and not path.endswith('/query') and path != '/v1/search'
+
+
+def answers_write(path, said):
+    """Whether a success has the shape that write's endpoint returns, the only proof that the write was applied: an API
+    object with an id, or, from an endpoint that answers a list (a block's children, one this client does not know),
+    a list of results."""
+    if not isinstance(said, dict) or not isinstance(said.get('object'), str) or said['object'] == 'error':
+        return False
+    if isinstance(said.get('id'), str) and said['id']:
+        return True
+    one = re.match(r'/v1/(pages|blocks|comments|file_uploads)(/|$)', path) and not path.endswith('/children')
+    return not one and isinstance(said.get('results'), list)
+
+
+def extra_of(answer):
+    """What the API adds to an error (`additional_data`), {} when it is not an object."""
+    extra = answer.get('additional_data')
+    return extra if isinstance(extra, dict) else {}
+
+
+def url_of(page):
+    return page.get('url') or page_link(page['id'])
 
 
 # ---------------------------------------------------------------------------------------------
@@ -183,11 +246,14 @@ def origin(url):
 
 
 class SameHostRedirects(urllib.request.HTTPRedirectHandler):
-    """Follow a redirect, but carry the token only when the scheme, the host and the port all stay the same:
-    never to another host or port, and never from https to http. A relative redirect stays (urllib has
-    already joined it to the request's url)."""
+    """Follow a redirect of a GET, but carry the token only when the scheme, the host and the port all stay the
+    same: never to another host or port, and never from https to http. A relative redirect stays (urllib has
+    already joined it to the request's url). Any other method is not followed: urllib would send a POST again
+    as a GET, whose answer says nothing about the write."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if req.get_method() not in ('GET', 'HEAD'):
+            return None
         new = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new is not None and (origin(newurl) is None or origin(newurl) != origin(req.full_url)):
             for name in list(new.headers):
@@ -196,35 +262,71 @@ class SameHostRedirects(urllib.request.HTTPRedirectHandler):
         return new
 
 
-_OPENER = urllib.request.build_opener(SameHostRedirects())
+class Dialled:
+    """A connection that knows whether it was ever established (the TLS handshake and a proxy's tunnel included):
+    until then it is certain that no byte of the request left."""
+
+    established = False
+
+    def connect(self):
+        super().connect()
+        self.established = True
 
 
-def never_left(reason):
-    """Whether urllib's reason proves the request never left: the name did not resolve, the connection was
-    refused, no route reached the host, or the certificate was refused before anything was sent. A reset,
-    any other TLS or socket error, or a timeout may have come after the request left."""
-    if isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError)):
-        return True
-    return isinstance(reason, OSError) and reason.errno in (errno.ENETUNREACH, errno.EHOSTUNREACH)
+class DialledHTTP(Dialled, http.client.HTTPConnection):
+    pass
+
+
+class DialledHTTPS(Dialled, http.client.HTTPSConnection):
+    pass
+
+
+class Dial:
+    def do_open(self, http_class, req, **options):
+        def dial(*args, **kept):
+            req.dialled = self.connection(*args, **kept)
+            return req.dialled
+
+        return super().do_open(dial, req, **options)
+
+
+class DialHTTP(Dial, urllib.request.HTTPHandler):
+    connection = DialledHTTP
+
+
+class DialHTTPS(Dial, urllib.request.HTTPSHandler):
+    connection = DialledHTTPS
+
+
+_OPENER = urllib.request.build_opener(SameHostRedirects(), DialHTTP(), DialHTTPS())
+
+
+def answer_body(error):
+    """The body of an answer that is not a success; its status is the answer, so a body lost on the way is empty."""
+    try:
+        return error.read()
+    except (OSError, http.client.HTTPException):
+        return b''
 
 
 def urllib_transport(method, url, headers, body=None, timeout=60):
-    request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    """(status, headers, body), or Unsent when no connection was established, whatever failed (a path that cannot
+    be sent, the name, the route, a proxy's tunnel, the TLS handshake, a timeout), TimeoutError when no answer came
+    in time, and ConnectionError for any other failure: once connected, the request may have left."""
+    request = None
     try:
+        request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
         with _OPENER.open(request, timeout=timeout) as response:
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as error:
-        return error.code, dict((error.headers or {}).items()), error.read()
-    except urllib.error.URLError as error:  # raised while connecting or sending the request
-        if isinstance(error.reason, (socket.timeout, TimeoutError)):
-            raise TimeoutError(str(error.reason))
-        if never_left(error.reason):
-            raise Unsent(str(error.reason))
-        raise ConnectionError(str(error.reason))
-    except (socket.timeout, TimeoutError) as error:
-        raise TimeoutError(str(error))
-    except http.client.HTTPException as error:  # the server closed or broke its answer after the request left
-        raise ConnectionError(f'{type(error).__name__}: {error}')
+        return error.code, dict((error.headers or {}).items()), answer_body(error)
+    except Exception as error:
+        # urllib wraps what connecting and sending raise in a URLError, and lets the rest (reading) through raw
+        reason = error.reason if isinstance(error, urllib.error.URLError) else error
+        said = said_by(reason) if isinstance(reason, Exception) else str(reason)
+        if not getattr(getattr(request, 'dialled', None), 'established', False):
+            raise Unsent(said)
+        raise TimeoutError(str(reason)) if isinstance(reason, TimeoutError) else ConnectionError(said)
 
 
 TRANSPORT = urllib_transport
@@ -273,11 +375,11 @@ def cache_dir():
 
 
 def well_formed(token, source):
-    """The token, or Fail(NO_TOKEN) naming the source (never the value) when it holds whitespace or a control
-    character: such a value would reach the Authorization header, and the error the HTTP layer raises prints it."""
-    if re.search(r'[\s\x00-\x1f\x7f]', token):
-        raise Fail(NO_TOKEN, f'the token from {source} is malformed (it holds a space or a line break); '
-                             f'store it again: {LOGIN_HINT}')
+    """The token, or Fail(NO_TOKEN) naming the source (never the value) when it holds anything but printable
+    ASCII: such a value would reach the Authorization header, and the error the HTTP layer raises prints it."""
+    if not re.fullmatch(r'[\x21-\x7e]+', token):
+        raise Fail(NO_TOKEN, f'the token from {source} is malformed (it holds a space, a line break or a character '
+                             f'that is not plain ASCII); store it again: {LOGIN_HINT}')
     return token, source
 
 
@@ -330,6 +432,24 @@ class Cache:
         except OSError:
             pass  # a cache that cannot be written is only slower
 
+    def update(self, name, merge):
+        """Write merge(what the file holds, or None), unless that is None. The file is read, merged and written
+        under its lock, so what another session writes at the same time is never lost; where there is no lock to
+        take, it goes on without one."""
+        lock = None
+        try:
+            if fcntl:
+                with contextlib.suppress(OSError):
+                    self.dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    lock = open(self.dir / f'.{name}.lock', 'a')
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+            value = merge(self.get(name))
+            if value is not None:
+                self.put(name, value)
+        finally:
+            if lock:
+                lock.close()
+
 
 # ---------------------------------------------------------------------------------------------
 # Small helpers
@@ -355,8 +475,190 @@ def plain(rich):
     return ''.join(part.get('plain_text') or (part.get('text') or {}).get('content', '') for part in rich or [])
 
 
-def rich_text(value):
-    return [{'text': {'content': value[i:i + 2000]}} for i in range(0, len(value), 2000)]
+def rich_text(value, url=None):
+    pieces = [{'content': value[i:i + 2000]} for i in range(0, len(value), 2000)]
+    return [{'text': dict(piece, link={'url': url}) if url else piece} for piece in pieces]
+
+
+# [text](address) in a text value is a link. The address is written as it is when it starts with http://, https://,
+# mailto: or tel:, and between < and > when it is another one Notion stores (scheme://…, //…, a bare domain or e-mail, the
+# full address of a page); a path inside Notion (/…) is written in full. An address Notion does not store is no link.
+# Inside a link: in the text, a bracket that is not one balanced pair and every backslash are written \[ \] \\ (a
+# backslash before anything else is a backslash); in the address, a parenthesis that is not one balanced pair, a
+# backslash and a space are written \( \) \\ and a backslash and the space. Outside a link: a backslash before the [ of
+# what would read as a link makes it plain text, backslashes right before that [ or right before a link are doubled,
+# and nothing else is escaped.
+NOTION_HOST = 'https://app.notion.com'
+RAW_ADDRESS = re.compile(r'https?://|mailto:|tel:')
+INSIDE_NOTION = re.compile(r'/[0-9a-f]{32}(?:#[0-9a-f]{32})?')
+STORED_ADDRESS = re.compile(r'(?:[A-Za-z][A-Za-z0-9+.-]*:)?//\S[\s\S]*|(?:[\w.+%-]+@)?(?:[\w-]+\.)+[^\W\d_]{2,}(?:[:/?#][\s\S]*)?')
+_ESCAPED = re.compile(r'(?:[^\s()\\]|\([^\s()\\]*\)|\\[()\\\s])*')
+ADDRESS_LIMIT = 2000  # characters of an address, the API's limit
+_PLAIN_TEXT = re.compile(r'(?:[^\[\]\\]|\[[^\[\]\\]*\])+')
+_TEXT_ESCAPE = re.compile(r'\\([\\\[\]])')
+_ADDRESS_ESCAPE = re.compile(r'\\([\\()\s])')
+
+
+class LinkScan:
+    """Finds the links of a value that is fed one character at a time, from its end to its start, so that each
+    character is looked at once. What a `[` opens depends only on the text at its right. A position is the number of
+    characters at the right of a character; an escaped character is one with an odd number of backslashes before it."""
+
+    def __init__(self):
+        self.chars = []
+        self.closing, self.parens = [], []  # the ] and the ) that nothing has opened yet, nearest last
+        self.space = -1  # the nearest space that is not escaped
+        self.ends = {}  # the ( of an address -> its )
+
+    def link(self):
+        """The (], ) of the link that a `[` fed now would open, or None."""
+        if not self.closing:
+            return None
+        close = self.closing[-1]
+        return (close, self.ends[close - 1]) if close < len(self.chars) - 1 and close - 1 in self.ends else None
+
+    def feed(self, char, escaped=False):
+        at = len(self.chars)
+        self.chars.append(char)
+        if escaped:
+            return
+        if char == ']':
+            self.closing.append(at)
+        elif char == '[':
+            if self.closing:
+                self.closing.pop()
+        elif char == ')':
+            self.parens.append(at)
+        elif char == '(':
+            if self.parens:
+                end = self.parens.pop()
+                if self.space < end and self.is_address(end, at):
+                    self.ends[at] = end
+        elif char.isspace():
+            self.space = at
+
+    def is_address(self, end, at):
+        size = at - end - 1
+        head = ''.join(reversed(self.chars[max(end + 1, at - 8):at]))
+        if head[:1] == '<':  # only what link_address() prints that way: code such as list[int](<int>) is text
+            if self.chars[end + 1] != '>' or size > 2 * ADDRESS_LIMIT + 2:
+                return False
+            written = ''.join(reversed(self.chars[end + 1:at]))
+            return bool(_ESCAPED.fullmatch(written)) and link_address(address_of(written)) == written
+        raw = RAW_ADDRESS.match(head)
+        return bool(raw) and size > raw.end()
+
+
+def escaped_flags(value):
+    """For each character of the value, whether an odd number of backslashes stands right before it."""
+    flags, odd = [], False
+    for char in value:
+        flags.append(odd and char != '\\')
+        odd = not odd if char == '\\' else False
+    return flags
+
+
+def link_text(said):
+    """The text of a link as it is written: as it is when it needs nothing, else with \\ \\[ \\] escaped."""
+    return said if _PLAIN_TEXT.fullmatch(said) else re.sub(r'[\\\[\]]', lambda m: '\\' + m.group(), said)
+
+
+def link_address(url):
+    """The address of a link as it is written: one level of balanced parentheses as they are, the rest escaped; '' when
+    it is none that Notion stores."""
+    path = url.startswith('/') and not url.startswith('//')
+    if path:
+        url = NOTION_HOST + url
+    said = re.sub(r'(\([^\s()\\]*\))|([\\()\s])', lambda m: m.group(1) or '\\' + m.group(2), url)
+    if path:
+        return said
+    raw = RAW_ADDRESS.match(url)
+    if raw and len(url) > raw.end() and not (url.startswith(NOTION_HOST) and INSIDE_NOTION.fullmatch(url[len(NOTION_HOST):])):
+        return said
+    return f'<{said}>' if len(url) <= ADDRESS_LIMIT and STORED_ADDRESS.fullmatch(url) else ''
+
+
+def address_of(written):
+    """The reverse of link_address(). The API takes a path back only as /<32 hex>; it also returns longer ones, such
+    as /p/<32 hex>?pvs=…, and refuses them, so those stay the full address of the same page."""
+    if written.startswith('<'):
+        return _ADDRESS_ESCAPE.sub(r'\1', written[1:-1])
+    url = _ADDRESS_ESCAPE.sub(r'\1', written)
+    inside = url[len(NOTION_HOST):] if url.startswith(NOTION_HOST) else ''
+    return inside if INSIDE_NOTION.fullmatch(inside) else url
+
+
+def linked(rich):
+    """The text of a title or text property with each linked run as [text](address) and everything else as it is
+    (see LinkScan and the note above it). Runs of one link (a bold word inside it splits it) are one link; a mention
+    is its plain text. linked_text() gives the same runs back (a path address_of() keeps in full excepted)."""
+    runs = []  # [address or None, text], neighbours of one address together
+    for part in rich or []:
+        said = part.get('plain_text') or (part.get('text') or {}).get('content', '')
+        url = ((part.get('text') or {}).get('link') or {}).get('url') if part.get('type', 'text') == 'text' else None
+        if not said:
+            continue
+        url = url if url and link_address(url) else None
+        if runs and runs[-1][0] == url:
+            runs[-1][1] += said
+        else:
+            runs.append([url, said])
+    if len(runs) == 1 and not runs[0][0] and '](' not in runs[0][1]:
+        return runs[0][1]
+    scan, out, before_link = LinkScan(), [], False
+    for url, said in reversed(runs):
+        if url:
+            written = f'[{link_text(said)}]({link_address(url)})'
+            for char, escaped in zip(reversed(written), reversed(escaped_flags(written))):
+                scan.feed(char, escaped)
+            out.append(written)
+            before_link = True
+            continue
+        flags, at, double = escaped_flags(said), len(said) - 1, before_link
+        while at >= 0:
+            char = said[at]
+            if double and char == '\\':
+                char = '\\\\'  # a backslash right before a link, or before a [ that was made plain text
+                scan.feed('\\')
+                scan.feed('\\')
+            elif char == '[' and scan.link():
+                scan.feed('[', True)
+                scan.feed('\\')
+                char, double = '\\[', True
+            else:
+                scan.feed(char, flags[at])
+                double = False
+            out.append(char)
+            at -= 1
+        before_link = False
+    return ''.join(reversed(out))
+
+
+def linked_text(value):
+    """The reverse of linked(): a value as rich text, each [text](address) a linked run."""
+    if '](' not in value:
+        return rich_text(value)
+    scan, flags, last, found = LinkScan(), escaped_flags(value), len(value) - 1, []
+    for at in range(last, -1, -1):
+        link = scan.link() if value[at] == '[' else None
+        if link:
+            found.append((at, last - link[0], last - link[1]))
+        scan.feed(value[at], flags[at])
+    runs, said, at = [], [], 0
+    for start, close, end in reversed(found):
+        if start < at:
+            continue  # inside a link already read
+        slashes = 0
+        while start - slashes > at and value[start - slashes - 1] == '\\':
+            slashes += 1
+        said.append(value[at:start - slashes] + '\\' * (slashes // 2))
+        if slashes % 2:  # plain text that looks like a link
+            said.append('[')
+            at = start + 1
+            continue
+        runs += rich_text(''.join(said)) + rich_text(_TEXT_ESCAPE.sub(r'\1', value[start + 1:close]), address_of(value[close + 2:end]))
+        said, at = [], end + 1
+    return runs + rich_text(''.join(said) + value[at:])
 
 
 def fold(value):
@@ -455,6 +757,9 @@ class Notion:
         self._schemas = {}
         self._fresh = set()  # data sources whose schema was read from the API in this command
         self._list_fresh = False  # the data source list was read from the API in this command
+        self._sources = None  # that list, once read
+        self.left_said = set()  # the warnings about placeholders left in a page, each said once
+        self.json = False  # the command was given --json: stdout holds one JSON document, emit()'s, and nothing else
 
     # -- secrets and output ---------------------------------------------------------------
 
@@ -465,7 +770,12 @@ class Notion:
         return TOKEN_SHAPE.sub('[token]', text)
 
     def say(self, text=''):
-        print(self.redact(text))
+        """A line for the reader; with --json it is a note beside the document, so it goes to stderr."""
+        print(self.redact(text), file=sys.stderr if self.json else sys.stdout)
+
+    def emit(self, value):
+        """The one JSON document a --json command prints on stdout."""
+        print(self.redact(json.dumps(value, ensure_ascii=False, indent=2)))
 
     def warn(self, text):
         print(self.redact(text), file=sys.stderr)
@@ -502,11 +812,11 @@ class Notion:
         never sent, refused (an ApiError for a 4xx) or in doubt (WriteInDoubt)."""
         outcome = write_outcome(status, error)
         if outcome == NOT_SENT:
-            cause = f'could not connect to api.notion.com ({error})'
+            cause = f'could not connect to api.notion.com ({said_by(error)})'
             return Fail(REFUSED, with_words(cause, outcome), outcome, cause)
         if error is not None:
             what = ('api.notion.com did not answer in time' if isinstance(error, TimeoutError)
-                    else f'the connection failed after the request may have left ({error})')
+                    else f'the connection failed after the request may have left ({said_by(error)})')
             return WriteInDoubt(what, path)
         if retries is not None:
             cause = f'Notion kept answering {status} (rate limited) on {path} after {retries} retries'
@@ -514,7 +824,8 @@ class Notion:
                 return WriteInDoubt(f'Notion kept answering {status} after {retries} retries', path, parsed, status)
             return Fail(REFUSED, with_words(cause, outcome) + '; wait a minute and run it again', outcome, cause)
         if outcome == IN_DOUBT:
-            return WriteInDoubt(f'Notion answered {status}', path, parsed, status)
+            unread = ' with a body that is not what that write answers' if 200 <= status < 300 else ''
+            return WriteInDoubt(f'Notion answered {status}{unread}', path, parsed, status)
         return ApiError(status, parsed.get('code', ''), parsed.get('message', ''), parsed, path, outcome)
 
     def send(self, method, path, body=None, query=None, raw=None, content_type=None, write=None):
@@ -540,23 +851,21 @@ class Notion:
         while True:
             try:
                 status, answer_headers, payload = TRANSPORT(method, url, headers, data, 60)
-            except TimeoutError as error:
+            except Exception as error:  # whatever it is, it does not say that a write never left unless it is Unsent
                 if write:
                     raise self.write_failed(path, error=error)
-                if server < 2:
+                if isinstance(error, (TimeoutError, Unsent, ConnectionRefusedError)) and server < 2:
                     server += 1
                     SLEEP(server)
                     continue
-                raise Fail(REFUSED, f'api.notion.com did not answer {method} {path} in time')
-            except ConnectionError as error:
-                if write:
-                    raise self.write_failed(path, error=error)
-                raise Fail(REFUSED, f'could not reach api.notion.com: {error}')
+                if isinstance(error, TimeoutError):
+                    raise Fail(REFUSED, f'api.notion.com did not answer {method} {path} in time')
+                raise Fail(REFUSED, f'could not reach api.notion.com: {said_by(error)}')
             parsed = self.parse(payload)
             if status == 529 and write:  # "overloaded" is a 5xx: the write may have been applied, so never resend it
                 raise self.write_failed(path, status, parsed)
             if status in (429, 529):
-                reason = (parsed.get('additional_data') or {}).get('rate_limit_reason', '')
+                reason = extra_of(parsed).get('rate_limit_reason', '')
                 if limited >= MAX_RETRIES or reason == 'public_api_request_blocked':
                     if write:
                         raise self.write_failed(path, status, parsed, retries=limited)
@@ -574,7 +883,23 @@ class Notion:
                                      f'expired or mistyped): {LOGIN_HINT} again', write_outcome(401) if write else None)
             if write and not 200 <= status < 300 and write_outcome(status) == IN_DOUBT:
                 raise self.write_failed(path, status, parsed)
+            if 200 <= status < 300 and method != 'HEAD' and not self.is_answer(payload, path if write else None):
+                # A proxy's page, or the API's answer cut short: it does not say whether the write was applied.
+                if write:
+                    raise self.write_failed(path, status, parsed)
+                raise Fail(REFUSED, f'Notion answered {status} on {method} {path} with a body that is not JSON; '
+                                    'a proxy or a sign-in page may stand between this machine and api.notion.com')
             return status, parsed
+
+    @staticmethod
+    def is_answer(payload, written=None):
+        """Whether the body of a success is one the API sends: a JSON object, or a list of them; for the write to
+        the path `written`, the object that write answers."""
+        try:
+            said = json.loads(payload)
+        except ValueError:
+            return False
+        return isinstance(said, (dict, list)) if written is None else answers_write(written, said)
 
     @staticmethod
     def parse(payload):
@@ -595,7 +920,7 @@ class Notion:
                     return int(seconds) if seconds.is_integer() else seconds
                 except ValueError:
                     break
-        given = (parsed.get('additional_data') or {}).get('retry_after')
+        given = extra_of(parsed).get('retry_after')
         if isinstance(given, (int, float)):
             return given
         return min(2 ** attempt, 60)
@@ -609,9 +934,19 @@ class Notion:
             raise self.write_failed(path, status, parsed)
         raise ApiError(status, parsed.get('code', ''), parsed.get('message', ''), parsed, path)
 
-    def pages_of(self, method, path, body=None, query=None, max_items=None):
-        """Every item of a paged list, following next_cursor. Returns (items, more_left)."""
-        items, cursor = [], None
+    def pages_of(self, method, path, body=None, query=None, max_items=None, whole=False):
+        """Every item of a paged list, following next_cursor. Returns (items, more_left): more_left when there are
+        more than `max_items`. Paging stops once it has them; `whole` also returns what came past that number."""
+        items = []
+        for found, more in self.each_page(method, path, body, query):
+            items += found
+            if max_items is not None and len(items) >= max_items:
+                return items if whole else items[:max_items], more or len(items) > max_items
+        return items, False
+
+    def each_page(self, method, path, body=None, query=None):
+        """(items, whether more follow) of each answer of a paged list, read as they are asked for."""
+        cursor = None
         while True:
             if method == 'GET':
                 q = dict(query or {}, page_size=100)
@@ -623,19 +958,17 @@ class Notion:
                 if cursor:
                     b['start_cursor'] = cursor
                 answer = self.call(method, path, b, query=query)
-            items += answer.get('results', [])
             more = bool(answer.get('has_more') and answer.get('next_cursor'))
-            if max_items is not None and len(items) >= max_items:
-                return items[:max_items], more or len(items) > max_items
+            yield answer.get('results', []), more
             if not more:
-                return items, False
+                return
             cursor = answer['next_cursor']
 
     def not_connected(self, identifier, error):
-        return Fail(REFUSED, f'Notion answered {error.status} {error.api_code} for {identifier}: the integration is not '
-                             'connected to that page or its parent, or it lacks the capability. Open the page in '
-                             'Notion, menu > Connections, and add the integration (D8 keeps the access to the '
-                             'data sources the team agreed on).')
+        return NotConnected(REFUSED, f'Notion answered {error.status} {error.api_code} for {identifier}: the integration '
+                                     'is not connected to that page or its parent, or it lacks the capability. Open the '
+                                     'page in Notion, menu > Connections, and add the integration (D8 keeps the access '
+                                     'to the data sources the team agreed on).')
 
     # -- the bot, settings, people --------------------------------------------------------
 
@@ -655,16 +988,24 @@ class Notion:
     def remember(self, user):
         if not isinstance(user, dict) or not user.get('id') or not user.get('name'):
             return
-        known = self.people()
+        known, identifier = self.people(), user['id']
+        before = known.get(identifier) or {}
         entry = {'name': user['name'], 'type': user.get('type', 'person')}
-        email = (user.get('person') or {}).get('email') or (known.get(user['id']) or {}).get('email')
-        if email:
-            entry['email'] = email
-        if known.get(user['id']) != entry:
-            known[user['id']] = entry
-            for other, seen in (self.cache.get('people') or {}).items():  # another session may have written meanwhile
-                known.setdefault(other, seen)
-            self.cache.put('people', known)
+        email = (user.get('person') or {}).get('email')
+        if email or before.get('email'):
+            entry['email'] = email or before['email']
+        if before == entry:
+            return
+
+        def merge(saved):
+            # another session may have written since this one read the file: what it holds wins, for everyone but
+            # the person just seen, whose e-mail it may know when this answer does not give it
+            known.update(saved or {})
+            kept = email or (known.get(identifier) or {}).get('email') or before.get('email')
+            known[identifier] = dict(entry, email=kept) if kept else entry
+            return known
+
+        self.cache.update('people', merge)
 
     def list_users(self):
         """(people known after listing, None) or, when a page of the list fails, (the people of the pages read
@@ -765,28 +1106,104 @@ class Notion:
         cached = None if refresh else self.cache.get(f'schema-{identifier}')
         if cached is None:
             cached = self.call('GET', f'/v1/data_sources/{identifier}')
-            self.cache.put(f'schema-{identifier}', cached)
-            self._fresh.add(identifier)
+            self.store_schema(identifier, cached)
         self._schemas[identifier] = cached
         return cached
 
+    def store_schema(self, identifier, schema):
+        """Keep a schema the API just gave: for this command, in the cache, and in the cached list of data sources,
+        whose title and key property come from it."""
+        self._schemas[identifier] = schema
+        self._fresh.add(identifier)
+        self.cache.put(f'schema-{identifier}', cacheable_schema(schema))
+        known = listed_entry(identifier, schema)
+
+        def correct(listed):
+            if any(entry.get('id') == identifier and entry != known for entry in listed or []):
+                return [known if entry.get('id') == identifier else entry for entry in listed]
+            return None
+
+        self.cache.update('data_sources', correct)
+        if self._sources is not None:
+            self._sources = [known if entry['id'] == identifier else entry for entry in self._sources]
+
+    # -- a cached schema that is out of date ------------------------------------------------
+    # One rule, here and nowhere else: what an unknown property or option stops - the client's own lookup, the
+    # API's 400, a row that does not hold a column - is done once more from the schema read again. The API is read
+    # at most once per command for each data source.
+
     def refresh_schema(self, schema):
-        """Re-read a data source's schema from the API, at most once per command, and bring `schema` (the
-        caller's copy) up to date in place. False when there is nothing to re-read: no id, or already fresh."""
+        """Bring `schema` (the caller's copy, which needs only its id) up to date in place with the schema as the
+        API gave it in this command, read now unless it already was. True when that changed the copy."""
         identifier = schema.get('id')
-        if not identifier or identifier in self._fresh:
+        if not identifier:
             return False
-        fresh = self.data_source(identifier, refresh=True)
-        if fresh is not schema:
-            schema.clear()
-            schema.update(fresh)
+        fresh = self.get_data_source(identifier, refresh=identifier not in self._fresh)
+        if fresh == schema:
+            return False
+        schema.clear()
+        schema.update(fresh)
         return True
+
+    def look_up(self, schema, find):
+        """The client's own lookup: find(schema) and, when it finds nothing, once more in the schema read again."""
+        found = find(schema)
+        if found is None and self.refresh_schema(schema):
+            found = find(schema)
+        return found
+
+    def on_current_schema(self, schema, build, send, lacks=None, built=UNBUILT):
+        """send(build()), a step built from `schema`, which may come from the cache. When Notion refuses it with a
+        400 (a read changes nothing, and neither does a write answered 400), or lacks(step, result) finds that what
+        came back does not hold a property the step reads, the schema is read again and the step built again; one
+        that comes out different is run once more. A property that is still unknown then fails as any unknown
+        property does, and a refusal that has another cause stands."""
+        if built is UNBUILT:
+            built = build()
+
+        def rebuild():
+            self.refresh_schema(schema)
+            return build()
+
+        try:
+            result = send(built)
+        except ApiError as refused:
+            if refused.status != 400:
+                raise
+            try:
+                again = rebuild()
+            except ApiError:
+                raise refused
+            except Fail as failure:
+                if failure.code != USAGE:
+                    raise refused  # the schema could not be read again
+                raise Unbuildable(failure)
+            if again == built:
+                raise refused
+            return send(again)
+        if lacks and lacks(built, result):
+            again = rebuild()
+            if again != built:
+                return send(again)
+        return result
 
     def refresh_data_sources(self):
         """The list of connected data sources re-read, at most once per command; None when it was already."""
         return None if self._list_fresh else self.data_sources(refresh=True)
 
+    def disconnected(self, identifier):
+        """Whether a data source that answered 403 or 404 is gone: the list of connected data sources, read from
+        the API in this command, no longer holds it. One that is still listed refused, and that is never hidden."""
+        self.refresh_data_sources()
+        return not any(source['id'] == identifier for source in self.data_sources())
+
+    def skip_note(self, identifier):
+        self.warn(f'note: data source {identifier} is no longer connected (the list of data sources, read again, does '
+                  'not hold it), so it was not searched')
+
     def data_sources(self, refresh=False):
+        if not refresh and self._sources is not None:
+            return self._sources
         listed = None if refresh else self.cache.get('data_sources')
         if listed is not None:
             return listed
@@ -797,15 +1214,13 @@ class Notion:
             if source.get('object') != 'data_source':
                 continue
             if source.get('properties'):
-                self.cache.put(f"schema-{source['id']}", source)
-                self._schemas[source['id']] = source
-                self._fresh.add(source['id'])
+                self.store_schema(source['id'], source)
                 schema = source
             else:
                 schema = self.data_source(source['id'], refresh=True)
-            prefix, unique = unique_of(schema['properties'])
-            listed.append({'id': source['id'], 'title': plain(schema.get('title')), 'prefix': prefix, 'unique': unique})
-        self.cache.put('data_sources', listed)
+            listed.append(listed_entry(source['id'], schema))
+        self.cache.update('data_sources', lambda _: listed)  # not between another session's read and write of it
+        self._sources = listed
         return listed
 
     def data_source_title(self, identifier):
@@ -815,19 +1230,44 @@ class Notion:
             return identifier
 
     def page_by_key(self, prefix, number):
-        sources = [s for s in self.data_sources() if (s.get('prefix') or '').upper() == prefix]
-        if not sources:
-            sources = [s for s in self.data_sources(refresh=True) if (s.get('prefix') or '').upper() == prefix]
-        if not sources:
+        def prefixed(listed):
+            return [s for s in listed or [] if (s.get('prefix') or '').upper() == prefix]
+
+        queue = prefixed(self.data_sources()) or prefixed(self.refresh_data_sources())
+        asked = set()
+        while queue:
+            source = queue.pop(0)
+            asked.add(source['id'])
+            try:
+                rows = self.rows_by_key(source, number)
+            except ApiError as failure:
+                if failure.status not in (403, 404) or not self.disconnected(source['id']):
+                    raise
+                self.skip_note(source['id'])
+                queue = [s for s in prefixed(self.data_sources()) if s['id'] not in asked]
+                continue
+            if rows:
+                return rows[0]
+        if not prefixed(self.data_sources()):
             known = sorted({s['prefix'] for s in self.data_sources() if s.get('prefix')})
-            raise Fail(USAGE, f'no connected data source has the key prefix {prefix}; known prefixes: '
-                              f"{', '.join(known) or 'none'}")
-        for source in sources:
-            answer = self.call('POST', f"/v1/data_sources/{source['id']}/query",
-                               {'filter': {'property': source['unique'], 'unique_id': {'equals': number}}, 'page_size': 1})
-            if answer.get('results'):
-                return answer['results'][0]
-        raise Fail(REFUSED, f'no page with key {prefix}-{number}')
+            raise NoSuchKey(USAGE, f'no connected data source has the key prefix {prefix}; known prefixes: '
+                                   f"{', '.join(known) or 'none'}")
+        raise NoSuchKey(REFUSED, f'no page with key {prefix}-{number}')
+
+    def rows_by_key(self, source, number):
+        schema = {'id': source['id']}  # filled when the key property the cached list names no longer works
+
+        def unique():
+            return unique_of(schema['properties'])[1] if 'properties' in schema else source['unique']
+
+        def ask(name):
+            if name is None:  # the data source has no unique id any more
+                return []
+            return self.call('POST', f"/v1/data_sources/{source['id']}/query",
+                             {'filter': {'property': name, 'unique_id': {'equals': number}}, 'page_size': 1}
+                             ).get('results', [])
+
+        return self.on_current_schema(schema, unique, ask)
 
     def resolve(self, text, want=None):
         """('page', page) or ('data_source', schema) for any reference form."""
@@ -846,7 +1286,7 @@ class Notion:
             titled = self.data_source_titled(text)
             if titled:
                 return 'data_source', titled
-            names = ', '.join(s['title'] for s in self.data_sources())
+            names = ', '.join(s['title'] for s in self.data_sources() if s['title'])
             raise Fail(USAGE, f'{text!r} is not a page id, a url, a key or the title of a connected data source '
                               f'({names or "none connected"}); to find a page by its words use `notion search`')
         identifier = ref.value
@@ -867,14 +1307,11 @@ class Notion:
                     continue
                 raise
             if kinds.get(identifier) != kind:
-                kinds[identifier] = kind
-                self.cache.put('kinds', kinds)
+                self.cache.update('kinds', lambda saved: dict(saved or {}, **{identifier: kind}))
             if kind == 'page':
                 return 'page', found
             if kind == 'data_source':
-                self._schemas[identifier] = found
-                self._fresh.add(identifier)
-                self.cache.put(f'schema-{identifier}', found)
+                self.store_schema(identifier, found)
                 return 'data_source', found
             sources = found.get('data_sources') or []
             if len(sources) == 1:
@@ -883,13 +1320,35 @@ class Notion:
             raise Fail(USAGE, f'{identifier} is a database with {len(sources)} data sources; name one: {listed}')
         raise self.not_connected(identifier, last)
 
-    def get_data_source(self, identifier):
+    def get_data_source(self, identifier, refresh=False):
+        """A data source the command was pointed at: one that cannot be read says how to connect it."""
         try:
-            return self.data_source(identifier)
+            return self.data_source(identifier, refresh=refresh)
         except ApiError as error:
             if error.status in (403, 404):
                 raise self.not_connected(identifier, error)
             raise
+
+    def of_data_source(self, schema, ask):
+        """ask(), a request about a data source whose schema may come from the cache. When it is answered 403 or
+        404 the schema is read from the API: a data source that is gone then fails as it does with nothing cached,
+        and one that can be read keeps the API's own refusal."""
+        try:
+            return ask()
+        except ApiError as refused:
+            if refused.status in (403, 404):
+                self.check_connected(schema)
+            raise
+
+    def check_connected(self, schema):
+        """NotConnected when the schema of a data source can no longer be read. Any other failure of that read says
+        nothing about it, and the refusal it was checking stands."""
+        try:
+            self.refresh_schema(schema)
+        except NotConnected:
+            raise
+        except Fail:
+            pass
 
     def data_source_titled(self, text):
         def find(listed):
@@ -906,16 +1365,16 @@ class Notion:
             raise Fail(USAGE, f'{text} is a data source, not a page')
         return found
 
-    def schema_for(self, page, refresh=False):
+    def schema_for(self, page):
         source = page.get('parent', {}).get('data_source_id')
         if source:
-            return self.data_source(source, refresh=refresh)
+            return self.get_data_source(source)
         return {'object': 'page_parent', 'title': [], 'properties': {'title': {'id': 'title', 'name': 'title', 'type': 'title'}}}
 
     # -- reading values -------------------------------------------------------------------
 
     def short_values(self, page, names=None):
-        """The page's properties in the short format, in the page's order."""
+        """The page's properties in the short format, in the page's order, links in text as [text](url)."""
         values = {}
         for name, prop in page.get('properties', {}).items():
             if names is not None and name not in names:
@@ -927,9 +1386,9 @@ class Notion:
     def short(self, name, prop, page_id):
         kind = prop.get('type')
         value = prop.get(kind)
-        label = f'userDefined:{name}' if name.lower() in ('id', 'url') else name
+        label = short_label(name)
         if kind in ('title', 'rich_text'):
-            return [(label, plain(value))]
+            return [(label, linked(value))]
         if kind in ('select', 'status'):
             return [(label, value.get('name') if value else None)]
         if kind == 'multi_select':
@@ -1032,11 +1491,9 @@ class Notion:
     def property_name(self, wanted, page_schema, quiet):
         """The schema's name for `wanted`; None (quiet) or a USAGE failure naming the nearest names."""
         properties = page_schema['properties']
-        if wanted in properties:
-            return wanted
-        for name in properties:
-            if name.casefold() == wanted.casefold():
-                return name
+        called = property_called(properties, wanted)
+        if called:
+            return called
         if wanted.casefold() in ('title', 'name'):
             for name, prop in properties.items():
                 if prop.get('type') == 'title':
@@ -1059,11 +1516,7 @@ class Notion:
             date_key = re.fullmatch(r'date:(.+):(start|end|is_datetime)', left)
             if date_key:
                 left, field = date_key.group(1), date_key.group(2)
-            if left.startswith('userDefined:'):
-                left = left[len('userDefined:'):]
-            name = self.property_name(left, page_schema, quiet=True)
-            if name is None and page_schema.get('id'):
-                page_schema = self.data_source(page_schema['id'], refresh=True)  # the cached schema may be stale
+            name = self.look_up(page_schema, lambda schema: self.property_name(left, schema, quiet=True))
             name = name or self.property_name(left, page_schema, quiet=False)
             prop = page_schema['properties'][name]
             kind = prop.get('type')
@@ -1079,22 +1532,23 @@ class Notion:
 
     def option(self, name, prop, value, page_schema):
         kind = prop['type']
-        options = [o['name'] for o in (prop.get(kind) or {}).get('options', [])]
-        for candidate in options:
-            if candidate.casefold() == value.casefold():
-                return candidate
-        if page_schema.get('id'):
-            fresh = self.data_source(page_schema['id'], refresh=True)['properties'].get(name, prop)
-            for candidate in [o['name'] for o in (fresh.get(kind) or {}).get('options', [])]:
-                if candidate.casefold() == value.casefold():
-                    return candidate
-        raise Fail(USAGE, f"unknown option {value!r} for the {kind} property {name}; options: {', '.join(options)}")
+
+        def options(schema):
+            return [o['name'] for o in ((schema['properties'].get(name) or {}).get(kind) or {}).get('options', [])]
+
+        found = self.look_up(page_schema, lambda schema: next(
+            (o for o in options(schema) if o.casefold() == value.casefold()), None))
+        if found is not None:
+            return found
+        self.property_name(name, page_schema, quiet=False)  # the schema read again may not hold the property at all
+        raise Fail(USAGE, f"unknown option {value!r} for the {kind} property {name}; options: "
+                          f"{', '.join(options(page_schema))}")
 
     def typed(self, name, prop, value, page_schema):
         kind = prop.get('type')
         empty = value.strip() in ('', 'null', 'none')
         if kind in ('title', 'rich_text'):
-            return {kind: rich_text(value) if value else []}
+            return {kind: linked_text(value)}
         if kind == 'number':
             return {'number': None if empty else number_of(value.strip(), name)}
         if kind in ('select', 'status'):
@@ -1127,22 +1581,29 @@ class Notion:
         raise Fail(USAGE, f'{name} is a {kind} property; write it with `notion api PATCH /v1/pages/<id>` and the API shape')
 
     def typed_date(self, name, fields, page):
-        start, end = fields.get('start'), fields.get('end')
-        if start is not None and start.strip() in ('', 'null', 'none'):
+        start, end = (None if fields.get(field) is None else fields[field].strip() for field in ('start', 'end'))
+        if start is not None and no_date(start):
             return {'date': None}
         current = ((page or {}).get('properties', {}).get(name) or {}).get('date') or {}
-        if start is None and end is not None:
+        start_kept, end_kept = start is None, end is None
+        if start_kept and not end_kept:
             start = current.get('start')
             if not start:
                 raise Fail(USAGE, f'date:{name}:end needs a start: the page has none, so pass date:{name}:start too')
         if start is None:
             raise Fail(USAGE, f'date:{name} needs :start')
         value = {'start': start}
-        if end is None:  # only :start given: move the start, keep the range and its time zone
+        if end_kept:  # only :start given: move the start, keep the range and its time zone
             end = current.get('end')
             if current.get('time_zone') and 'T' in start:
                 value['time_zone'] = current['time_zone']
-        if end:
+        if end and not no_date(end):
+            if ends_before_it_starts(start, end, current.get('time_zone') if start_kept or end_kept else None):
+                said = (f'the new start {start} is after the end the property keeps, {end}' if end_kept
+                        else f'the new end {end} is before the start the property keeps, {start}' if start_kept
+                        else f'the start {start} is after the end {end}')
+                raise Fail(USAGE, f'date:{name}: {said}; nothing was sent. Set the end with date:{name}:end=<date>, on or '
+                                  f'after the start, or clear it with date:{name}:end= (an empty value)')
             value['end'] = end
         return {'date': value}
 
@@ -1188,11 +1649,79 @@ class Notion:
         return [(i, p) for i, p in people.items() if needle in fold(p.get('name')) or needle in fold(p.get('email'))]
 
 
+def no_date(value):
+    """Whether what was written for a date stands for none. The documented form is the empty value; `null`, as an
+    empty end is printed, and `none` are read as it and never sent as a date."""
+    return value.strip().casefold() in ('', 'null', 'none')
+
+
+def ends_before_it_starts(start, end, zone=None):
+    """Whether a date range ends before it starts. A plain date is its whole day, so against one only the days
+    are compared; a time with no offset is in the range's time zone, else UTC. False for what is not a date,
+    which Notion judges."""
+    try:
+        first, last = (datetime.date.fromisoformat(v) if len(v) == 10
+                       else datetime.datetime.fromisoformat(v.replace('Z', '+00:00')) for v in (start, end))
+    except ValueError:
+        return False
+    if not (isinstance(first, datetime.datetime) and isinstance(last, datetime.datetime)):
+        first, last = (m.date() if isinstance(m, datetime.datetime) else m for m in (first, last))
+        return last < first
+    try:
+        local = zoneinfo.ZoneInfo(zone) if zone else datetime.timezone.utc
+    except (ValueError, zoneinfo.ZoneInfoNotFoundError):
+        local = datetime.timezone.utc
+    first, last = (m if m.tzinfo else m.replace(tzinfo=local) for m in (first, last))
+    return last < first
+
+
 def unique_of(properties):
     for name, prop in properties.items():
         if prop.get('type') == 'unique_id':
             return (prop.get('unique_id') or {}).get('prefix'), name
     return None, None
+
+
+USER_DEFINED = 'userDefined:'
+
+
+def short_label(name):
+    """The short format's key for a property: `id` and `url` are the page's own, so a property of one of those
+    names (any case) is under userDefined:<name>."""
+    return USER_DEFINED + name if name.lower() in ('id', 'url') else name
+
+
+def property_called(properties, wanted):
+    """The name of the property a command calls `wanted`: by that name, by it in any case, or by it under the
+    userDefined: prefix short_label() prints; None when there is none."""
+    plain_name = wanted[len(USER_DEFINED):] if wanted.casefold().startswith(USER_DEFINED.casefold()) else wanted
+    for said in dict.fromkeys((wanted, plain_name)):
+        for name in (said, *(name for name in properties if name.casefold() == said.casefold())):
+            if name in properties:
+                return name
+    return None
+
+
+def value_named(values, name):
+    """The value of the property `name` among short_values(), whatever key the short format gives it; a date's
+    is its start."""
+    return next((values[key] for key in (short_label(name), f'date:{name}:start') if key in values), None)
+
+
+def cacheable_schema(schema):
+    """What the cache keeps of a data source: only what the client reads from it, the title as plain text. Its icon
+    and cover can be uploaded files, whose address is signed with temporary credentials, and a custom emoji in the
+    title has an address too: none of that is kept."""
+    kept = {key: schema[key] for key in ('object', 'id', 'parent', 'properties') if key in schema}
+    title = plain(schema.get('title'))
+    kept['title'] = [{'type': 'text', 'text': {'content': title}, 'plain_text': title}] if title else []
+    return kept
+
+
+def listed_entry(identifier, schema):
+    """What the list of connected data sources keeps of one."""
+    prefix, unique = unique_of(schema['properties'])
+    return {'id': identifier, 'title': plain(schema.get('title')), 'prefix': prefix, 'unique': unique}
 
 
 def icon_of(value):
@@ -1213,7 +1742,7 @@ def icon_of(value):
 def schema_lines(client, schema, budget=SCHEMA_BUDGET):
     props = schema.get('properties', {})
     prefix, unique = unique_of(props)
-    head = [f"data source: {plain(schema.get('title'))}", f"ref: {COLLECTION}{schema['id']}"]
+    head = [f"data source: {plain(schema.get('title')) or UNTITLED}", f"ref: {COLLECTION}{schema['id']}"]
     database = (schema.get('parent') or {}).get('database_id')
     if database:
         head.append(f'database: {database}')
@@ -1260,7 +1789,7 @@ def cmd_fetch(client, args):
     if kind == 'data_source':
         client.refresh_schema(found)  # the schema a write is built from is read from the API, whatever the reference form
         if args.json:
-            client.say(json.dumps(found, ensure_ascii=False, indent=2))
+            client.emit(found)
         else:
             client.say('\n'.join(schema_lines(client, found)))
         return DONE
@@ -1268,7 +1797,7 @@ def cmd_fetch(client, args):
     body = None if args.props_only else client.markdown(page['id'])
     threads = client.discussions(page['id']) if args.discussions else None
     if args.json:
-        client.say(json.dumps({'page': page, 'markdown': body, 'discussions': threads}, ensure_ascii=False, indent=2))
+        client.emit({'page': page, 'markdown': body, 'discussions': threads})
         return DONE
     lines = [f'title: {client.title_of(page)}', f"url: {page.get('url')}", f"id: {page['id']}"]
     key = client.key_of(page)
@@ -1293,7 +1822,7 @@ def cmd_fetch(client, args):
         for discussion, comments in threads.items():
             lines.append(f'- discussion {discussion}')
             for comment in comments:
-                said = plain(comment.get('rich_text')) or '(attachment only)'
+                said = linked(comment.get('rich_text')) or '(attachment only)'
                 lines.append(f'  {client.author(comment)}: {said}')
     client.say('\n'.join(lines))
     return DONE
@@ -1302,6 +1831,405 @@ def cmd_fetch(client, args):
 # ---------------------------------------------------------------------------------------------
 # update, trash
 # ---------------------------------------------------------------------------------------------
+
+PLACEHOLDER = 'https://file-upload.invalid/'
+MEDIA = ('image', 'file', 'pdf', 'audio', 'video')
+_LINE_MARK = re.compile(r' *(>|(?:[-*+]|\d{1,9}[.)])(?= |$))')
+_FENCE = re.compile(r'(`{3,})[^`]*$|(~{3,})')
+
+
+def body_lines(markdown):
+    """[line, fence] for each line of a body: fence is None for a line of text, and one dict for every line of a
+    block of code (fenced by ``` or ~~~) or of a display equation ($$), its own marks included. A fence ends at its
+    closing mark, where the quote or the list item it stands in ends, or at the end of the body (`closed` False)."""
+    lines, fence, items = markdown.split('\n'), None, []  # items: the column of the text of each list item it is in
+    out = []
+    for number, line in enumerate(lines):
+        text = line.rstrip('\r').expandtabs(4)
+        if fence:
+            state = within_fence(fence, text)
+            fence['closed'] = state != 'code'
+            if state != 'out':
+                out.append([line, fence])
+                fence = None if state == 'end' else fence
+                continue
+            fence = None
+        at, quotes, marks, first, mark = 0, 0, [], None, _LINE_MARK.match(text)
+        while mark:
+            first = mark.start(1) if first is None else first
+            if mark.group(1) == '>':
+                quotes += 1
+            else:
+                marks.append(mark.end() + 1)
+            at = mark.end()
+            mark = _LINE_MARK.match(text, at)
+        rest = text[at:].lstrip(' ')
+        column = len(text) - len(rest)
+        if text.strip():
+            edge = column if first is None else first
+            items = [item for item in items if item <= edge] + marks
+        item = max((c for c in items if c <= column), default=0)
+        opens = _FENCE.match(rest) if column - max(item, at) < 4 else None
+        if opens:
+            run = opens.group(1) or opens.group(2)
+            fence = {'mark': run[0], 'size': len(run), 'column': column, 'quotes': quotes, 'item': item}
+        elif rest.strip() == '$$' and any(later.strip(' \t\r>') == '$$' for later in lines[number + 1:]):
+            fence = {'mark': '$', 'size': 2, 'column': column, 'quotes': quotes, 'item': item}
+        if fence:
+            fence.update(closed=False, line=number + 1)
+        out.append([line, fence])
+    return out
+
+
+def within_fence(fence, text):
+    """What a line is to the fence that is open: 'code', its 'end', or 'out' of the quote or item it stood in."""
+    at = 0
+    for _ in range(fence['quotes']):
+        mark = re.compile(' *>').match(text, at)
+        if not mark:
+            return 'out'
+        at = mark.end()
+    said = text[at:].strip()
+    column = len(text) - len(text[at:].lstrip(' '))
+    if not said:
+        return 'code'
+    if column < fence['item']:
+        return 'out'
+    if set(said) == {fence['mark']} and len(said) >= fence['size'] and (fence['mark'] != '$' or said == '$$'):
+        return 'end' if column <= fence['column'] + 3 else 'code'
+    return 'code'
+
+
+def code_spans(text):
+    """(start, end) of each piece of inline code: between two runs of as many backticks, over lines too, as Notion
+    reads them, and between <code> and </code>."""
+    runs, by_size = [(m.start(), m.end()) for m in re.finditer('`+', text)], {}
+    for start, end in runs:
+        by_size.setdefault(end - start, []).append(start)
+    spans, at = [], 0
+    for start, end in runs:
+        if start < at:
+            continue
+        slashes = 0
+        while start - slashes > at and text[start - slashes - 1] == '\\':
+            slashes += 1
+        start += slashes % 2  # an escaped backtick is text
+        size = end - start
+        closing = by_size.get(size, [])
+        place = bisect.bisect_left(closing, end)
+        if size and place < len(closing):
+            at = closing[place] + size
+            spans.append((start, at))
+    at = text.find('<code>')
+    while at >= 0:
+        end, line = text.find('</code>', at), text.find('\n', at)
+        if end < 0:
+            break
+        if line < 0 or end < line:
+            spans.append((at, end))
+        at = text.find('<code>', end if line < 0 or end < line else line)
+    return spans
+
+
+# An uploaded file in a body, as `notion upload` prints it: ![name](file-upload://<id>) or <file source="file-upload://<id>">
+# name</file>. The markdown endpoints do not know that address: they store an empty block. So it is sent as an address of
+# the placeholder host that carries the upload's id, which Notion stores as it is, and each block that holds one is then
+# given the uploaded file. Only a block of its own can hold a file, so a reference anywhere else is refused before
+# anything is sent; code is text.
+# stale: written as a placeholder, not as file-upload://; tag: what it was written in, '' for an image; held: the id in the
+# placeholder that waits for it, another one when a new upload takes the place of one that expired
+BodyFile = collections.namedtuple('BodyFile', 'id name stale line tag held')
+_FILE_ADDRESS = r'(?:(?i:file-upload://)|https://file-upload\.invalid/)' + UUID_RE.pattern
+FILE_ADDRESS = re.compile(_FILE_ADDRESS)
+PLACEHOLDER_ID = re.compile(re.escape(PLACEHOLDER) + UUID_RE.pattern)
+MARKS = re.compile(r'(?:[ \t>]|[-*+][ \t]|\d{1,9}[.)][ \t])*')
+_IMAGE = r'!\[(?P<name>(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*\])*)\]\(\s*<?(?P<address>' + _FILE_ADDRESS + r')>?'
+IMAGE_LINE = re.compile(r'[ \t>]*' + _IMAGE + r'(?:\s+(?:"[^"]*"|\'[^\']*\'|\([^()]*\)))?\s*\)\s*')
+TAG_LINE = re.compile(MARKS.pattern + r'<(?P<tag>image|img|file|pdf|audio|video)(?P<attributes>\s[^<>]*)>')
+SOURCE = re.compile(r'\s(?:source|src)\s*=\s*(?P<address>"\s*' + _FILE_ADDRESS + r'\s*"|\'\s*' + _FILE_ADDRESS + r'\s*\')')
+BAD_FILE_ADDRESS = re.compile(r'(?:\]\(\s*<?|\b(?:source|src)\s*=\s*(?:["\']\s*)?)(?P<address>(?i:file-upload)://)(?!' + UUID_RE.pattern + ')')
+PLACEHOLDER_ALONE = re.compile(r'\s*' + PLACEHOLDER_ID.pattern + r'\s*')
+UPLOAD_ALONE = re.compile(r'\s*(?i:file-upload://)' + UUID_RE.pattern + r'\s*')
+
+
+def file_line(line):
+    """(tag, name, start, end of the address) of a line that is one uploaded file and nothing else, in a form Notion
+    makes a block of; else None. The tag of an image is ''."""
+    found = IMAGE_LINE.fullmatch(line)
+    if found:
+        return ('', found.group('name').strip(), *found.span('address'))
+    found = TAG_LINE.match(line)
+    source = found and SOURCE.search(line, found.start('attributes'), found.end('attributes'))
+    if not source:
+        return None
+    tag, rest = found.group('tag'), line[found.end():].strip()
+    closing = f'</{tag}>'
+    if rest if found.group('attributes').rstrip().endswith('/') else closing in rest and rest.index(closing) != len(rest) - len(closing):
+        return None
+    return ('' if tag in ('image', 'img') else tag, rest.split('</')[0].strip(), *source.span('address'))
+
+
+def outside_code(rows):
+    """(index, line, code) of each line of body_lines() that is not in a block of code. code(place) is the number of the
+    line that opens the inline code which holds that place of the line, 0 when none does."""
+    first = 0
+    while first < len(rows):
+        last = first
+        while last < len(rows) and rows[last][1] is None:
+            last += 1
+        lines = [line for line, _ in rows[first:last]]
+        begins = list(itertools.accumulate((len(line) + 1 for line in lines), initial=0))
+        spans = []
+        for start, end in sorted(code_spans('\n'.join(lines))):
+            if spans and start < spans[-1][1]:
+                spans[-1][1] = max(end, spans[-1][1])
+            else:
+                spans.append([start, end])
+        starts = [start for start, _ in spans]
+
+        def code(place):
+            at = bisect.bisect_right(starts, place) - 1
+            return first + bisect.bisect_right(begins, starts[at]) if at >= 0 and place < spans[at][1] else 0
+
+        for index, line in enumerate(lines):
+            yield first + index, line, lambda place, begin=begins[index]: code(begin + place)
+        first = last + 1
+
+
+def hold_files(markdown, where):
+    """(the markdown with each uploaded file's address as its placeholder, the files in it). A reference that Notion
+    would not make a block of, or one inside code that nothing closes, is refused: Fail(USAGE), nothing sent."""
+    if 'file-upload' not in markdown.lower():
+        return markdown, []
+
+    def refuse(number, said, why):
+        raise Fail(USAGE, f'{where}, line {number}: {said} {why}; nothing was sent')
+
+    rows, files, table, opened = body_lines(markdown), [], False, 0  # opened: the line of a <table> nothing closed yet
+    for number, (line, fence) in enumerate(rows, 1):
+        if fence and not fence['closed'] and FILE_ADDRESS.search(line):
+            refuse(number, FILE_ADDRESS.search(line).group(), f"stands in the code that line {fence['line']} opens and nothing closes")
+    for index, line, code in outside_code(rows):
+        number, own, found = index + 1, None, file_line(line)
+        if found:
+            own = FILE_ADDRESS.search(line, found[2])
+            opens = code(own.start())
+            if opens and re.match(r'[ \t]*`{3,}', rows[opens - 1][0]):
+                refuse(number, own.group(), f'is in the fence that line {opens} opens, indented by a tab or by four spaces or more: Notion '
+                                            'reads that as inline code, not as a block of code, so it would keep the file as text. Write '
+                                            'the fence with at most three spaces before it, or under its list item')
+            if opens:
+                refuse(number, own.group(), f'is inside the inline code that a backtick on line {opens} opens, so Notion would '
+                                            'keep it as text: close or escape (\\`) that backtick')
+            if table:
+                refuse(number, own.group(), 'stands in a table: a cell holds only text, so Notion cannot show a file there')
+        for other in FILE_ADDRESS.finditer(line):
+            if (own is None or other.start() != own.start()) and not code(other.start()):
+                refuse(number, other.group(), 'is not on a line of its own. Notion makes a file only of a block: write '
+                       '![name](file-upload://<id>) or <file source="file-upload://<id>">name</file> alone on its line, with a '
+                       'blank line before and after (it refuses an image inside a sentence, a heading, a list item or a table cell, '
+                       'and keeps a tag there as text), or write it as code, `file-upload://…`, when it is only text')
+        for bad in BAD_FILE_ADDRESS.finditer(line):
+            if not code(bad.start('address')):
+                refuse(number, line[bad.start('address'):][:60].split()[0], 'is not the address of an upload: it is file-upload:// and the '
+                       'id `notion upload` printed')
+        for tag in re.finditer(r'(?<!\\)<(/?)table\b', line):
+            if not code(tag.start()):
+                table = not tag.group(1) and (table or bool(MARKS.fullmatch(line, 0, tag.start())))  # in a sentence it is text
+                opened = 0 if tag.group(1) else opened or number
+        if found:
+            tag, name, start, end = found
+            upload, quote = hyphenate(own.group()), '' if line[start] not in '"\'' else '"'
+            files.append(BodyFile(upload, name, own.group().startswith(PLACEHOLDER), number, tag, upload))
+            rows[index][0] = line[:start] + quote + PLACEHOLDER + upload + quote + line[end:]
+    if files and opened:
+        refuse(opened, '<table>', 'is never closed, and Notion refuses the whole body for it: close it, or write \\<table> or `<table>` '
+               'when it is only text')
+    return '\n'.join(line for line, _ in rows), files
+
+
+def refuse_placeholders(held):
+    """Refuse a body that holds the placeholder of a file this command does not supply: it was read back after a
+    file could not be placed, and written as it is it would stay an address that shows nothing."""
+    given = {file.id for _, files in held for file in files if not file.stale}
+    for where, files in held:
+        for file in files:
+            if file.stale and file.id not in given:
+                raise Fail(USAGE, f'{where}, line {file.line}: {PLACEHOLDER}{file.id} is the address this client leaves where an '
+                                  f'uploaded file was not placed, and nothing is there. Write file-upload://{file.id} in its place (upload '
+                                  'the file again when that was over an hour ago, and write its new id), or take the line out; '
+                                  'nothing was sent')
+
+
+def placeholders_in(markdown):
+    """The placeholders in a page's markdown as it reads back, outside code: how many blocks wait for each upload, and
+    the uploads whose placeholder is text."""
+    blocks, texts = collections.Counter(), set()
+    if PLACEHOLDER in markdown:
+        for _, line, code in outside_code(body_lines(markdown)):
+            own = file_line(line)
+            for found in PLACEHOLDER_ID.finditer(line):
+                if own and own[2] <= found.start() < own[3]:
+                    blocks[hyphenate(found.group())] += 1
+                elif not code(found.start()):
+                    texts.add(hyphenate(found.group()))
+    return blocks, texts
+
+
+def waiting_texts(markdown, upload):
+    """The different texts, in a page's markdown, of the blocks that wait for an upload."""
+    address = re.escape(PLACEHOLDER + upload)
+    image = r'!\[(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*\])*\]\(' + address + r'\)'
+    tag = r'<(image|file|pdf|audio|video)\s[^<>]*' + address + r'"[^<>]*(?:/>|>.*?</\1>)'
+    return list(dict.fromkeys(found.group() for found in re.finditer(f'{image}|{tag}', markdown, re.S)))
+
+
+def find_waiting(client, page_id, wanted, from_end):
+    """(the media blocks that wait for the uploads of `wanted`, as (block id, type, upload id), the blocks skipped, what
+    ended the search or None). It goes no further than it takes to find that many: the page's own blocks, then each
+    block that has children, the last ones first when the write was at the end. A block whose children Notion does
+    not give is skipped with a warning; any other failure below the page's own list ends the search."""
+    stack, seen, total, found, skipped = [page_id], set(), sum(wanted.values()), [], []
+    while stack and len(found) < total:
+        identifier, inside = stack.pop(), []
+        try:
+            for blocks, _ in client.each_page('GET', f'/v1/blocks/{identifier}/children'):
+                for block in blocks:
+                    kind = block.get('type')
+                    url = ((block.get(kind) or {}).get('external') or {}).get('url') or ''
+                    if block['id'] in seen:
+                        continue  # a synced block shows the same blocks twice
+                    seen.add(block['id'])
+                    if kind in MEDIA and url.startswith(PLACEHOLDER) and hyphenate(url) in wanted:
+                        found.append((block['id'], kind, hyphenate(url)))
+                    if block.get('has_children') and kind not in ('child_page', 'child_database', 'table'):
+                        inside.append(block['id'])
+                if len(found) >= total and not from_end:
+                    break
+        except Exception as error:
+            if identifier == page_id:
+                raise
+            if not (isinstance(error, ApiError) and error.status in (400, 403, 404)):
+                return found, skipped, as_fail(error)
+            skipped.append(identifier)
+            client.warn(f'warning: the blocks inside block {identifier} could not be read, so no file was looked for there ({error.cause})')
+        stack += inside if from_end else reversed(inside)
+    return found, skipped, None
+
+
+def written_form(file, tag=None):
+    """A file as a line of a body, in the tag it was written in or in `tag`; <file> takes any kind of file."""
+    tag = file.tag if tag is None else tag
+    return f'<{tag} source="file-upload://{file.id}">{file.name}</{tag}>' if tag else f'![{file.name}](file-upload://{file.id})'
+
+
+def place_command(where, held, new):
+    quoted = new.replace("'", "'\\''")
+    return f"`notion update {where} --edit '{PLACEHOLDER}{held}' '{quoted}'`"
+
+
+def files_left(where, files, sure=True, refused=''):
+    """The sentence that says which files are not on the page (`sure`), or may not be, and the command that places each;
+    `refused` is the placeholder whose block cannot take that kind of file: its block is written again as a <file>."""
+    files = list({file.held: file for file in files}.values())
+    commands = [place_command(where, f.held, written_form(f, 'file') if f.held == refused else f'file-upload://{f.id}') for f in files]
+    return (f"The page {'still holds' if sure else 'may still hold'} the placeholder of "
+            f"{', '.join(file_label(f.name, f.id) for f in files)} and not the file; place it with {', '.join(commands)} "
+            '(it says that no edit matched when the file is already there; when the upload was over an hour ago, upload the file '
+            'again and put its new id in the second part)')
+
+
+def file_label(name, upload):
+    return f'file {name!r} ({upload})' if name else f'file {upload}'
+
+
+def warn_left(client, where, blocks, texts):
+    """Name the placeholders a page holds that are not this command's work, each once."""
+    lines = [f'warning: {where} holds the placeholder of another upload, or of another place of one ({upload}), which an earlier command '
+             f"did not place: run {place_command(where, upload, f'file-upload://{upload}')}, or, when that was over an hour ago, upload that "
+             'file again and put its new id in the second part' for upload in blocks]
+    lines += [f'warning: {where} holds {PLACEHOLDER}{upload} in text, where Notion cannot show a file: take it out' for upload in texts]
+    for line in lines:
+        if line not in client.left_said:
+            client.left_said.add(line)
+            client.warn(line)
+
+
+def place_files(client, page_id, files, landed, where, before='', from_end=False, rest=(), then='', misses=()):
+    """Give each block that holds a placeholder of these files its file, then read the page's markdown: none may be left.
+    `before` is the markdown once the body was written, '' when it is not known. Each block is one write; `landed` grows
+    with each, and a failure is report_writes' (rest: the writes of the command still to come, then: what to do about
+    them once the files are there)."""
+    own, first = collections.Counter(file.held for file in files), {file.held: file for file in reversed(files)}
+    names = {held: file_label(file.name, file.id) for held, file in first.items()}
+    waiting, texts = placeholders_in(before)
+    warn_left(client, where, [u for u in waiting if u not in own], sorted(texts - set(own)))
+    wanted = own | collections.Counter({u: waiting[u] for u in own})  # an earlier command may have left one of the same upload
+
+    def report(label, failure, pending=(), advice=()):
+        raise report_writes('update', landed, label, failure, [*pending, *rest], where=where, misses=misses,
+                            finish='. '.join([*advice, *([then] if then else [])]))
+
+    def commands(uploads, sure=True, refused=''):
+        return [files_left(where, [first[u] for u in uploads], sure, refused)] if uploads else []
+
+    def times(counts):
+        return [names[u] + ('' if counts[u] == own[u] else f' ({counts[u]} of its {own[u]} places)') for u in counts]
+
+    try:
+        found, skipped, stopped = find_waiting(client, page_id, wanted, from_end)
+    except Exception as error:
+        failure = as_fail(error)
+        report(', '.join(times(own)), Fail(failure.code, outcome=NOT_SENT, cause='the page could not be read to place them: '
+                                           f'{failure.cause}'), advice=commands(own))
+    missing = own - collections.Counter(held for *_, held in found)
+    for number, (block, kind, held) in enumerate(found):
+        try:
+            client.call('PATCH', f'/v1/blocks/{block}', {kind: {'file_upload': {'id': first[held].id}}})
+        except Fail as failure:
+            later = found[number + 1:]
+            wrong_kind = isinstance(failure, ApiError) and re.search(r'only \w+ files are expected', failure.api_message)
+            report(f'{names[held]} in block {block}', failure, [f'{names[u]} in block {b}' for b, _, u in later] + times(missing),
+                   commands([held, *(u for *_, u in later), *missing], failure.outcome != IN_DOUBT, held if wrong_kind else ''))
+        landed.append(f'{names[held]} placed in block {block}')
+    shown = before
+    if found:
+        try:
+            shown = client.markdown(page_id)['markdown']
+            waiting, texts = placeholders_in(shown)
+        except Exception as error:
+            pending = [*times(missing), *rest]
+            raise Fail(PARTIAL, f"done in part on {where}: written: {'; '.join(landed)}. Not confirmed: the page could not be read again to "
+                                f'check that no placeholder is left ({as_fail(error).cause}). Fetch it: if {PLACEHOLDER} is in its body, run '
+                                + ', '.join(place_command(where, u, f'file-upload://{first[u].id}') for u in own)
+                                + (f"; not sent: {'; '.join(pending)}" if pending else '')
+                                + (f"; edits that did not apply: {'; '.join(misses)}" if misses else '') + (f'. {then}' if then else ''))
+    hidden = wanted - collections.Counter(held for *_, held in found)  # known, and in no block that was read
+    doubt = [u for u in own if found and waiting[u] > hidden[u]]
+    why, advice = [], []
+    for held in missing:
+        why.append(f'the page could not be read to the end to place {names[held]} ({stopped.cause})' if stopped
+                   else f'{names[held]} stands in text, which cannot hold a file' if held in texts
+                   else f"{names[held]} stands in a block that could not be read ({', '.join(skipped)})" if skipped and waiting[held]
+                   else f'{names[held]} stands in a code block, which cannot hold a file' if PLACEHOLDER + held in shown and not waiting[held]
+                   else f'no block of the page holds {names[held]}')
+        if stopped or waiting[held] and not skipped:  # looked for again, it can be found
+            advice += commands([held])
+            continue
+        advice.append(f'Add it on a line of its own: put `{written_form(first[held])}` in a file F and run `notion update {where} '
+                      '--append-file F`, and take the placeholder that is left out of the page')
+    if doubt:
+        for block, _, held in found:
+            if held in doubt:
+                landed.remove(f'{names[held]} placed in block {block}')
+        report(', '.join(f'{names[u]} in block {b}' for b, _, u in found if u in doubt), Fail(REFUSED, outcome=IN_DOUBT, cause='Notion '
+               'answered that the block took it, and the page read again still holds the placeholder'), times(missing),
+               commands(doubt) + advice)
+    if missing:
+        report(', '.join(times(missing)), Fail(REFUSED, outcome=NOT_SENT, cause='; '.join(why)), advice=advice)
+    client.say(f'uploaded files placed: {len(found)}')
+    warn_left(client, where, [u for u in own if waiting[u]], sorted(texts & set(own)))
+
 
 CHILD_TAG = re.compile(r'<(page|database)\s+url="([^"]+)"[^>]*>(.*?)</\1>', re.S)
 
@@ -1315,19 +2243,49 @@ def cmd_update(client, args):
     page = client.page(args.ref)
     files = {flag: read_file(path) for flag, path in (('replace', args.replace_file), ('append', args.append_file),
                                                      ('prepend', args.prepend_file)) if path}
-    properties = client.build_properties(args.set or [], client.schema_for(page), page) if args.set else {}
-    current = None
+    schema = client.schema_for(page) if args.set else None
+
+    def build():
+        return client.build_properties(args.set, schema, page)
+
+    properties = build() if args.set else {}
+    held = {}  # the uploaded files of each part of the body
+    for flag in files:
+        files[flag], held[flag] = hold_files(files[flag], f"--{flag}-file {getattr(args, flag + '_file')}")
+    edits = []  # (number, OLD, NEW, the upload whose placeholder OLD is when its blocks are to take NEW's file, else None)
+    for number, (old, new) in enumerate(args.edit or [], 1):
+        waits = hyphenate(old) if PLACEHOLDER_ALONE.fullmatch(old) else None
+        if waits and UPLOAD_ALONE.fullmatch(new):  # no text is written: the blocks are given the file
+            held[number], new = [BodyFile(hyphenate(new), '', False, 1, 'file', waits)], ''
+        else:
+            new, held[number] = hold_files(new, f'--edit {number}')
+            waits = waits if file_line(new.strip()) else None  # the blocks are written again as NEW, then given the file
+        edits.append((number, old, new.strip() if waits else new, waits))
+    refuse_placeholders([(f'--{part}-file' if part in files else f'--edit {part}', found) for part, found in held.items()])
+    current, cut = '', False
     if args.edit or 'replace' in files:
-        current = client.markdown(page['id']).get('markdown', '')
-    plan = []
+        answer = client.markdown(page['id'])
+        current, cut = answer.get('markdown', ''), answer.get('truncated')
+    plan = []  # (number, OLD, its state, the text edits it sends)
     if args.edit:
-        for number, (old, new) in enumerate(args.edit, 1):
-            count = current.count(old)
-            plan.append((number, old, new, 'matched' if count == 1 else ('no match' if count == 0 else f'matches {count} places')))
-        if not any(state == 'matched' for *_, state in plan):
-            for number, old, _, state in plan:
+        waiting, loose = placeholders_in(current)
+        for number, old, new, waits in edits:
+            if waits:  # every block that waits for the upload
+                again = waiting_texts(current, waits) if new else []
+                count = sum(current.count(text) for text in again) if new else waiting[waits]
+                state = ('matches inside code too' if count > waiting[waits] else 'matched' if count or (cut and not new)
+                         else 'it stands only in text, which cannot hold a file' if waits in loose else 'no match')
+                updates = [{'old_str': text, 'new_str': new, 'replace_all_matches': True} for text in again]
+                held[number] = held[number] * max(count, 1)
+            else:
+                count = current.count(old)
+                state = 'matched' if count == 1 else 'no match' if count == 0 else f'matches {count} places'
+                updates = [{'old_str': old, 'new_str': new}]
+            plan.append((number, old, state, updates))
+        if not any(state == 'matched' for _, _, state, _ in plan):
+            for number, _, state, _ in plan:
                 client.say(f'edit {number}: {state}')
-            missed = '; '.join(f'edit {n}: {old[:80]!r} ({state})' for n, old, _, state in plan)
+            missed = '; '.join(f'edit {n}: {old[:80]!r} ({state})' for n, old, state, _ in plan)
             raise Fail(REFUSED, f'no edit matched the body, so nothing was changed: {missed}. '
                                 'Fetch the page and copy OLD from its current text')
     if 'replace' in files:
@@ -1340,54 +2298,86 @@ def cmd_update(client, args):
     # Everything above only read. From here each request writes; a write that fails, the first one included,
     # is reported by report_writes with what landed, its own case and what was never sent (exit 4 once one
     # has landed), so a rerun repeats nothing.
-    steps, landed, misses = [], [], []
+    steps, landed, misses, unread = [], [], [], []
     if properties or args.icon:
         what = []
         if properties:
             what.append('properties ' + ', '.join(properties))
         if args.icon:
             what.append('icon')
-        steps.append((' and '.join(what), lambda: write_properties(client, page, properties, args.icon)))
+        def write_them():
+            def send(built):
+                return built, send_properties(client, page, built, args.icon)
+
+            # only the write is inside the rule that may send it again; what reads its answer comes after
+            built, stored = (client.on_current_schema(schema, build, send, built=properties) if properties
+                             else send(properties))
+            unread.extend(say_written(client, page, stored, built, args.icon))
+
+        steps.append((' and '.join(what), write_them, []))
     if args.edit:
-        matched = [(number, old, new) for number, old, new, state in plan if state == 'matched']
-        steps.append(('body edits ' + ', '.join(str(n) for n, *_ in matched),
-                      lambda: write_edits(client, page, plan, matched, args.allow_deleting_content, misses)))
+        matched = [(number, updates) for number, _, state, updates in plan if state == 'matched']
+        sent = [number for number, updates in matched if updates]  # an edit that only places a file writes no text
+        steps.append(('body edits ' + ', '.join(map(str, sent)) if sent else '',
+                      lambda: write_edits(client, page, plan, [u for _, updates in matched for u in updates], args.allow_deleting_content,
+                                          misses, current),
+                      [file for number, _ in matched for file in held[number]]))
     for kind in ('replace', 'prepend', 'append'):
         if kind in files:
             label = {'replace': 'body replaced', 'prepend': 'body added at the start', 'append': 'body added at the end'}[kind]
-            steps.append((label, lambda kind=kind: write_body(client, page, kind, files[kind], args.allow_deleting_content)))
-    for number, (label, write) in enumerate(steps):
+            steps.append((label, lambda kind=kind: write_body(client, page, kind, files[kind], args.allow_deleting_content), held[kind]))
+    where = page.get('url')
+    for number, (label, write, placed) in enumerate(steps):
+        later = [name for name, _, _ in steps[number + 1:]]
+        then = f"Then run only what was not sent: {'; '.join(later)}" if later else ''
         try:
-            write()
-        except Fail as failure:
-            rest = [name for name, _ in steps[number + 1:]]
-            raise report_writes('update', landed, label, failure, rest, where=page.get('url'), misses=misses)
-        if not landed and not (properties or args.icon):
-            client.say(f"updated {page.get('url')}")  # only once a write has landed (write_properties says it itself)
-        landed.append(label)
+            written = write()
+        except Exception as error:
+            failure = as_fail(error)
+            if isinstance(failure, Unbuildable) and not landed:
+                raise  # said as any unknown property is: nothing was written
+            pending = list(dict.fromkeys(file_label(file.name, file.id) for file in placed))
+            finish = None
+            if placed and (failure.outcome or IN_DOUBT) == IN_DOUBT:
+                finish = 'If it was applied: ' + files_left(where, placed) + (f'. {then}' if then else '')
+            raise report_writes('update', landed, label, failure, pending + later, where=where, misses=misses, finish=finish)
+        if label and not landed and not (properties or args.icon):
+            client.say(f'updated {where}')  # only once a write has landed (write_properties says it itself)
+        if label:
+            landed.append(label)
+        if placed:
+            place_files(client, page['id'], placed, landed, where, written, label == 'body added at the end', later, then, misses)
+            if not label and len(steps) == 1:
+                client.say(f'updated {where}')
+    if unread:
+        raise Fail(PARTIAL, f"done on {where}: written: {'; '.join(landed)}. Not confirmed: {unread[0]}; fetch the page to see it"
+                            + (f". Not applied: {'; '.join(misses)}" if misses else ''))
     if misses:
         raise Fail(PARTIAL, 'done in part; not applied: ' + '; '.join(misses))
     return DONE
 
 
-def report_writes(kind, done, label, failure, rest, total=None, where='', misses=()):
-    """The one report of a command with several writes - the steps of `update`, the pages of `create`: what
-    was written or created, the write that stopped the command in the case write_outcome gave it (refused,
-    never sent, or in doubt), and what was never sent. Exit 4 once something was written, else the code of
-    the failure itself."""
+def report_writes(kind, done, label, failure, rest, total=None, where='', misses=(), finish=None):
+    """The one report of a command with several writes - the steps of `update` and each file they place, the pages
+    of `create`: what was written or created, the write that stopped the command in the case write_outcome gave it
+    (refused, never sent, or in doubt), and what was never sent. Exit 4 once something was written, else the code of
+    the failure itself. Once something landed, no line says that nothing changed. `finish` says how to go on in place
+    of what to run again."""
     create = kind == 'create'
     outcome = failure.outcome or IN_DOUBT  # a failure that does not say what became of the write
     nothing = 'nothing was made' if create else 'nothing changed'
     if outcome == REFUSED_WRITE:
-        failed = f"Not {'created' if create else 'written'}: {label} ({failure.cause}): Notion refused it and {nothing}"
+        failed = (f"Not {'created' if create else 'written'}: {label} ({failure.cause}): Notion refused it"
+                  + ('' if done else f' and {nothing}'))
         again = ('Rerun with only the pages that were not created' if create
                  else 'Rerun only what was not written') + (' or not sent' if rest else '')
     elif outcome == NOT_SENT:
-        failed = f'Not sent: {label} ({failure.cause}): the request never left this machine, so {nothing}'
+        failed = f'Not sent: {label} ({failure.cause})' + ('' if done else f': the request never left this machine, so {nothing}')
         again = 'Rerun with only the pages not sent' if create else 'Rerun only what was not sent'
     else:
         advice = (f'it may have been created and may still appear, so look for a page titled {label} in {where} '
                   'before creating it again' if create
+                  else 'it may have been applied, and nothing uses it' if kind == 'upload'
                   else 'it may have been applied, so fetch the page and check it before running that part again')
         failed = f'In doubt: {label} ({failure.cause}): {advice}'
         again = ('Rerun with only the pages not sent' if create else 'Rerun only what was not sent') if rest else ''
@@ -1397,36 +2387,48 @@ def report_writes(kind, done, label, failure, rest, total=None, where='', misses
                 else f"done in part on {where}: written: {'; '.join(done)}. ")
     elif not rest:
         again = ''
+    if finish is not None:
+        again = finish
     message = (head + failed + (f"; not sent: {(', ' if create else '; ').join(rest)}" if rest else '')
                + (f"; edits that did not apply: {'; '.join(misses)}" if misses else '')
                + (f'. {again}' if again else ''))
     return Fail(PARTIAL if done else failure.code, message, outcome, failure.cause)
 
 
-def write_properties(client, page, properties, icon_text):
+def send_properties(client, page, properties, icon_text):
     payload = {}
     if properties:
         payload['properties'] = properties
     if icon_text:
         icon = icon_of(icon_text)
         payload['icon'] = None if icon == 'none' else icon
-    stored = client.call('PATCH', f"/v1/pages/{page['id']}", payload)
-    changed = client.short_values(stored, names=set(properties))
+    return client.call('PATCH', f"/v1/pages/{page['id']}", payload)
+
+
+def say_written(client, page, stored, properties, icon_text):
+    """Print what a write stored; [] or, when reading it fails, what could not be read: the write landed all the same."""
     client.say(f"updated {stored.get('url') or page.get('url')}")
+    changed, unread = {}, []
+    try:
+        changed = client.short_values(stored, names=set(properties))
+    except Exception as error:
+        unread = [f"the stored value of {', '.join(properties)} could not be read ({as_fail(error).cause})"]
     if changed:
         client.say(json.dumps(changed, ensure_ascii=False, indent=2))
     if icon_text:
         client.say(f'icon: {icon_text}')
+    return unread
 
 
-def write_edits(client, page, plan, matched, allow_deleting, misses):
-    command = {'content_updates': [{'old_str': old, 'new_str': new} for _, old, new in matched]}
+def write_edits(client, page, plan, updates, allow_deleting, misses, current):
+    """Send the text edits; the page's markdown after them, as the answer holds it."""
+    command = {'content_updates': updates}
     if allow_deleting:
         command['allow_deleting_content'] = True
-    answer = client.call('PATCH', f"/v1/pages/{page['id']}/markdown",
-                         {'markdown_version': MARKDOWN_VERSION, 'type': 'update_content', 'update_content': command})
+    answer = client.call('PATCH', f"/v1/pages/{page['id']}/markdown", {
+        'markdown_version': MARKDOWN_VERSION, 'type': 'update_content', 'update_content': command}) if updates else {'markdown': current}
     notion_misses = [w for w in answer.get('warnings', []) if w.get('code') in ('no_match', 'indentation_mismatch')]
-    for number, old, _, state in plan:
+    for number, old, state, _ in plan:
         client.say(f'edit {number}: {state}' + ('' if state == 'matched' else f': {old[:80]!r}'))
         if state != 'matched':
             misses.append(f'edit {number} ({old[:80]!r}): {state}')
@@ -1435,6 +2437,7 @@ def write_edits(client, page, plan, matched, allow_deleting, misses):
     for warning in answer.get('warnings', []):
         if warning not in notion_misses:
             client.warn(f"warning {warning.get('code')}: {warning.get('message')}")
+    return answer.get('markdown') or ''
 
 
 def write_body(client, page, kind, content, allow_deleting):
@@ -1450,6 +2453,7 @@ def write_body(client, page, kind, content, allow_deleting):
     client.say({'replace': 'body replaced', 'prepend': 'body: added at the start', 'append': 'body: added at the end'}[kind])
     for warning in answer.get('warnings', []):
         client.warn(f"warning {warning.get('code')}: {warning.get('message')}")
+    return answer.get('markdown') or ''
 
 
 def cmd_trash(client, args):
@@ -1504,7 +2508,7 @@ def cmd_create(client, args):
     else:
         target, page_schema = {'page_id': parent['id']}, client.schema_for({'parent': {}})
         where = f"page {page_link(parent['id'])}"
-    payloads = []
+    payloads, held = [], []
     for number, (assignments, content, icon) in enumerate(drafts, 1):
         try:
             built = client.build_properties(assignments, page_schema)
@@ -1512,27 +2516,60 @@ def cmd_create(client, args):
             if len(drafts) > 1 and failure.code == USAGE:
                 raise Fail(USAGE, f'page {number} of {len(drafts)}: {failure.message}; nothing was sent')
             raise
-        payload = {'parent': target, 'properties': built}
+        payload, files = {'parent': target, 'properties': built}, []
         if content:
+            source = (f'--body-file {args.body_file}' if not args.pages_file else f'{args.pages_file}, page {number}')
+            content, files = hold_files(content, source)
+            held.append((source, files))
             payload['markdown'] = content
             payload['markdown_version'] = MARKDOWN_VERSION
         if icon:
             payload['icon'] = icon_of(icon) if icon_of(icon) != 'none' else None
-        title = ''
-        for name, value in payload['properties'].items():
-            if page_schema['properties'][name].get('type') == 'title':
-                title = ''.join(part['text']['content'] for part in value['title'])
-        payloads.append((payload, title))
+        # read from what is sent, not from the schema: a later page may have made the client read that again
+        title = next((''.join(part['text']['content'] for part in value['title'])
+                      for value in payload['properties'].values() if 'title' in value), '')
+        payloads.append((payload, title, files, assignments))
+    refuse_placeholders(held)
     created, seen = [], set()  # urls reported, and the ids of the pages this run created or found
-    for number, (payload, title) in enumerate(payloads):
+    for number, (payload, title, files, assignments) in enumerate(payloads):
+        rest = [repr(t or '(untitled)') for _, t, *_ in payloads[number + 1:]]
+        then = 'Then create only the pages not sent' if rest else ''
+        def create(built):
+            try:
+                return create_one(client, kind, parent, dict(payload, properties=built), title, started, seen, where)
+            except ApiError as refused:
+                if kind == 'data_source' and refused.status in (403, 404):
+                    try:
+                        client.check_connected(parent)
+                    except NotConnected as gone:  # the cached parent is gone: say how to connect it, as with no cache
+                        raise Fail(gone.code, gone.message, refused.outcome)
+                raise
+
         try:
-            page = create_one(client, kind, parent, payload, title, started, seen, where)
-        except Fail as failure:
-            rest = [repr(t or '(untitled)') for _, t in payloads[number + 1:]]
+            page = client.on_current_schema(
+                page_schema, lambda: client.build_properties(assignments, page_schema), create, built=payload['properties'])
+        except Exception as error:
+            failure = as_fail(error)
+            if isinstance(failure, Unbuildable) and not created:  # said as any unknown property is: nothing was made
+                if len(payloads) > 1:
+                    raise Fail(USAGE, f'page {number + 1} of {len(payloads)}: {failure.message}; nothing was made')
+                raise
+            finish = None
+            if files and (failure.outcome or IN_DOUBT) == IN_DOUBT:
+                finish = ('If it was created: ' + files_left('<its url>', files)
+                          + (f'. {then}' if then else ''))
             raise report_writes('create', created, repr(title or '(untitled)'), failure, rest, total=len(payloads),
-                                where=where)
-        seen.add(page.get('id'))
-        created.append(page.get('url') or page.get('id', ''))
+                                where=where, finish=finish)
+        seen.add(page['id'])
+        created.append(url_of(page))
+        heading = dropped_heading(payload.get('markdown')) if title else ''
+        if heading:
+            client.warn(f'warning: Notion takes the only `#` heading of a body for a title when it is the first line, so '
+                        f'{heading!r} was left out of {created[-1]}: start a body at `##`, or add the heading with '
+                        '`notion update <page> --prepend-file F`')
+        if files:
+            place_files(client, page['id'], files, ['created ' + ', '.join(created)], created[-1],
+                        rest=[f'the create of {t}' for t in rest], then=then)
     return DONE
 
 
@@ -1543,22 +2580,32 @@ def create_one(client, kind, parent, payload, title, started, seen=(), where='')
     except WriteInDoubt as doubt:
         try:
             page = find_created(client, kind, parent, title, started, doubt, seen)
-        except Fail as lookup:  # any failure to look - an answer, a timeout, a lost connection, 429 - leaves it in doubt
-            raise CreateInDoubt(doubt, title, where, lookup)
+        except Exception as lookup:  # any failure to look - an answer, a timeout, a lost connection, 429 - leaves it in doubt
+            raise CreateInDoubt(doubt, title, where, as_fail(lookup))
         if page is None:
             raise CreateInDoubt(doubt, title, where)
         note = (f' ({doubt.what}; not sent again: found by its title among the pages this '
                 'integration made since the minute the command started; check it is the new page)')
-    client.say(f"created {page.get('url')} {client.key_of(page)}".rstrip() + note)
+    client.say(f"created {url_of(page)} {client.key_of(page)}".rstrip() + note)
     return page
+
+
+def dropped_heading(markdown):
+    """The heading a create leaves out, '' when none: the API takes a body's `#` heading for a title, and drops
+    it, when it is the only one and the first line, even if the title was given."""
+    rows = [(line, fence) for line, fence in body_lines(markdown or '') if line.strip()]
+    headings = [row for row in rows if row[1] is None and re.match(r' {0,3}#\s+\S', row[0])]
+    return headings[0][0].strip() if len(headings) == 1 and rows[0] is headings[0] else ''
 
 
 def find_created(client, kind, parent, title, started, doubt, seen=()):
     """The page a create in doubt may have made: never one this run already created or found (`seen`)."""
-    committed = (doubt.body.get('additional_data') or {}).get('committed_resource_id')
-    if committed and committed not in seen:
+    committed = extra_of(doubt.body).get('committed_resource_id')
+    if isinstance(committed, str) and committed not in seen:
         try:
-            return client.call('GET', f'/v1/pages/{committed}')
+            page = client.call('GET', f'/v1/pages/{committed}')
+            if page.get('id'):
+                return page
         except ApiError:
             pass
     if not title:
@@ -1566,18 +2613,23 @@ def find_created(client, kind, parent, title, started, doubt, seen=()):
     since = started.strftime('%Y-%m-%dT%H:%M:%S.000Z')
     bot = client.bot().get('id')
     if kind == 'data_source':
-        title_prop = next(n for n, p in parent['properties'].items() if p.get('type') == 'title')
-        candidates = client.call('POST', f"/v1/data_sources/{parent['id']}/query", {
-            'filter': {'and': [{'property': title_prop, 'title': {'equals': title}},
-                               {'timestamp': 'created_time', 'created_time': {'on_or_after': since}}]},
-            'page_size': 100}).get('results', [])
+        def title_property():
+            return next(n for n, p in parent['properties'].items() if p.get('type') == 'title')
+
+        def same_title(title_prop):
+            return client.call('POST', f"/v1/data_sources/{parent['id']}/query", {
+                'filter': {'and': [{'property': title_prop, 'title': {'equals': title}},
+                                   {'timestamp': 'created_time', 'created_time': {'on_or_after': since}}]},
+                'page_size': 100}).get('results', [])
+
+        candidates = client.on_current_schema(parent, title_property, same_title)
     else:
         candidates = [p for p in client.call('POST', '/v1/search', {
             'query': title, 'filter': {'property': 'object', 'value': 'page'}, 'page_size': 100}).get('results', [])
             if p.get('parent', {}).get('page_id') == parent['id']]
     # The filter is not trusted alone: each candidate is checked here too, its creator and its time.
     for candidate in candidates:
-        if candidate.get('id') in seen:
+        if candidate.get('id') in (None, *seen):
             continue  # a page this run created or already took for another create in doubt
         if ((candidate.get('created_by') or {}).get('id') == bot and client.title_of(candidate) == title
                 and created_at_or_after(candidate, started)):
@@ -1613,6 +2665,8 @@ TOKEN_RE = re.compile(r"""\s*(?:
 )""", re.X)
 
 TEXT_TYPES = ('title', 'rich_text', 'url', 'email', 'phone_number')
+EMPTY_TYPES = TEXT_TYPES + ('number', 'select', 'status', 'multi_select', 'date', 'people', 'created_by',
+                            'last_edited_by', 'relation', 'files')  # the types the API filters by is_empty
 DATE_OPS = {'=': 'equals', '>': 'after', '>=': 'on_or_after', '<': 'before', '<=': 'on_or_before'}
 NUMBER_OPS = {'=': 'equals', '!=': 'does_not_equal', '>': 'greater_than', '>=': 'greater_than_or_equal_to',
               '<': 'less_than', '<=': 'less_than_or_equal_to'}
@@ -1802,24 +2856,30 @@ def compile_node(client, node, schema, sources):
 
 
 def where_property(schema, name, client=None):
+    """(name, property) of what --where, --order, --select and --group-by call `name`: a property of that name
+    (any case) first, else the built-in name - a page's own created or last edited time, of type `timestamp`, or the
+    unique id and the title property under `id`/`key` and `title`/`name`."""
+    def find(schema):
+        properties = schema['properties']
+        called = property_called(properties, name)
+        if called:
+            return called, properties[called]
+        lowered = name.casefold()
+        if lowered in ('created', 'created_time'):
+            return 'created_time', {'type': 'timestamp'}
+        if lowered in ('edited', 'last_edited', 'last_edited_time', 'updated'):
+            return 'last_edited_time', {'type': 'timestamp'}
+        for kind, aliases in (('unique_id', ('id', 'key')), ('title', ('title', 'name'))):
+            if lowered in aliases:
+                for candidate, prop in properties.items():
+                    if prop.get('type') == kind:
+                        return candidate, prop
+        return None
+
+    found = client.look_up(schema, find) if client else find(schema)
+    if found:
+        return found
     properties = schema['properties']
-    if name in properties:
-        return name, properties[name]
-    for candidate, prop in properties.items():
-        if candidate.casefold() == name.casefold():
-            return candidate, prop
-    lowered = name.casefold()
-    if lowered in ('created', 'created_time'):
-        return 'created_time', {'type': 'timestamp'}
-    if lowered in ('edited', 'last_edited', 'last_edited_time', 'updated'):
-        return 'last_edited_time', {'type': 'timestamp'}
-    for kind, aliases in (('unique_id', ('id', 'key')), ('title', ('title', 'name'))):
-        if lowered in aliases:
-            for candidate, prop in properties.items():
-                if prop.get('type') == kind:
-                    return candidate, prop
-    if client is not None and client.refresh_schema(schema):  # the cached schema may be stale: look once more
-        return where_property(schema, name, client)
     close = nearest(name, list(properties))
     hint = f"did you mean {' or '.join(close)}?" if close else f"properties: {', '.join(properties)}"
     raise Fail(USAGE, f'unknown property {name!r} in the condition; {hint}')
@@ -1839,6 +2899,8 @@ def compile_condition(client, schema, name, operator, values):
     if operator in ('is empty', 'is not empty'):
         if kind in ('checkbox', 'unique_id', 'timestamp', 'created_time', 'last_edited_time', 'formula', 'rollup'):
             raise refuse()
+        if kind not in EMPTY_TYPES:
+            raise Fail(USAGE, f'{prop_name} is a {kind} property, which the condition cannot filter; nothing was sent')
         return dict(head, **{key: {'is_empty' if operator == 'is empty' else 'is_not_empty': True}})
 
     def leaf(op, value):
@@ -1886,7 +2948,13 @@ def compile_condition(client, schema, name, operator, values):
         ops = dict(DATE_OPS, **{'in': 'equals'})
         if operator not in ops:
             raise refuse()
-        return either(ops[operator], str)
+
+        def to_date(value):
+            if no_date(value):
+                raise Fail(USAGE, f'{prop_name}: {value!r} is not a date; to find no date write `{name} is empty` in the '
+                                  'condition. Nothing was sent')
+            return value
+        return either(ops[operator], to_date)
     if kind in ('people', 'created_by', 'last_edited_by'):
         ops = {'=': 'contains', 'contains': 'contains', '!=': 'does_not_contain', 'in': 'contains'}
         if operator not in ops:
@@ -1940,61 +3008,102 @@ def cell(value):
     return match.group(1) if match else text.replace('\n', ' ').replace('|', '\\|')
 
 
-def cmd_query(client, args):
-    kind, schema = client.resolve(args.ref, want='data_source')
-    if kind != 'data_source':
-        raise Fail(USAGE, f'{args.ref} is a page; `notion query` takes a data source')
-    body = {}
+Column = collections.namedtuple('Column', 'name fact')  # fact: the page's own (created, edited), not a property
+
+
+def column_value(client, row, column):
+    """What a row holds in a column of the table or of --group-by."""
+    if column.fact:
+        return row.get(column.name)
+    return value_named(client.short_values(row, names={column.name}), column.name)
+
+
+def row_values(client, row, columns):
+    """A row's properties as --json prints them, under their short keys: all of them, or the selected columns,
+    a built-in one with the page's own value."""
+    if columns is None:
+        return client.short_values(row)
+    values = client.short_values(row, names={column.name for column in columns if not column.fact})
+    values.update({column.name: row.get(column.name) for column in columns if column.fact})
+    return values
+
+
+def query_plan(client, args, schema):
+    """What `query` asks of the data source and reads from its rows, from the schema as it stands: the request's
+    body, the table's columns (None: --json without --select, the whole property set) and --group-by's column."""
+    body, columns, group = {}, None, None
     if args.where:
         body['filter'] = compile_where(client, args.where, schema)
     if args.order:
         body['sorts'] = parse_order(schema, args.order, client)
-    columns = None
+
+    def column(wanted):
+        name, prop = where_property(schema, wanted, client)
+        return Column(name, prop.get('type') == 'timestamp')  # a built-in only when no property has the name
+
     if args.select:
-        columns = [where_property(schema, c.strip().strip('"`'), client)[0] for c in args.select.split(',') if c.strip()]
-    group = where_property(schema, args.group_by, client)[0] if args.group_by else None
+        columns = [column(c.strip().strip('"`')) for c in args.select.split(',') if c.strip()]
+    if args.group_by:
+        group = column(args.group_by)
+    if columns is None and not args.json:
+        props = schema['properties']
+        columns = [Column(name, False) for kind in ('unique_id', 'title', 'status')
+                   for name in [n for n, p in props.items() if p.get('type') == kind][:1]]
+    return {'body': body, 'columns': columns, 'group': group}
+
+
+def cmd_query(client, args):
+    kind, schema = client.resolve(args.ref, want='data_source')
+    if kind != 'data_source':
+        raise Fail(USAGE, f'{args.ref} is a page; `notion query` takes a data source')
     max_rows = args.max_rows or MAX_ROWS
-    rows, more = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query", body, max_items=max_rows)
+
+    def ask(plan):
+        return plan, client.of_data_source(schema, lambda: client.pages_of(
+            'POST', f"/v1/data_sources/{schema['id']}/query", plan['body'], max_items=max_rows))
+
+    def lacks(plan, answer):
+        """Whether a row does not hold a property the output reads: the schema named it, so the schema is old."""
+        read = [] if args.count else [plan['group']] if plan['group'] else plan['columns'] or []
+        _, (rows, _) = answer
+        return any(c.name not in row.get('properties', {}) for row in rows for c in read if not c.fact)
+
+    plan, (rows, more) = client.on_current_schema(schema, lambda: query_plan(client, args, schema), ask, lacks)
+    columns, group = plan['columns'], plan['group']
     stopped = f'stopped paging at {max_rows} rows; more rows match (--max-rows N raises the cap)' if more else ''
     if args.count:
-        client.say(str(len(rows)))
+        if args.json:
+            client.emit(len(rows))
+        else:
+            client.say(str(len(rows)))
         if stopped:
             client.say(stopped)
         return DONE
     if group:
         counts = {}
         for row in rows:
-            value = client.short_values(row, names={group})
-            value = next(iter(value.values()), None) if value else None
+            value = column_value(client, row, group)
             for item in (value if isinstance(value, list) else [value]) or [None]:
                 label = cell(item) or '(empty)'
                 counts[label] = counts.get(label, 0) + 1
-        for label, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-            client.say(f'{label} {count}')
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        if args.json:
+            client.emit(dict(ordered))
+        else:
+            for label, count in ordered:
+                client.say(f'{label} {count}')
         if stopped:
             client.say(stopped)
         return DONE
     limit = args.limit if args.limit is not None else DEFAULT_ROWS
     shown = rows[:limit]
     if args.json:
-        client.say(json.dumps([{'id': r['id'], 'url': r.get('url'), 'key': client.key_of(r) or None,
-                                'properties': client.short_values(r, names=set(columns) if columns else None)}
-                               for r in shown], ensure_ascii=False, indent=2))
+        client.emit([{'id': r['id'], 'url': r.get('url'), 'key': client.key_of(r) or None,
+                      'properties': row_values(client, r, columns)} for r in shown])
     else:
-        if columns is None:
-            props = schema['properties']
-            columns = [n for n, p in props.items() if p.get('type') == 'unique_id'][:1]
-            columns += [n for n, p in props.items() if p.get('type') == 'title'][:1]
-            columns += [n for n, p in props.items() if p.get('type') == 'status'][:1]
-        client.say(' | '.join(columns + ['url']))
+        client.say(' | '.join([column.name for column in columns] + ['url']))
         for row in shown:
-            values = client.short_values(row, names=set(columns))
-            cells = []
-            for name in columns:
-                if name in values:
-                    cells.append(cell(values[name]))
-                else:
-                    cells.append(cell(values.get(f'date:{name}:start')))
+            cells = [cell(column_value(client, row, column)) for column in columns]
             client.say(' | '.join(cells + [row.get('url', '')]))
     if len(rows) > limit:
         client.say(f'… {len(rows) - limit} more rows matched (--limit N shows them, --count counts them)')
@@ -2010,15 +3119,48 @@ def cmd_query(client, args):
 # ---------------------------------------------------------------------------------------------
 
 
+SIMILAR = 'similar title'  # the API's title search also returns titles that only resemble the words
+
+
+def holding(page, needle, names):
+    """The first of the page's properties `names` that is a title or a text holding `needle` (folded), else None.
+    The text is read plain, as the filter matches it: a link's address is not a match and never splits one."""
+    for name in names:
+        prop = page.get('properties', {}).get(name) or {}
+        if prop.get('type') in ('title', 'rich_text') and needle in fold(plain(prop.get(prop['type']))):
+            return name
+    return None
+
+
+def search_rows(client, schema, words, limit):
+    """(the rows of a data source whose title or a text holds the words, whether it has more, the properties asked)."""
+    def text_properties():
+        return {n: p['type'] for n, p in schema['properties'].items() if p.get('type') in ('title', 'rich_text')}
+
+    def ask(asked):
+        conditions = [{'property': name, kind: {'contains': words}} for name, kind in asked.items()]
+        if not conditions:
+            return [], False, []
+        rows, more = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query",
+                                     {'filter': {'or': conditions} if len(conditions) > 1 else conditions[0]},
+                                     max_items=limit, whole=True)
+        return rows, more, list(asked)
+
+    return client.on_current_schema(schema, text_properties, ask)
+
+
 def cmd_search(client, args):
     words = ' '.join(args.words).strip()
     if not words:
         raise Fail(USAGE, 'search for what? `notion search <words>`')
     limit = args.limit or 10
-    hits = {}
+    # capped: a source had more rows than --limit, so the count of hits is a lower bound. Every row a source's
+    # answer held is a hit, those past --limit too: they are counted, and only the first --limit are printed.
+    hits, capped = {}, False
 
     def add(page, matched):
-        if page['id'] not in hits and not page.get('in_trash'):
+        kept = hits.get(page['id'])  # a real match replaces a likeness, whichever came first
+        if (kept is None or kept[1] == SIMILAR != matched) and not page.get('in_trash'):
             hits[page['id']] = (page, matched)
 
     ref = parse_ref(words)
@@ -2027,26 +3169,27 @@ def cmd_search(client, args):
         if kind == 'page':
             add(found, 'id')
         else:
-            client.say(f"{plain(found.get('title'))} | {COLLECTION}{found['id']} | data source | matched: id")
+            client.say(f"{plain(found.get('title')) or UNTITLED} | {COLLECTION}{found['id']} | data source | matched: id")
             return DONE
     else:
         if ref.kind == 'key':
             try:
                 add(client.page_by_key(ref.prefix, ref.number), 'key')
-            except Fail as failure:
-                if failure.code not in (REFUSED, USAGE):
-                    raise
+            except NoSuchKey:  # the words only look like a key, or no page has it: any other failure is the search's
+                pass
         if args.within:
             kind, scope = client.resolve(args.within, want='data_source')
             if kind != 'data_source':
                 raise Fail(USAGE, f'--in takes a data source, and {args.within} is a page')
             queue = [scope['id']]
         else:
-            found, _ = client.pages_of('POST', '/v1/search', {'query': words, 'filter': {'property': 'object', 'value': 'page'}},
-                                       max_items=limit)
+            found, more = client.pages_of('POST', '/v1/search', {'query': words, 'filter': {'property': 'object', 'value': 'page'}},
+                                          max_items=limit, whole=True)
+            capped = capped or more
             for page in found:
-                if page.get('object') == 'page':
-                    add(page, 'title')
+                if page.get('object') == 'page':  # a title that only resembles the words may still hold them in a text
+                    add(page, 'title' if fold(words) in fold(client.title_of(page))
+                        else holding(page, fold(words), page.get('properties', {})) or SIMILAR)
             queue = [s['id'] for s in client.data_sources()]
         needle = fold(words)
         searched = set()
@@ -2055,31 +3198,26 @@ def cmd_search(client, args):
             searched.add(identifier)
             try:
                 schema = client.data_source(identifier)
-                props = schema['properties']
-                searchable = [n for n, p in props.items() if p.get('type') in ('title', 'rich_text')]
-                conditions = [{'property': n, props[n]['type']: {'contains': words}} for n in searchable]
-                if not conditions:
-                    continue
-                rows, _ = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query",
-                                          {'filter': {'or': conditions} if len(conditions) > 1 else conditions[0]},
-                                          max_items=limit)
+
+                def ask():
+                    return search_rows(client, schema, words, limit)
+
+                rows, more, searchable = client.of_data_source(schema, ask) if args.within else ask()
+                capped = capped or more
             except ApiError as failure:
-                if args.within or failure.status not in (403, 404):
+                # only a data source of the cached list that is gone is skipped; the one named by --in never is
+                if args.within or failure.status not in (403, 404) or not client.disconnected(identifier):
                     raise
-                # a data source of the cached list that is no longer connected: read the list again, once, and skip it
-                fresh = client.refresh_data_sources()
-                if fresh is not None:
-                    queue = [s['id'] for s in fresh if s['id'] not in searched]
+                client.skip_note(identifier)
+                queue = [s['id'] for s in client.data_sources() if s['id'] not in searched]
                 continue
             for row in rows:
-                values = client.short_values(row, names=set(searchable) | {n for n, p in props.items() if p.get('type') == 'unique_id'})
-                matched = next((n for n, v in values.items() if isinstance(v, str) and needle in fold(v)), None)
+                matched = holding(row, needle, searchable)
                 if matched:
                     add(row, matched)
     if not hits:
         client.say(f'no hit for {words!r}')
-        return DONE
-    for page, matched in list(hits.values())[:limit]:
+    for page, matched in sorted(hits.values(), key=lambda hit: hit[1] == SIMILAR)[:limit]:  # likenesses last
         parent = page.get('parent', {})
         if parent.get('type') == 'data_source_id':
             where = client.data_source_title(parent['data_source_id'])
@@ -2089,7 +3227,9 @@ def cmd_search(client, args):
         title = client.title_of(page) or '(untitled)'
         client.say(' | '.join(filter(None, [key, title, page.get('url', ''), where, f'matched: {matched}'])))
     if len(hits) > limit:
-        client.say(f'… {len(hits) - limit} more hits (--limit N shows them)')
+        client.say(f"… {'at least ' if capped else ''}{len(hits) - limit} more hits (--limit N shows them)")
+    elif capped:  # the rows not read may be hits already counted, or none: no number is sure
+        client.say('… more may match: a source was cut short (a higher --limit reads further)')
     return DONE
 
 
@@ -2098,10 +3238,15 @@ def cmd_search(client, args):
 # ---------------------------------------------------------------------------------------------
 
 
+EMPTY_TAG = re.compile(r'</?(?:br|p|div|span|empty-block)(?:\s[^<>]*)?/?>', re.I)  # tags that show nothing by themselves
+
+
 def comment_body(args):
-    if args.body is not None:
-        return args.body
-    return read_file(args.body_file)
+    text = args.body if args.body is not None else read_file(args.body_file)
+    shown = EMPTY_TAG.sub('', text)
+    if all(char.isspace() or unicodedata.category(char) in ('Cc', 'Cf') for char in shown):  # the API would post it
+        raise Fail(USAGE, 'the comment is empty; nothing was sent')
+    return text
 
 
 def display_name(client):
@@ -2126,7 +3271,7 @@ def cmd_comments(client, args):
         for discussion, comments in threads.items():
             client.say(f'- discussion {discussion}')
             for comment in comments:
-                client.say(f"  {client.author(comment)} [{comment['id']}]: {plain(comment.get('rich_text')) or '(attachment only)'}")
+                client.say(f"  {client.author(comment)} [{comment['id']}]: {linked(comment.get('rich_text')) or '(attachment only)'}")
         return DONE
     if args.body is None and args.body_file is None:
         raise Fail(USAGE, f'`notion comments {args.action}` needs --body TEXT or --body-file F')
@@ -2166,7 +3311,7 @@ def cmd_comments(client, args):
     if signed:
         payload['display_name'] = signed
     stored = client.call('POST', '/v1/comments', payload)
-    client.say(f"comment {stored.get('id')} in discussion {stored.get('discussion_id')}")
+    client.say(f"comment {stored['id']}" + (f" in discussion {stored['discussion_id']}" if stored.get('discussion_id') else ''))
     return DONE
 
 
@@ -2190,18 +3335,26 @@ def cmd_upload(client, args):
             f'Content-Type: {mime}\r\n\r\n').encode('utf-8') + path.read_bytes() + f'\r\n--{boundary}--\r\n'.encode('utf-8')
     try:
         created = client.call('POST', '/v1/file_uploads', {'filename': path.name, 'content_type': mime})
-        sent = client.call('POST', f"/v1/file_uploads/{created['id']}/send", raw=data,
-                           content_type=f'multipart/form-data; boundary={boundary}')
     except ApiError as error:
         if error.status == 400:
             error.code = REFUSED  # the plan's Surface: a file the API refuses exits 1
         raise
+    try:
+        sent = client.call('POST', f"/v1/file_uploads/{created['id']}/send", raw=data,
+                           content_type=f'multipart/form-data; boundary={boundary}')
+    except Fail as failure:
+        report = report_writes('upload', [f"the upload object {created['id']}, on no page, which expires by itself"], f'the content of {path.name}',
+                               failure, [], where=path.name, finish='Run `notion upload` again: it makes a new one')
+        report.code = NO_TOKEN if failure.code == NO_TOKEN else REFUSED  # the same: the object is nothing to go on from
+        raise report
     reference = f"file-upload://{created['id']}"
-    client.say(f"uploaded {path.name} ({sent.get('status', 'sent')}): attach it within one hour")
+    client.say(f"uploaded {path.name} ({sent.get('status', 'sent')}): within one hour, put this line in a body "
+               '(`notion create` or `notion update`, which place the file)')
+    name = re.sub(r'([\\\[\]`<>])', r'\\\1', path.name)  # a name is text, whatever it holds
     if mime.startswith('image/'):
-        client.say(f'![{path.name}]({reference})')
+        client.say(f'![{name}]({reference})')
     else:
-        client.say(f'<file source="{reference}">{path.name}</file>')
+        client.say(f'<file source="{reference}">{name}</file>')
     client.say(f"or as a files property: --set 'Files={reference}'")
     return DONE
 
@@ -2300,7 +3453,7 @@ def cmd_auth(client, args):
         token = GETPASS('Notion API token (input hidden): ').strip()
         if not token:
             raise Fail(USAGE, 'no token typed; nothing stored')
-        client._token, client.source = token, 'the prompt'
+        client._token, client.source = well_formed(token, 'the prompt')
         client.bot()
         stored = secret_tool('store', '--label=Notion API token (cdv-notion)', *KEYRING, stdin=token)
         if stored is not None and stored.returncode == 0:
@@ -2341,8 +3494,35 @@ Hidden line
 </toggle>"""
 
 
-def squash(text):
-    return re.sub(r'\s+', ' ', text or '').strip()
+def children_of(client, identifier):
+    """The blocks directly under a page or a block, every page of the list."""
+    return client.pages_of('GET', f'/v1/blocks/{identifier}/children')[0]
+
+
+def write_check_problems(client, page_id):
+    """What the stored blocks of WRITE_CHECK_BODY are not, empty when every construct landed as its own block.
+    The blocks are read, not the markdown: text that came back the same may still be a plain paragraph."""
+    blocks = children_of(client, page_id)
+    kinds = [b.get('type') for b in blocks]
+    if kinds != ['callout', 'table', 'toggle']:
+        return [f"stored as {', '.join(kinds) or 'nothing'}, not as a callout, a table and a toggle"]
+    callout, table, toggle = blocks
+    problems = []
+    said = plain(callout['callout'].get('rich_text'))
+    if said != 'Write check callout':
+        problems.append(f'the callout holds {said!r}')
+    shape = table['table']
+    if shape.get('table_width') != 2 or not shape.get('has_column_header'):
+        problems.append(f"the table has {shape.get('table_width')} columns and "
+                        f"{'a' if shape.get('has_column_header') else 'no'} header row")
+    cells = [[plain(cell) for cell in (row.get('table_row') or {}).get('cells', [])] for row in children_of(client, table['id'])]
+    if cells != [['Column', 'Value'], ['a', '1']]:
+        problems.append(f'the table holds {cells!r}')
+    said = plain(toggle['toggle'].get('rich_text'))
+    hidden = [plain((b.get(b.get('type')) or {}).get('rich_text')) for b in children_of(client, toggle['id'])]
+    if said != 'Write check toggle' or hidden != ['Hidden line']:
+        problems.append(f'the toggle {said!r} holds {hidden!r}')
+    return problems
 
 
 def cmd_doctor(client, args):
@@ -2397,8 +3577,42 @@ def cmd_doctor(client, args):
         failed = True
         client.say('data source: none connected (connect the integration to the data sources in Notion)')
     for source in sources:
-        client.say(f"data source: {source['title']}, prefix {source.get('prefix') or 'none'}, {COLLECTION}{source['id']}")
+        client.say(f"data source: {source['title'] or UNTITLED}, prefix {source.get('prefix') or 'none'}, {COLLECTION}{source['id']}")
     return REFUSED if failed else DONE
+
+
+def trash_check_card(client, page, title, step):
+    """Trash the write check's card and read it back; when that fails, say which card to trash by hand."""
+    by_hand = f"trash the card {title!r} by hand: {url_of(page)}"
+    try:
+        client.call('PATCH', f"/v1/pages/{page['id']}", {'in_trash': True})
+        trashed = client.call('GET', f"/v1/pages/{page['id']}").get('in_trash')
+        step('trash', bool(trashed), f'the page is not in the trash; {by_hand}')
+    except Exception as error:
+        step('trash', False, f'{as_fail(error).message}; {by_hand}')
+
+
+def trash_lost_check_card(client, schema, title, started, doubt, step):
+    """The card of a write check whose create ended in doubt: looked for by its title, which holds the day and the
+    time to the second, so a day is allowed for the difference between this machine's clock and Notion's, and
+    trashed; when it is not found, or cannot be looked for, its title is said."""
+    since = started - datetime.timedelta(days=1)
+    for wait in (0, 2, 4):  # a query may not list a page at once
+        if wait:
+            SLEEP(wait)
+        found, why = None, 'no card with that title was found'
+        try:
+            found = find_created(client, 'data_source', schema, title, since, doubt)
+        except Exception as error:
+            failure = as_fail(error)
+            why = f'it could not be looked for ({failure.cause})'
+            if failure.code == NO_TOKEN or isinstance(failure, ApiError) and failure.status in (400, 403, 404):
+                break  # waiting does not change the answer
+        if found is not None and client.title_of(found) == title:
+            client.say(f"write check create: the card was made and was found by its title, {url_of(found)}")
+            return trash_check_card(client, found, title, step)
+    where = f"data source {plain(schema.get('title')) or schema['id']} ({COLLECTION}{schema['id']})"
+    step('trash', False, f'{why}; it may still appear, so look for a card titled {title!r} in {where} and trash it by hand')
 
 
 def write_check(client, args):
@@ -2409,20 +3623,27 @@ def write_check(client, args):
     kind, schema = client.resolve(args.write_check, want='data_source')
     if kind != 'data_source':
         raise Fail(USAGE, '--write-check takes the data source to write the test card in')
+    client.refresh_schema(schema)  # a check reads the schema the workspace has now
     props = schema['properties']
     title_prop = next(n for n, p in props.items() if p.get('type') == 'title')
-    title = f"{marker} doctor {NOW().strftime('%Y-%m-%d %H:%M:%S')}"
+    started = NOW()
+    title = f"{marker} doctor {started.strftime('%Y-%m-%d %H:%M:%S')}"
     results, page = {}, None
 
-    def step(name, ok, detail=''):
+    def step(name, ok, detail='', where=''):
         results[name.split()[0]] = ok
-        client.say(f'write check {name}: ' + ('ok' if ok else f'FAILED{" (" + detail + ")" if detail else ""}'))
+        client.say(f'write check {name}: ' + (f'ok{" (" + where + ")" if where else ""}' if ok
+                                              else f'FAILED{" (" + detail + ")" if detail else ""}'))
         return ok
 
     try:
         page = client.call('POST', '/v1/pages', {'parent': {'data_source_id': schema['id']},
                                                   'properties': {title_prop: {'title': rich_text(title)}}})
-        step('create', client.title_of(page) == title, 'the title read back differs')
+        step('create', client.title_of(page) == title, f'the title read back differs, {url_of(page)}', where=url_of(page))
+    except WriteInDoubt as doubt:
+        step('create', False, doubt.message)
+        trash_lost_check_card(client, schema, title, started.replace(second=0, microsecond=0), doubt, step)
+        return results
     except Fail as failure:
         step('create', False, failure.message)
         return results
@@ -2436,28 +3657,22 @@ def write_check(client, args):
             value, expected = {'checkbox': ('__YES__', '__YES__'), 'rich_text': ('write check', 'write check'),
                                'number': ('1', 1)}[kind]
             client.call('PATCH', f"/v1/pages/{page['id']}", {'properties': client.build_properties([f'{name}={value}'], schema)})
-            stored = client.short_values(client.call('GET', f"/v1/pages/{page['id']}"), names={name})
-            step(f'property ({name})', stored.get(name) == expected, f'read back {stored.get(name)!r}')
+            stored = value_named(client.short_values(client.call('GET', f"/v1/pages/{page['id']}"), names={name}), name)
+            step(f'property ({name})', stored == expected, f'read back {stored!r}')
         client.call('PATCH', f"/v1/pages/{page['id']}/markdown",
                     {'markdown_version': MARKDOWN_VERSION, 'type': 'replace_content', 'replace_content': {'new_str': WRITE_CHECK_BODY}})
-        back = client.markdown(page['id']).get('markdown', '')
-        step('body (callout, table, toggle)', squash(back) == squash(WRITE_CHECK_BODY),
-             f'read back {squash(back)[:160]!r}')
-        said = f'{marker} write check comment'
+        problems = write_check_problems(client, page['id'])
+        step('body (callout, table, toggle)', not problems, '; '.join(problems))
+        said = f'{marker} write check comment with [a link](https://example.com/)'  # read back with its address
         client.call('POST', '/v1/comments', {'parent': {'page_id': page['id']}, 'markdown': said,
                                              'markdown_version': MARKDOWN_VERSION})
         threads = client.discussions(page['id'])
-        step('comment', any(plain(c.get('rich_text')) == said for cs in threads.values() for c in cs),
-             'the comment did not read back')
-    except Fail as failure:
-        client.say(f'write check stopped: {client.redact(failure.message)}')
+        step('comment', any(linked(c.get('rich_text')) == said for cs in threads.values() for c in cs),
+             'the comment did not read back with its link')
+    except Exception as error:
+        client.say(f'write check stopped: {as_fail(error).message}')
     finally:
-        try:
-            client.call('PATCH', f"/v1/pages/{page['id']}", {'in_trash': True})
-            trashed = client.call('GET', f"/v1/pages/{page['id']}").get('in_trash')
-            step('trash', bool(trashed), 'the page is not in the trash')
-        except Fail as failure:
-            step('trash', False, f"{failure.message}; trash {page.get('url')} by hand")
+        trash_check_card(client, page, title, step)
     return results
 
 
@@ -2473,6 +3688,9 @@ def cmd_api(client, args):
     bare = path.split('?', 1)[0]
     if not bare.startswith('/v1/') or '/../' in bare + '/' or '/./' in bare:
         raise Fail(USAGE, f'`notion api` takes a path under /v1/, not {args.path}')
+    if not re.fullmatch(r'[\x21-\x7e]+', bare):
+        raise Fail(USAGE, f'{bare!r} cannot be sent: a path holds no space, control character or character that is not plain ASCII '
+                          f'(percent-encode it); {OUTCOME_WORDS[NOT_SENT]}')
     query = None
     if '?' in path:
         path, raw_query = path.split('?', 1)
@@ -2613,6 +3831,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     client = Notion()
+    client.json = getattr(args, 'json', False)
     try:
         return args.func(client, args) or DONE
     except Fail as failure:

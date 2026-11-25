@@ -5,21 +5,30 @@ from synthetic objects written from the shapes of the official API reference. No
 copied from a real workspace: ids are made up, people are "Ana Lima" and "Bruno Costa", and ticket
 keys and data source references are built at runtime so the public scan never sees one."""
 
+import collections
 import contextlib
 import datetime
+import http.client
 import http.server
 import importlib.machinery
 import importlib.util
 import io
 import json
 import os
+import random
 import re
+import shlex
 import shutil
+import socket
+import ssl
 import stat
+import struct
 import sys
 import tempfile
 import threading
+import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -62,6 +71,27 @@ WIKI = uid(0x7001)
 
 def text(value):
     return [{"type": "text", "text": {"content": value}, "plain_text": value, "annotations": {}, "href": None}]
+
+
+def run(value, url=None, kind="text", **annotations):
+    """One rich text run as the API reads it back: the link in text.link and in href, its formatting beside it."""
+    marks = dict({"bold": False, "italic": False, "strikethrough": False, "underline": False, "code": False,
+                  "color": "default"}, **annotations)
+    if kind != "text":
+        return {"type": kind, kind: {"type": "page", "page": {"id": uid(0x9001)}}, "annotations": marks,
+                "plain_text": value, "href": url}
+    return {"type": "text", "text": {"content": value, "link": {"url": url} if url else None},
+            "annotations": marks, "plain_text": value, "href": url}
+
+
+def comment_runs(markdown):
+    """A comment's markdown as the API stores it: each [text](address) a linked run, the rest plain runs."""
+    runs, at = [], 0
+    for found in re.finditer(r"\[([^\[\]]+)\]\((https?://[^\s()]+)\)", markdown):
+        runs += text(markdown[at:found.start()]) if found.start() > at else []
+        runs.append(run(found.group(1), found.group(2)))
+        at = found.end()
+    return runs + (text(markdown[at:]) if at < len(markdown) else []) or text(markdown)
 
 
 def person(identifier, name, email=None):
@@ -220,7 +250,10 @@ class FakeNotion:
         self.comments = {}
         self.property_items = {}
         self.blocks = {}
+        self.children = {}  # page or block id -> the blocks under it, as the block endpoints give them
+        self.page_of = {}  # block id -> the page it was stored on
         self.files = {}
+        self.kinds = {}  # upload id -> what it is: image, pdf, file
         self.next_number = 200
         self.next_id = 0x5000
         self.now = "2026-11-22T09:30:00.000Z"  # created_time of new pages, to the minute as Notion stores it
@@ -305,6 +338,9 @@ class FakeNotion:
         if match and m == "POST":
             if match.group(1) not in self.data_sources:
                 return error(404, "object_not_found", "Could not find data source.")
+            unknown = self.unknown_property(match.group(1), r.json or {})
+            if unknown:
+                return error(400, "validation_error", f"Could not find property with name or id: {unknown}")
             return 200, self.query(match.group(1), r.json or {})
         match = re.fullmatch(r"/v1/databases/([^/]+)", p)
         if match and m == "GET":
@@ -326,7 +362,7 @@ class FakeNotion:
                     if comment["id"] == match.group(1):
                         if comment["created_by"]["id"] != BOT:
                             return error(404, "object_not_found", "Could not find comment.")
-                        comment["rich_text"] = text((r.json or {}).get("markdown", ""))
+                        comment["rich_text"] = comment_runs((r.json or {}).get("markdown", ""))
                         return 200, comment
             return error(404, "object_not_found", "Could not find comment.")
         if m == "POST" and p == "/v1/comments":
@@ -339,7 +375,13 @@ class FakeNotion:
         match = re.fullmatch(r"/v1/file_uploads/([^/]+)/send", p)
         if match and m == "POST":
             return 200, {"object": "file_upload", "id": match.group(1), "status": "uploaded"}
+        match = re.fullmatch(r"/v1/blocks/([^/]+)/children", p)
+        if match and m == "GET":
+            return 200, {"object": "list", "results": self.children.get(match.group(1), []), "next_cursor": None,
+                         "has_more": False, "type": "block", "block": {}}
         match = re.fullmatch(r"/v1/blocks/([^/]+)", p)
+        if match and m == "PATCH":
+            return self.patch_block(match.group(1), r.json or {})
         if match and m == "GET":
             found = self.blocks.get(match.group(1))
             return (200, found) if found else error(404, "object_not_found", "Could not find block.")
@@ -371,6 +413,33 @@ class FakeNotion:
         more = start + size < len(rows)
         return {"object": "list", "results": chunk, "has_more": more, "next_cursor": str(start + size) if more else None}
 
+    def unknown_property(self, ds, body):
+        """The first name a filter or a sort gives that no property of the data source has, as name or id."""
+        schema = self.data_sources[ds]["properties"]
+        known = set(schema) | {p.get("id") for p in schema.values()}
+        queue = [body.get("filter") or {}] + list(body.get("sorts") or [])
+        while queue:
+            node = queue.pop(0)
+            queue += node.get("and", []) + node.get("or", [])
+            if "property" in node and node["property"] not in known:
+                return node["property"]
+        return None
+
+    @staticmethod
+    def refused_values(schema, written):
+        """The 400 a page write gets for a property that does not exist, a value of another type or a status that is
+        not one of the options."""
+        for name, value in written.items():
+            if name not in schema:
+                return error(400, "validation_error", f"{name} is not a property that exists.")
+            kind = schema[name]["type"]
+            if kind not in value:
+                return error(400, "validation_error", f"{name} is expected to be {kind}.")
+            if kind == "status" and value[kind] and "status" in schema[name]:
+                if value[kind]["name"] not in [o["name"] for o in schema[name]["status"]["options"]]:
+                    return error(400, "validation_error", f"Invalid status option for {name}.")
+        return None
+
     def matches(self, page, condition):
         """Only what key lookups and duplicate checks need; any other condition matches every row."""
         if not condition:
@@ -387,8 +456,144 @@ class FakeNotion:
         return True
 
     def page_markdown(self, identifier):
-        return {"object": "page_markdown", "id": identifier, "markdown": self.markdown.get(identifier, ""),
+        """A body as the markdown endpoint gives it back: a table whose only style is its header row comes back
+        as a pipe table, whatever form it was written in."""
+        def pipes(match):
+            rows = [re.findall(r"<td>(.*?)</td>", row) for row in re.findall(r"<tr>(.*?)</tr>", match.group(1), re.S)]
+            lines = ["| " + " | ".join(row) + " |" for row in rows]
+            return "\n".join(lines[:1] + ["| " + " | ".join("---" for _ in rows[0]) + " |"] + lines[1:])
+        body = re.sub(r'<table header-row="true">(.*?)</table>', pipes, self.markdown.get(identifier, ""), flags=re.S)
+        return {"object": "page_markdown", "id": identifier, "markdown": body,
                 "truncated": False, "unknown_block_ids": []}
+
+    def block(self, kind, content, children=()):
+        made = {"object": "block", "id": self.new_id(), "has_children": bool(children), "in_trash": False,
+                "type": kind, kind: content}
+        self.blocks[made["id"]] = made
+        self.children[made["id"]] = list(children)
+        return made
+
+    def patch_block(self, identifier, body):
+        """A media block given an uploaded file: it becomes a hosted file with a signed url, in the body too."""
+        block = self.blocks[identifier]
+        upload = body[block["type"]]["file_upload"]["id"]
+        kind = self.kinds.get(upload, block["type"])  # an image block takes only an image, a pdf block a pdf; a file block, all
+        if block["type"] not in ("file", kind):
+            return error(400, "validation_error", f"File upload {upload} has a type of {kind}, but only {block['type']} files are expected.")
+        hosted = f"https://files.example.com/{upload}?X-Amz-Expires=3600"
+        before = block[block["type"]].get("external", {}).get("url")
+        block[block["type"]] = {"caption": block[block["type"]]["caption"], "type": "file",
+                                "file": {"url": hosted, "expiry_time": "2026-11-22T10:30:00.000Z"}}
+        page = self.page_of.get(identifier)
+        if before and page:  # the first block of the body that holds it, never code
+            parts = re.split(r"(```.*?```|~~~.*?~~~|`[^`\n]*`|<code>.*?</code>)", self.markdown[page], flags=re.S)
+            for place in range(0, len(parts), 2):
+                for mark in ("](" + before, 'source="' + before):
+                    if mark in parts[place]:
+                        parts[place] = parts[place].replace(mark, mark.replace(before, hosted), 1)
+                        self.markdown[page] = "".join(parts)
+                        return 200, block
+        return 200, block
+
+    class Refused(Exception):
+        """A body the markdown endpoints answer 400 to, as seen on the real API."""
+
+    def store_blocks(self, identifier, markdown):
+        """The blocks Notion stores for the constructs the tests write: callout, table, toggle, columns, quote, code,
+        media, text. As the real API: a media address that is not http(s) is stored empty; an image that is not
+        alone on its line and an attribute in single quotes are refused; a media tag in a sentence or a cell is text."""
+        def paragraph(value):
+            return self.block("paragraph", {"rich_text": text(value), "color": "default"})
+
+        def plain_line(value):
+            shown = re.sub(r"`[^`]*`", "", value)
+            if re.search(r"(?<!\\)!\[[^\]]*\]\(", shown):
+                raise self.Refused("Images must be standalone blocks and cannot be mixed with paragraph text or other images.")
+            if re.search(r"^<\w+ [^>]*=\s*'", shown):
+                raise self.Refused("Malformed attribute. Attribute values must use double quotes.")
+            return value
+
+        def line_of(value):
+            value = value.strip()
+            found = re.fullmatch(r"!\[((?:[^\[\]\\]|\\.|\[[^\]]*\])*)\]\(\s*<?([^\s<>]*)>?(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^()]*\)))?\s*\)", value)
+            kind, caption, url = ("image", found.group(1), found.group(2)) if found else (None, "", "")
+            tag = re.fullmatch(r'<(image|file|pdf|audio|video|bookmark|embed)\s(?:[^<>]*?\s)?(?:source|src)\s*=\s*"([^"]*)"[^<>]*?'
+                               r"(?:/>|>([^<]*)</\1>)", value)
+            if tag:
+                kind, url, caption = tag.groups()
+            if kind in ("bookmark", "embed"):
+                return self.block(kind, {"caption": [], "url": url})
+            if not kind:
+                return paragraph(plain_line(value))
+            if url.startswith("https://files.example.com/"):
+                return self.block(kind, {"caption": text(caption or ""), "type": "file", "file": {"url": url}})
+            return self.block(kind, {"caption": text(caption or ""), "type": "external",
+                                     "external": {"url": url if url.startswith("http") else ""}})
+
+        def inside(lines, at, tag):
+            """(the lines between an opening tag's line and its closing one, the place after it)."""
+            depth, inner = 1, []
+            for place in range(at + 1, len(lines)):
+                depth += bool(re.match(rf"\s*<{tag}[ >]", lines[place])) - lines[place].count(f"</{tag}>")
+                if depth == 0:
+                    return inner, place + 1
+                inner.append(lines[place])
+            raise self.Refused(f"Trailing unclosed tags were auto-closed: <{tag}>.")
+
+        def blocks_of(lines):
+            made, at = [], 0
+            while at < len(lines):
+                line = lines[at].strip()
+                fence = re.match(r"(`{3,})[^`]*$|(~{3,})", line)
+                if not line:
+                    at += 1
+                elif fence:
+                    mark, code = fence.group(1) or fence.group(2), []
+                    at += 1
+                    while at < len(lines) and not (set(lines[at].strip()) == {mark[0]} and len(lines[at].strip()) >= len(mark)):
+                        code.append(lines[at])
+                        at += 1
+                    at += 1
+                    made.append(self.block("code", {"rich_text": text("\n".join(code)), "language": "plain text"}))
+                elif line.startswith(">"):
+                    quoted = []
+                    while at < len(lines) and lines[at].strip().startswith(">"):
+                        quoted.append(re.sub(r"^\s*> ?", "", lines[at]))
+                        at += 1
+                    made.append(self.block("quote", {"rich_text": [], "color": "default"}, blocks_of(quoted)))
+                elif line.startswith("<table"):
+                    inner, after = inside(lines, at, "table")
+                    cells = [re.findall(r"<td>(.*?)</td>", row, re.S) for row in re.findall(r"<tr>(.*?)</tr>", "\n".join(inner), re.S)]
+                    if any(re.search(r"!\[[^\]]*\]\(", cell) for row in cells for cell in row):
+                        raise self.Refused("Inline image Markdown is not supported in rich text.")
+                    rows = [self.block("table_row", {"cells": [text(c) for c in row]}) for row in cells]
+                    made.append(self.block("table", {"table_width": len(cells[0]), "has_column_header": 'header-row="true"' in line,
+                                                     "has_row_header": False}, rows))
+                    at = after
+                elif re.match(r"<(callout|toggle|columns|column)\b", line):
+                    kind = re.match(r"<(\w+)", line).group(1)
+                    inner, after = inside(lines, at, kind)
+                    if kind in ("callout", "toggle"):
+                        content = {"rich_text": text(inner[0] if inner else ""), "color": "default"}
+                        if kind == "callout":
+                            content.update(icon={"type": "emoji", "emoji": re.search(r'icon="([^"]+)"', line).group(1)}, color="gray_background")
+                        made.append(self.block(kind, content, blocks_of(inner[1:])))
+                    else:
+                        made.append(self.block({"columns": "column_list"}.get(kind, kind), {}, blocks_of(inner)))
+                    at = after
+                else:
+                    made.append(line_of(lines[at]))
+                    at += 1
+            return made
+
+        def placed_on(blocks):
+            for block in blocks:
+                self.page_of[block["id"]] = identifier
+                placed_on(self.children[block["id"]])
+
+        stored = blocks_of(markdown.split("\n"))
+        placed_on(stored)
+        self.children[identifier] = stored
 
     def patch_markdown(self, identifier, body):
         if identifier not in self.pages:
@@ -399,7 +604,7 @@ class FakeNotion:
         if kind == "update_content":
             matched = 0
             for pair in body["update_content"]["content_updates"]:
-                if current.count(pair["old_str"]) == 1:
+                if current.count(pair["old_str"]) == 1 or (pair.get("replace_all_matches") and pair["old_str"] in current):
                     current = current.replace(pair["old_str"], pair["new_str"])
                     matched += 1
                 else:
@@ -412,6 +617,10 @@ class FakeNotion:
             content = body["insert_content"]["content"]
             position = (body["insert_content"].get("position") or {}).get("type", "end")
             current = content + "\n\n" + current if position == "start" else current + "\n\n" + content
+        try:
+            self.store_blocks(identifier, current)
+        except self.Refused as refused:
+            return error(400, "validation_error", f"Markdown errors blocked parsing:\n{refused}")
         self.markdown[identifier] = current
         answer = self.page_markdown(identifier)
         if warnings:
@@ -434,8 +643,7 @@ class FakeNotion:
     def stored(self, schema_type, written):
         """The read shape Notion answers with, for a write shape the client sent."""
         if schema_type in ("title", "rich_text"):
-            joined = "".join(part["text"]["content"] for part in written[schema_type])
-            return text(joined) if joined else []
+            return [run(part["text"]["content"], (part["text"].get("link") or {}).get("url")) for part in written[schema_type]]
         if schema_type in ("status", "select"):
             value = written[schema_type]
             return None if value is None else {"id": "x", "name": value["name"], "color": "default"}
@@ -459,6 +667,9 @@ class FakeNotion:
         if not page:
             return error(404, "object_not_found", f"Could not find page with ID: {identifier}.")
         schema = self.schema_of(page)
+        refused = self.refused_values(schema, body.get("properties") or {})
+        if refused:
+            return refused
         for name, written in (body.get("properties") or {}).items():
             kind = schema[name]["type"]
             value = page["properties"].setdefault(name, {"id": schema[name]["id"], "type": kind})
@@ -476,9 +687,15 @@ class FakeNotion:
         identifier = self.new_id()
         if "data_source_id" in parent:
             ds = parent["data_source_id"]
+            if ds not in self.data_sources:
+                return error(404, "object_not_found", "Could not find data source.")
             schema = self.data_sources[ds]["properties"]
+            refused = self.refused_values(schema, body.get("properties") or {})
+            if refused:
+                return refused
             page = task_page(identifier, self.next_number, "", status=None, created_time=self.now)
             page["parent"] = {"type": "data_source_id", "data_source_id": ds, "database_id": DB_TASKS}
+            page["properties"] = {name: value for name, value in page["properties"].items() if name in schema}
             self.next_number += 1
             for name, written in (body.get("properties") or {}).items():
                 kind = schema[name]["type"]
@@ -491,6 +708,11 @@ class FakeNotion:
             page["created_time"] = self.now
         if body.get("icon"):
             page["icon"] = body["icon"]
+        if body.get("markdown"):
+            try:
+                self.store_blocks(identifier, body["markdown"])
+            except self.Refused as refused:
+                return error(400, "validation_error", f"Markdown errors blocked parsing:\n{refused}")
         self.add_page(page, body.get("markdown", ""))
         return 200, page
 
@@ -501,7 +723,7 @@ class FakeNotion:
             "discussion_id": body.get("discussion_id") or self.new_id(),
             "parent": body.get("parent") or {"type": "page_id", "page_id": PAGE},
             "created_by": {"object": "user", "id": BOT},
-            "rich_text": text(body.get("markdown", "")),
+            "rich_text": comment_runs(body.get("markdown", "")),
         }
         if body.get("display_name"):
             comment["display_name"] = {"type": body["display_name"]["type"],
@@ -767,6 +989,117 @@ class UpdateTest(ClientTestCase):
         patch = self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]
         self.assertEqual(patch["Done at"], {"date": {"start": "2026-11-24"}})
 
+    def test_a_date_range_that_would_end_before_it_starts_is_refused(self):
+        # Whichever side is written and whichever is kept, in update, create and a pages file: exit 2, nothing sent,
+        # both dates named, and how to set or clear the end. A range that does not go backwards is sent.
+        def stored(start, end=None, zone=None):
+            self.page["properties"]["Done at"]["date"] = {"start": start, "end": end, "time_zone": zone} if start else None
+
+        days = ("2026-11-17", "2026-11-28")
+        timed = ("2026-11-17T09:00:00-03:00", "2026-11-28T18:00:00-03:00")
+        kept = "the new start {0} is after the end the property keeps, {1}"
+        moved_end = "the new end {1} is before the start the property keeps, {0}"
+        both = "the start {0} is after the end {1}"
+        refused = [
+            ("a start past a range of days", days, ["Done at=2026-12-10"], kept, ("2026-12-10", days[1])),
+            ("the same with :start", days, ["date:Done at:start=2026-11-29"], kept, ("2026-11-29", days[1])),
+            ("a time past a range of days", days, ["Done at=2026-11-29T08:00:00-03:00"], kept,
+             ("2026-11-29T08:00:00-03:00", days[1])),
+            ("a day past a range of times", timed, ["Done at=2026-11-29"], kept, ("2026-11-29", timed[1])),
+            ("a time past a time of the same day", timed, ["Done at=2026-11-28T19:00:00-03:00"], kept,
+             ("2026-11-28T19:00:00-03:00", timed[1])),
+            ("the offsets decide, not the digits", timed, ["Done at=2026-11-28T17:00:00-05:00"], kept,
+             ("2026-11-28T17:00:00-05:00", timed[1])),
+            ("an end before the start kept", days, ["date:Done at:end=2026-11-10"], moved_end, (days[0], "2026-11-10")),
+            ("a start and an end written backwards", days,
+             ["date:Done at:start=2026-12-10", "date:Done at:end=2026-12-01"], both, ("2026-12-10", "2026-12-01")),
+        ]
+        for name, before, assignments, said, dates in refused:
+            with self.subTest(name):
+                stored(*before)
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("update", PAGE, *[part for a in assignments for part in ("--set", a)])
+                self.assertEqual((code, out), (2, ""), err)
+                self.assertIn("date:Done at: " + said.format(*dates), err)
+                self.assertIn("nothing was sent", err)
+                self.assertIn("date:Done at:end=<date>", err)
+                self.assertIn("date:Done at:end= (an empty value)", err)
+                self.assertEqual(self.writes(), [])
+        backwards = {"date:Done at:start": "2026-12-10", "date:Done at:end": "2026-12-01"}
+        for name, command in {
+                "create": ("create", "--parent", "Tasks", "--set", "title=A", "--set", "date:Done at:start=2026-12-10",
+                           "--set", "date:Done at:end=2026-12-01"),
+                "a pages file": ("create", "--parent", "Tasks", "--pages-file", str(self.tmp / "pages.json"))}.items():
+            with self.subTest(name):
+                (self.tmp / "pages.json").write_text(json.dumps(
+                    [{"properties": {"title": "A"}}, {"properties": dict(backwards, title="B")}]))
+                self.fake.calls.clear()
+                code, out, err = self.run_cli(*command)
+                self.assertEqual((code, out), (2, ""), err)
+                self.assertIn("date:Done at: the start 2026-12-10 is after the end 2026-12-01", err)
+                self.assertEqual(self.writes(), [])
+        sent = [
+            ("a start on the day the range ends", days, "Done at=2026-11-28", ("2026-11-28", days[1])),
+            ("a time on the day the range ends", days, "Done at=2026-11-28T23:00:00-03:00",
+             ("2026-11-28T23:00:00-03:00", days[1])),
+            ("a day on the day a range of times ends", timed, "Done at=2026-11-28", ("2026-11-28", timed[1])),
+            ("an instant before the end in another offset", timed, "Done at=2026-11-28T15:00:00-05:00",
+             ("2026-11-28T15:00:00-05:00", timed[1])),
+            ("an end on the day the range starts", days, "date:Done at:end=2026-11-17", (days[0], "2026-11-17")),
+        ]
+        for name, before, assignment, (start, end) in sent:
+            with self.subTest(name):
+                stored(*before)
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("update", PAGE, "--set", assignment)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": {"start": start, "end": end}})
+        with self.subTest("a time with no offset is in the range's time zone"):
+            stored("2026-11-17T09:00:00", "2026-11-28T18:00:00", "America/Sao_Paulo")
+            code, out, err = self.run_cli("update", PAGE, "--set", "Done at=2026-11-28T17:00:00")
+            self.assertEqual(code, 0, err)
+            stored("2026-11-17T09:00:00", "2026-11-28T18:00:00", "America/Sao_Paulo")
+            code, out, err = self.run_cli("update", PAGE, "--set", "Done at=2026-11-28T19:00:00")
+            self.assertEqual(code, 2, out + err)
+
+    def test_the_word_null_is_never_sent_as_a_date(self):
+        # `date:<Property>:end=` clears the end; the empty end as it is printed, null, and its other spellings are
+        # read the same in update, create, a pages file and --where, and none of them reaches Notion as a date.
+        words = ("", "null", "NULL", "Null", "none", "None", " null ")
+        for word in words:
+            with self.subTest(end=word):
+                self.page["properties"]["Done at"]["date"] = {"start": "2026-11-17", "end": "2026-11-28", "time_zone": None}
+                for assignments, expected in (([f"date:Done at:end={word}"], {"start": "2026-11-17"}),
+                                              (["Done at=2026-12-10", f"date:Done at:end={word}"], {"start": "2026-12-10"})):
+                    self.page["properties"]["Done at"]["date"] = {"start": "2026-11-17", "end": "2026-11-28", "time_zone": None}
+                    code, out, err = self.run_cli("update", PAGE, *[p for a in assignments for p in ("--set", a)])
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": expected})
+            for field in ("start", None):
+                with self.subTest(start=word, field=field):
+                    left = "date:Done at:start" if field else "Done at"
+                    code, out, err = self.run_cli("update", PAGE, "--set", f"{left}={word}")
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": None})
+            with self.subTest("create", end=word):
+                code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=A", "--set",
+                                              "date:Done at:start=2026-11-20", "--set", f"date:Done at:end={word}")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": {"start": "2026-11-20"}})
+            for where in (f"\"Done at\" = '{word}'", f"created >= '{word}'", f"\"Done at\" in ('2026-11-20', '{word}')"):
+                with self.subTest(where=where):
+                    self.fake.calls.clear()
+                    code, out, err = self.run_cli("query", "Tasks", "--where", where)
+                    self.assertEqual(code, 2, out + err)
+                    self.assertIn("is empty", err)
+                    self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
+        pages = self.tmp / "pages.json"
+        pages.write_text(json.dumps([{"properties": {"title": "A", "date:Done at:start": "2026-11-20",
+                                                     "date:Done at:end": None}}]))
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--pages-file", str(pages))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.writes()[-1].json["properties"]["Done at"], {"date": {"start": "2026-11-20"}})
+
     def test_update_prints_properties_as_stored(self):
         code, out, err = self.run_cli("update", PAGE, "--set", "Status=rollout", "--set", "Notes=Weekly export")
         self.assertEqual(code, 0, err)
@@ -882,6 +1215,271 @@ class UpdateTest(ClientTestCase):
         self.assertTrue(self.page["in_trash"])
 
 
+class TextLinksTest(ClientTestCase):
+    """Links inside a title or text property, as the short format reads and writes them."""
+
+    def test_a_linked_run_is_printed_as_markdown_and_everything_else_is_literal(self):
+        runs = [run("See "), run("the docs", "https://example.com/docs"), run(" and [draft] a_b *c* "),
+                run("a ", "https://example.com/x"), run("bold", "https://example.com/x", bold=True), run(" word"),
+                run(" mail "), run("ana@example.com", "mailto:ana@example.com"), run(" in "),
+                run("Glossary", "/p/" + hex32(WIKI) + "?pvs=25"), run(" about "), run("Billing revamp", page_url(PROJECT), kind="mention"),
+                run(" by "), run("wiki", "https://example.com/A_(b) c"), run("plain bold", bold=True)]
+        shown = ("See [the docs](https://example.com/docs) and [draft] a_b *c* [a bold](https://example.com/x) word mail "
+                 "[ana@example.com](mailto:ana@example.com) in [Glossary](" + page_url(WIKI) + "?pvs=25) about Billing revamp by "
+                 "[wiki](https://example.com/A_(b)\\ c)plain bold")
+        self.page["properties"]["Notes"]["rich_text"] = runs
+        self.page["properties"]["Task name"]["title"] = [run("Export ["), run("invoices", "https://example.com/i"), run("]")]
+        title = "Export [[invoices](https://example.com/i)]"
+        code, out, err = self.run_cli("fetch", PAGE)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.props_of(out)["Notes"], shown)
+        self.assertEqual(self.props_of(out)["Task name"], title)
+        self.assertEqual(out.splitlines()[0], "title: Export [invoices]")
+        code, out, err = self.run_cli("query", "Tasks", "--select", "Task name,Notes")
+        self.assertEqual(out.splitlines()[1], title + " | " + shown + " | " + self.page["url"])
+        code, out, err = self.run_cli("query", "Tasks", "--json")
+        row = json.loads(out)[0]["properties"]
+        self.assertEqual((row["Task name"], row["Notes"]), (title, shown))
+
+    def test_a_value_read_and_written_back_keeps_its_links(self):
+        runs = [run("See "), run("the [old] docs", "https://example.com/docs?a=1&b=(2)"), run(", "),
+                run("ana@example.com", "mailto:ana@example.com"), run(" [draft] (x) "), run("Glossary", "/p/" + hex32(WIKI))]
+        self.page["properties"]["Notes"]["rich_text"] = runs
+        code, out, err = self.run_cli("fetch", PAGE, "--props-only")
+        value = self.props_of(out)["Notes"]
+        code, out, err = self.run_cli("update", PAGE, "--set", "Notes=" + value)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.props_of(out)["Notes"], value)
+        stored = self.page["properties"]["Notes"]["rich_text"]
+        self.assertEqual([(r["plain_text"], r["href"]) for r in stored],
+                         [("See ", None), ("the [old] docs", "https://example.com/docs?a=1&b=(2)"), (", ", None),
+                          ("ana@example.com", "mailto:ana@example.com"), (" [draft] (x) ", None), ("Glossary", page_url(WIKI))])
+
+    def test_any_runs_printed_and_written_back_store_the_same_runs(self):
+        u, v = "https://example.com/a", "https://example.com/b"
+        wiki, mail = "https://example.org/wiki/Name_(thing)", "mailto:ana@example.com"
+        table = [  # (the runs as (text, address), how they are printed)
+            ("a lone [ in a link's text", [("see ", None), ("a [ b", u)], r"see [a \[ b](" + u + ")"),
+            ("a lone ] in a link's text", [("a ] b", u)], r"[a \] b](" + u + ")"),
+            ("] then [ in a link's text", [("x][y", u)], r"[x\]\[y](" + u + ")"),
+            ("brackets nested in a link's text", [("[[x]]", u)], r"[\[\[x\]\]](" + u + ")"),
+            ("balanced brackets stay as they are", [("the [old] docs", u)], "[the [old] docs](" + u + ")"),
+            ("a backslash in a link's text", [("C:\\dir", u)], r"[C:\\dir](" + u + ")"),
+            ("a backslash ending a link's text", [("a\\", u)], r"[a\\](" + u + ")"),
+            ("a backslash before a bracket", [("a\\[b\\]", u)], r"[a\\\[b\\\]](" + u + ")"),
+            ("link syntax in a link's text", [("a](" + v + ")", u)], r"[a\](" + v + r")](" + u + ")"),
+            ("an address with balanced parentheses", [("Name", wiki)], "[Name](" + wiki + ")"),
+            ("an address with an unbalanced )", [("x", "https://example.org/a)b")], r"[x](https://example.org/a\)b)"),
+            ("an address with an unbalanced (", [("x", "https://example.org/a(b")], r"[x](https://example.org/a\(b)"),
+            ("balanced and unbalanced parentheses", [("x", "https://example.org/a_(b)_c)")], r"[x](https://example.org/a_(b)_c\))"),
+            ("a backslash and a space in an address", [("x", "https://example.org/a\\b c")], r"[x](https://example.org/a\\b\ c)"),
+            ("brackets in an address", [("x", "https://example.org/a[1]")], "[x](https://example.org/a[1])"),
+            ("a mailto address", [("write", mail)], "[write](" + mail + ")"),
+            ("two links side by side", [("a", u), ("b", v)], "[a](" + u + ")[b](" + v + ")"),
+            ("a link at the start", [("a", u), (" tail", None)], "[a](" + u + ") tail"),
+            ("a link at the end", [("head ", None), ("a", u)], "head [a](" + u + ")"),
+            ("a link alone", [("a", u)], "[a](" + u + ")"),
+            ("plain text stays literal", [("a\\b [x] ] [ \\ ", None), ("l", u), (" ] \\[ (y) ", None)],
+             "a\\b [x] ] [ \\ [l](" + u + ") ] \\[ (y) "),
+            ("text that only looks like a link", [("[z](relative) [x] (y) [w](ftp://example.com/w)", None)],
+             "[z](relative) [x] (y) [w](ftp://example.com/w)"),
+            ("plain text that reads as a link", [("[x](" + u + ")", None)], r"\[x](" + u + ")"),
+            ("plain text that reads as a link, after a backslash", [("\\[x](" + u + ")", None)], r"\\\[x](" + u + ")"),
+            ("plain text that reads as a link, after two backslashes", [("a\\\\[x](" + u + ") b", None)], "a" + "\\" * 5 + "[x](" + u + ") b"),
+            ("plain text that reads as a link to a mail, a telephone", [("[x](mailto:a@example.com) [y](tel:+1)", None)],
+             r"\[x](mailto:a@example.com) \[y](tel:+1)"),
+            ("plain text that reads as a link between < and >", [("[x](<example.com>)", None)], r"\[x](<example.com>)"),
+            ("code between < and > is text", [("list[int](<int>) a[0](<T, U>) f[x](<a.b>) g[y](<a:b>) [z](<https://example.com>) [w](<#a>) [v](</p>)", None)],
+             "list[int](<int>) a[0](<T, U>) f[x](<a.b>) g[y](<a:b>) [z](<https://example.com>) [w](<#a>) [v](</p>)"),
+            ("a bracket and a backslash right before a link", [("folder [x\\", None), ("a", u)], "folder [x\\\\[a](" + u + ")"),
+            ("two backslashes right before a link", [("x\\\\", None), ("a", u)], "x" + "\\" * 4 + "[a](" + u + ")"),
+            ("a backslash alone before a link", [("\\", None), ("a", u), ("\\", None), ("b", v), ("\\", None)],
+             "\\\\[a](" + u + ")\\\\[b](" + v + ")\\"),
+            ("a bracket that the text after a link would close", [("[x ", None), ("a", u), (" y](" + v + ")", None)],
+             r"\[x [a](" + u + ") y](" + v + ")"),
+            ("a bracket that the address of a link would close", [("[x ", None), ("a", "https://e.com/](https://z)"), (" b", None)],
+             r"\[x [a](https://e.com/](https://z)) b"),
+            ("plain text around a link reads as an address", [("[x](https://e.com/", None), ("a", u), (")", None)],
+             r"\[x](https://e.com/[a](" + u + "))"),
+            ("plain text around a link reads as an address between < and >", [("[x](<", None), ("a", u), (">)", None)],
+             "[x](<[a](" + u + ")>)"),
+            ("nested brackets that read as a link", [("[[x]](" + u + ") [a [b] c](" + v + ")", None)],
+             r"\[[x]](" + u + r") \[a [b] c](" + v + ")"),
+            ("two links in a row, both plain", [("[x](" + u + ")[y](" + v + ")", None)], r"\[x](" + u + r")\[y](" + v + ")"),
+            ("an escaped bracket in plain text is nothing to escape", [(r"a \[b\] \] c", None)], r"a \[b\] \] c"),
+            ("text with an unfinished link", [("[x](https://e.com [y](mailto:) [](" + u + ")", None)],
+             "[x](https://e.com [y](mailto:) [](" + u + ")"),
+            ("a telephone", [("call", "tel:+15550100")], "[call](tel:+15550100)"),
+            ("another scheme", [("x", "notion://app/y"), (" ", None), ("y", "sftp://example.com/a"), (" ", None), ("z", "linear://example.com/a")],
+             "[x](<notion://app/y>) [y](<sftp://example.com/a>) [z](<linear://example.com/a>)"),
+            ("an address with no scheme", [("x", "example.com"), ("y", "user@example.com"), ("z", "//example.com/x")],
+             "[x](<example.com>)[y](<user@example.com>)[z](<//example.com/x>)"),
+            ("an address urllib cannot read", [("x", "//[x"), ("y", "http://[x")], "[x](<//[x>)[y](http://[x)"),
+            ("spaces, parentheses and backslashes between < and >", [("x", "//a )(b\\"), ("y", "a.com/<z>(q)")], r"[x](<//a\ \)\(b\\>)[y](<a.com/<z>(q)>)"),
+            ("more addresses between < and >", [("a", "a.b.example.com:80/x?y#z"), (" ", None), ("b", "a.b+c@example.org"), (" ", None), ("c", "s3-x.y+z://h")],
+             "[a](<a.b.example.com:80/x?y#z>) [b](<a.b+c@example.org>) [c](<s3-x.y+z://h>)"),
+            ("a path inside Notion", [("page", "/" + hex32(WIKI)), (" ", None), ("block", "/" + hex32(WIKI) + "#" + hex32(PAGE))],
+             "[page](https://app.notion.com/" + hex32(WIKI) + ") [block](https://app.notion.com/" + hex32(WIKI) + "#" + hex32(PAGE) + ")"),
+            ("the full address of the same page", [("page", "https://app.notion.com/" + hex32(WIKI)), ("p", page_url(WIKI))],
+             "[page](<https://app.notion.com/" + hex32(WIKI) + ">)[p](" + page_url(WIKI) + ")"),
+        ]
+        for name, spec, printed in table:
+            with self.subTest(name):
+                runs = [run(said, address) for said, address in spec]
+                self.page["properties"]["Notes"]["rich_text"] = runs
+                code, out, err = self.run_cli("fetch", PAGE, "--props-only")
+                self.assertEqual(code, 0, err)
+                value = self.props_of(out)["Notes"]
+                self.assertEqual(value, printed)
+                self.page["properties"]["Notes"]["rich_text"] = []
+                code, out, err = self.run_cli("update", PAGE, "--set", "Notes=" + value)
+                self.assertEqual(code, 0, err)
+                stored = self.page["properties"]["Notes"]["rich_text"]
+                self.assertEqual([(r["plain_text"], r["href"]) for r in stored], spec)
+
+    def test_every_list_of_runs_survives_printing_and_reading(self):
+        # A fuzz that favours brackets, parentheses and backslashes next to links, and whole links as plain text.
+        dice = random.Random(20261125)
+        bits = ["[", "]", "(", ")", "\\", "\\\\", "[", "](", ")", "<", ">", " ", "x", "é", "\n", "](https://e.com/", "https://",
+                "mailto:", "tel:", "[a](https://e.com/b)", "](<", ">)", "/" + hex32(WIKI), "https://app.notion.com/" + hex32(WIKI)]
+        starts = ["https://e.com/", "http://", "mailto:", "tel:", "notion://", "/", "//", "", "/" + hex32(WIKI), "https://app.notion.com/"]
+
+        def made(limit):
+            return "".join(dice.choice(bits) for _ in range(dice.randint(1, limit)))
+
+        def merged(runs):
+            out = []
+            for said, url in runs:
+                if out and out[-1][1] == url:
+                    out[-1] = (out[-1][0] + said, url)
+                else:
+                    out.append((said, url))
+            return out
+
+        def writable(url):  # a path the API refuses is the full address of the same page, an address it stores nowhere is none
+            if url and not re.match(r"/(?!/)|(?:https?://|mailto:|tel:).|(?:[a-z][a-z0-9+.-]*:)?//\S", url, re.S):
+                return None
+            path = url and url.startswith("/") and not url.startswith("//")
+            return "https://app.notion.com" + url if path and not re.fullmatch(r"/[0-9a-f]{32}(#[0-9a-f]{32})?", url) else url
+
+        escaped = 0
+        for number in range(6000):
+            spec = [(made(6), None) if dice.random() < 0.5 else (made(4), dice.choice(starts) + made(3)) for _ in range(dice.randint(1, 5))]
+            runs = merged([(said, url or None) for said, url in spec])
+            printed = self.n.linked([run(said, url) for said, url in runs])
+            read = merged([(r["text"]["content"], (r["text"].get("link") or {}).get("url")) for r in self.n.linked_text(printed)])
+            self.assertEqual(read, merged([(said, writable(url)) for said, url in runs]), (number, runs, printed))
+            self.assertEqual(self.n.linked([run(*pair) for pair in read]), printed)
+            if [url for _, url in runs] == [None]:  # plain text alone: escaped only where something in it looks like a link
+                if not re.search(r"\[[\s\S]+\]\((?:https?://|mailto:|tel:|<)", runs[0][0]):
+                    self.assertEqual(printed, runs[0][0])
+                escaped += printed != runs[0][0]
+        self.assertGreater(escaped, 20, "the fuzz never met plain text that looks like a link")
+
+    def test_the_reader_takes_between_angles_only_what_the_printer_prints(self):
+        # Every short string over the marks, between < and >: it is a link exactly when it is how a link is printed.
+        dice, links = random.Random(20261125), 0
+        bits = ["a", "b.com", "x@example.org", "//", "https://", "notion://", "mailto:", ".", ":", "/", "\\", "\\\\", "(", ")", "\\(", "\\)", " ", "\\ ", "<", ">", "#",
+                "[", "]", "int", "tel:", "https://app.notion.com/" + hex32(WIKI), "/" + hex32(WIKI)]
+        for number in range(20000):
+            inside = "".join(dice.choice(bits) for _ in range(dice.randint(0, 4)))
+            value = f"[x](<{inside}>)"
+            read = self.n.linked_text(value)
+            url = (read[0]["text"].get("link") or {}).get("url") if len(read) == 1 and read[0]["text"]["content"] == "x" else None
+            if url is not None:
+                links += 1
+                self.assertEqual(self.n.linked([run("x", url)]), value)
+            elif not any(r["text"].get("link") for r in read):
+                self.assertEqual("".join(r["text"]["content"] for r in read).replace("\\", ""), value.replace("\\", ""), number)
+        self.assertGreater(links, 1000)
+        for address, linked in (("x.example.com/" + "a" * 1986, True), ("x.example.com/" + "a" * 1987, False)):
+            self.assertEqual("link" in self.n.linked_text(f"[x](<{address}>)")[0]["text"], linked)
+            self.assertEqual(self.n.linked([run("x", address)]), f"[x](<{address}>)" if linked else "x")
+        for said in ("list[int](<int>)", "Dict[str](<T>)", "a[0](<>)", "[x](<int>) and [y](<https://example.com>)"):
+            self.assertEqual(self.n.linked_text(said), [{"text": {"content": said}}])
+
+    def test_a_long_value_is_read_and_printed_in_linear_time(self):
+        size = 200000
+        shapes = {"\\[": "\\[", "[": "[", "]": "]", "[[]": "[[]", "backslashes": "\\", "\\[\\": "\\[\\", "](": "](", "[](": "[](",
+                  "[a](": "[a](", "[a](https://": "[a](https://", "[a](https://e.com/(": "[a](https://e.com/(", "(": "(", ")": ")",
+                  "[a](<": "[a](<", "[a](<//x": "[a](<//x", "(<//x(": "(<//x(", "(<a.com/(": "(<a.com/(", "[a](<a.com>)": "[a](<a.com>)",
+                  "nested angles": "[a](<//x" * 80 + ">)" * 80, "[a](<//x\\(": "[a](<//x\\(>)", "[a](<//x y>)": "[a](<//x y>)", "[a](https://e.com/b)": "[a](https://e.com/b)", "\\[a](https://e.com/b)": "\\[a](https://e.com/b)",
+                  "words": "some words ", "[a] ": "[a] ", "[a](https://e.com/\\ ": "[a](https://e.com/\\ ", "](https://e.com)": "](https://e.com)"}
+        for name, shape in shapes.items():
+            value = "[a](https://e.com/b) " + (shape * (size // len(shape) + 1))[:size] + "[a](https://e.com/b)"
+            with self.subTest(shape=name):
+                began = time.process_time()  # the process's own time: the machine's load does not count
+                runs = self.n.linked_text(value)
+                printed = self.n.linked([run(r["text"]["content"], (r["text"].get("link") or {}).get("url")) for r in runs])
+                spent = time.process_time() - began
+                self.assertLess(spent, 5, "the scan is not linear")
+                again = self.n.linked_text(printed)
+                self.assertEqual([(r["text"]["content"], r["text"].get("link")) for r in again],
+                                 [(r["text"]["content"], r["text"].get("link")) for r in self.joined(runs)])
+
+    def joined(self, runs):
+        """The runs as one reading gives them: neighbours of one address together, in pieces of 2,000."""
+        out = []
+        for r in runs:
+            url = (r["text"].get("link") or {}).get("url")
+            if out and out[-1][1] == url:
+                out[-1][0] += r["text"]["content"]
+            else:
+                out.append([r["text"]["content"], url])
+        return [piece for said, url in out for piece in self.n.rich_text(said, url)]
+
+    def test_reading_never_fails_on_what_a_card_holds(self):
+        addresses = ["//[x", "http://[x", "https://[::1", "//", "/", "?", "#", "[", "](", ")", "(", "\\", " ", "<", "<>", "::", "%", "https://a:b/",
+                     "javascript:x", "data:,x", "mailto:", "tel:", "\u0000", "\n"]
+        for address in addresses:
+            with self.subTest(address=address):
+                self.page["properties"]["Notes"]["rich_text"] = [run("before "), run("label", address), run(" after")]
+                for verb in (("fetch", PAGE), ("query", "Tasks", "--select", "Notes"), ("query", "Tasks", "--json")):
+                    code, out, err = self.run_cli(*verb)
+                    self.assertEqual(code, 0, err)
+                    self.assertIn("label", out)
+
+    def test_a_written_link_becomes_a_linked_run_in_update_create_and_a_pages_file(self):
+        link = {"text": {"content": "docs", "link": {"url": "https://example.com/docs"}}}
+        value = "A [docs](https://example.com/docs), [x] (y) [z](relative) **b**"
+        expected = [{"text": {"content": "A "}}, link, {"text": {"content": ", [x] (y) [z](relative) **b**"}}]
+        code, out, err = self.run_cli("update", PAGE, "--set", "Notes=" + value)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]["Notes"], {"rich_text": expected})
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=" + value)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.sent("POST", r"/v1/pages")[-1].json["properties"]["Task name"], {"title": expected})
+        pages = self.tmp / "pages.json"
+        pages.write_text(json.dumps([{"properties": {"Task name": "One", "Notes": value}}]))
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--pages-file", pages)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.sent("POST", r"/v1/pages")[-1].json["properties"]["Notes"], {"rich_text": expected})
+        long = "a" * 2500
+        code, out, err = self.run_cli("update", PAGE, "--set", f"Notes=[{long}](https://example.com/l)")
+        sent = self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]["Notes"]["rich_text"]
+        self.assertEqual([(len(r["text"]["content"]), r["text"]["link"]["url"]) for r in sent],
+                         [(2000, "https://example.com/l"), (500, "https://example.com/l")])
+
+    def test_the_client_itself_uses_titles_as_plain_text(self):
+        self.fake.data_sources[DS_PROJECTS]["title"] = [run("Pro"), run("jects", "https://example.com/p")]
+        code, out, err = self.run_cli("fetch", "projects")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines()[0], "data source: Projects")
+
+        def lands_then_503(request):
+            self.fake.create_page(request.json)
+            return error(503, "service_unavailable", "Try later.")
+        self.fake.on("POST", r"/v1/pages", lands_then_503)
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Read [docs](https://example.com/docs)")
+        self.assertEqual(code, 0, err)
+        self.assertIn("found by its title", out)
+        looked = self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query")[-1].json["filter"]["and"][0]
+        self.assertEqual(looked, {"property": "Task name", "title": {"equals": "Read docs"}})
+        self.page["properties"]["Notes"]["rich_text"] = [run("split "), run("needle", "https://example.com/haystack"), run(" here")]
+        code, out, err = self.run_cli("search", "split needle here")
+        self.assertIn(f"{self.page['url']} | Tasks | matched: Notes", out)
+
+
 class CreateTest(ClientTestCase):
     def test_create_in_data_source_one_request(self):
         body = self.tmp / "card.md"
@@ -910,6 +1508,29 @@ class CreateTest(ClientTestCase):
         self.assertEqual(sent["parent"], {"page_id": PROJECT})
         self.assertEqual(sent["properties"], {"title": {"title": [{"text": {"content": "Approved plan"}}]}})
         self.assertIn("created ", out)
+
+    def test_create_says_which_heading_notion_left_out(self):
+        # The API drops a body's only level-1 heading when it is the first line, title given or not.
+        cases = [("# Only\n\nText.\n", "'# Only'"), ("\n# Only\n## Sub\n\n```\n# code\n```\n", "'# Only'"),
+                 ("# One\n\nText.\n\n# Two\n", None), ("Intro.\n\n# Mid\n", None), ("## Sub\n\nText.\n", None),
+                 ("```\n# code\n```\n", None), ("#tag text\n", None), ("", None),
+                 ("# Only\n\n```\na\n```js\n# in code\n```\n", "'# Only'"), ("# Only\n\n~~~\n# in code\n~~~\n", "'# Only'"),
+                 ("# Only\n\n> ```\n> # in code\n> ```\n\ntext\n", "'# Only'"), ("# Only\n\n~~~\na\n```\n# in code\n~~~\n", "'# Only'"),
+                 ("~~~\n# code\n~~~\n", None), ("```code``` text\n\n# Mid\n", None), ("# One\n\n```code``` text\n\n# Two\n", None),
+                 ("Title\n=====\n\nText.\n", None), ("> # quoted\n\nText.\n", None)]
+        body = self.tmp / "body.md"
+        for markdown, heading in cases:
+            with self.subTest(markdown=markdown):
+                body.write_text(markdown)
+                code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=A card", "--body-file", body)
+                self.assertEqual(code, 0, err)
+                url = re.search(r"created (\S+)", out).group(1)
+                if heading:
+                    self.assertEqual(len(err.splitlines()), 1)
+                    self.assertIn(f"{heading} was left out of {url}", err)
+                    self.assertIn("--prepend-file", err)
+                else:
+                    self.assertEqual(err, "")
 
     def test_create_pages_file_three_pages(self):
         pages = self.tmp / "pages.json"
@@ -1017,7 +1638,8 @@ class CreateTest(ClientTestCase):
         self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", lambda r: error(400, "validation_error", "Bad markdown."))
         code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--append-file", note)
         self.assertEqual(code, 4, err)
-        self.assertRegex(err, r"Not written: body added at the end \(.*400.*\): Notion refused it and nothing changed")
+        self.assertRegex(err, r"Not written: body added at the end \(.*400.*\): Notion refused it\. ")
+        self.assertNotIn("nothing changed", err)  # the properties were written
         self.assertIn("Rerun only what was not written", err)
         self.assertNotIn("In doubt", err)
 
@@ -1171,16 +1793,44 @@ class CreateTest(ClientTestCase):
 WRITE_OUTCOMES = {  # how a write's request ends -> which of the three cases the client must say it is
     "400": "refused", "429": "refused", "500": "in doubt", "502": "in doubt", "503": "in doubt",
     "504": "in doubt", "529": "in doubt", "timeout": "in doubt", "reset": "in doubt", "unreachable": "not sent",
+    "302": "in doubt", "200 {}": "in doubt", "200 []": "in doubt", "200 message": "in doubt", "200 error": "in doubt",
+    "200 no id": "in doubt", "200 null id": "in doubt", "200 list": "in doubt", "200 id alone": "in doubt", "200 not json": "in doubt", "200 cut": "in doubt", "200 empty": "in doubt", "200 scalar": "in doubt",
+    "tls eof": "in doubt", "tls other": "in doubt", "incomplete": "in doubt", "disconnected": "in doubt",
+    "broken answer": "in doubt", "pipe": "in doubt", "os error": "in doubt", "any other": "in doubt",
+}
+LOST = {  # how a connection that was established fails before its answer is whole
+    "timeout": TimeoutError("timed out"),
+    "reset": ConnectionResetError(104, "Connection reset by peer"),
+    "tls eof": ssl.SSLEOFError(8, "EOF occurred in violation of protocol"),
+    "tls other": ssl.SSLError(1, "[SSL: BAD_RECORD_MAC] bad record mac"),
+    "incomplete": http.client.IncompleteRead(b"{", 40),
+    "disconnected": http.client.RemoteDisconnected("Remote end closed connection without response"),
+    "broken answer": http.client.BadStatusLine("garbage"),
+    "pipe": BrokenPipeError(32, "Broken pipe"),
+    "os error": OSError(5, "Input/output error"),
+    "any other": ValueError("a chunk that is not a number"),
+}
+UNREADABLE = {  # a success whose body is not the API's answer
+    "200 not json": b"<html>Sign in to the network</html>", "200 cut": b'{"object": "page", "id"', "200 empty": b"", "200 scalar": b'"ok"',
+}
+
+OTHER_SHAPE = {  # a success whose body is JSON, and not what a write to a page, a block, a comment or an upload answers
+    "200 {}": {}, "200 []": [], "200 message": {"message": "sign in"}, "200 no id": {"object": "page", "url": "https://example.com/"},
+    "200 error": {"object": "error", "id": uid(0xE0), "status": 503, "code": "busy", "additional_data": "none"},
+    "200 null id": {"object": "page", "id": None}, "200 list": {"object": "list", "results": []}, "200 id alone": {"id": uid(0xE1)},
 }
 
 
 def ends_in(outcome):
-    """A fake answer for a write: a status, a timeout, a reset after the request left, or no connection."""
+    """A fake answer for a write: a status, a success that cannot be read, a connection lost after the request
+    left, or no connection."""
     def handler(r):
-        if outcome == "timeout":
-            raise TimeoutError("timed out")
-        if outcome == "reset":
-            raise ConnectionResetError(104, "Connection reset by peer")
+        if outcome in LOST:
+            raise LOST[outcome]
+        if outcome in UNREADABLE:
+            return 200, UNREADABLE[outcome]
+        if outcome in OTHER_SHAPE:
+            return 200, OTHER_SHAPE[outcome]
         if outcome == "unreachable":
             raise ConnectionRefusedError(111, "Connection refused")
         status = int(outcome)
@@ -1193,12 +1843,14 @@ def ends_in(outcome):
 class WriteOutcomeTest(ClientTestCase):
     """One rule for every write that does not come back with a success: refused, not sent or in doubt."""
 
-    def assert_case(self, case, err):
+    def assert_case(self, case, err, landed=False):
+        if landed:  # once a write of the command landed, no line says that nothing changed
+            self.assertNotRegex(err, r"(?i)nothing changed|nothing was made|never left this machine")
         if case == "refused":
-            self.assertRegex(err, r"Notion refused it and nothing (changed|was made)")
+            self.assertRegex(err, r"Notion refused it" + ("" if landed else r" and nothing (changed|was made)"))
             self.assertNotRegex(err, r"(?i)in doubt|may have been|never left")
         elif case == "not sent":
-            self.assertRegex(err, r"the request never left this machine, so nothing (changed|was made)")
+            self.assertRegex(err, r"Not sent: " if landed else r"the request never left this machine, so nothing (changed|was made)")
             self.assertNotRegex(err, r"(?i)in doubt|may have been|refused it")
         else:
             self.assertRegex(err, r"(?i)\bin doubt\b")
@@ -1247,7 +1899,7 @@ class WriteOutcomeTest(ClientTestCase):
                     code, out, err = self.run_cli(*args)
                     expected = 4 if name == "create --pages-file" else (on_400 if outcome == "400" else 1)
                     self.assertEqual(code, expected, err)
-                    self.assert_case(case, err)
+                    self.assert_case(case, err, landed=name == "create --pages-file")
                     first = 1 if name == "create --pages-file" else 0
                     self.assertEqual(len(sends), first + (6 if outcome == "429" else 1), "a write is never resent blindly")
         for doc in ("SKILL.md", "references/api-limits.md"):
@@ -1257,22 +1909,96 @@ class WriteOutcomeTest(ClientTestCase):
                               "never left", "in doubt", "any 5xx", "a timeout", "after the request left"):
                     self.assertIn(words.casefold(), said.casefold())
 
+    def test_what_a_write_answers_is_judged_by_its_endpoint(self):
+        answers = [  # path, answer, whether it proves the write
+            ("/v1/pages", {"object": "page", "id": uid(1)}, True), (f"/v1/pages/{PAGE}/markdown", {"object": "page_markdown", "id": uid(1)}, True),
+            (f"/v1/blocks/{PAGE}/children", {"object": "list", "results": []}, True), (f"/v1/blocks/{PAGE}/children", {"object": "list"}, False),
+            (f"/v1/blocks/{PAGE}", {"object": "list", "results": []}, False), ("/v1/comments", {"object": "list", "results": []}, False),
+            ("/v1/data_sources", {"object": "data_source", "id": uid(1)}, True), ("/v1/something", {"object": "list", "results": []}, True),
+            ("/v1/something", {"object": "list", "results": "none"}, False), ("/v1/something", {"object": "ok"}, False),
+            ("/v1/pages", {"object": "page", "id": ""}, False), ("/v1/pages", {"object": "page", "id": 7}, False), ("/v1/pages", "page", False),
+        ]
+        for path, answer, proves in answers:
+            with self.subTest(path=path, answer=answer):
+                self.assertEqual(self.n.answers_write(path, answer), proves)
+        self.assertFalse(self.n.is_write("HEAD", "/v1/pages"))
+        # a partial object is a page or a comment like any other, and nothing is printed as None
+        self.fake.on("POST", r"/v1/pages", lambda r: (200, {"object": "page", "id": uid(0x31)}))
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Partial")
+        self.assertEqual((code, out.strip()), (0, "created " + page_url(uid(0x31))), err)
+        self.fake.on("POST", r"/v1/comments", lambda r: (200, {"object": "comment", "id": uid(0x32)}))
+        code, out, err = self.run_cli("comments", "add", PAGE, "--body", "Ready")
+        self.assertEqual((code, out.strip()), (0, "comment " + uid(0x32)), err)
+        # the answer of another shape is shown by `api`, and a create whose answer names a page reads that page
+        self.fake.on("POST", r"/v1/comments", lambda r: (200, {"message": "sign in"}))
+        code, out, err = self.run_cli("api", "POST", "/v1/comments", "--data", "{}")
+        self.assertEqual((code, json.loads(out)), (1, {"message": "sign in"}), err)
+        for named in (uid(0x33), [uid(0x33)], {"id": uid(0x33)}):
+            with self.subTest(committed=named):
+                self.fake.on("GET", rf"/v1/pages/{uid(0x33)}", lambda r: (200, {}))
+                self.fake.on("POST", r"/v1/pages", lambda r, named=named: (503, dict(error(503, "x", "y")[1], additional_data={
+                    "committed_resource_id": named})))
+                code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Nowhere")
+                self.assertEqual(code, 1)
+                self.assertIn("In doubt: 'Nowhere'", err)
+                self.assertNotIn("None", out + err)
+
+    def test_an_upload_whose_content_does_not_arrive_says_what_was_made(self):
+        shot = self.tmp / "screen.png"
+        shot.write_bytes(b"png")
+        for outcome, case in WRITE_OUTCOMES.items():
+            with self.subTest(outcome=outcome):
+                self.fake.overrides.clear()
+                self.fake.calls.clear()
+                self.fake.on("POST", r"/v1/file_uploads/[^/]+/send", ends_in(outcome))
+                code, out, err = self.run_cli("upload", shot)
+                self.assertEqual((code, out), (1, ""), err)
+                upload = self.fake.sent("POST", r"/v1/file_uploads/[^/]+/send")[0].path.split("/")[3]
+                self.assert_case(case, err, landed=True)
+                self.assertIn(f"written: the upload object {upload}, on no page, which expires by itself. ", err)
+                label = {"refused": "Not written", "not sent": "Not sent", "in doubt": "In doubt"}[case]
+                self.assertIn(f"{label}: the content of screen.png (", err)
+                self.assertIn("Run `notion upload` again", err)
+                self.assertEqual(len(self.fake.sent("POST", r"/v1/file_uploads")), 1)
+        self.fake.on("POST", r"/v1/file_uploads/[^/]+/send", lambda r: error(401, "unauthorized", "No."))
+        self.assertEqual(self.run_cli("upload", shot)[0], 3)
+
+    def test_an_answer_with_no_code_or_message_is_said_in_whole_words(self):
+        self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", lambda r: (302, b""))
+        code, out, err = self.run_cli("query", COLLECTION + DS_TASKS)
+        self.assertEqual((code, err), (1, f"Notion answered 302 on /v1/data_sources/{DS_TASKS}/query\n"))
+        self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", lambda r: error(403, "restricted_resource", "No."))
+        code, out, err = self.run_cli("query", COLLECTION + DS_TASKS)
+        self.assertEqual((code, err), (1, f"Notion answered 403 restricted_resource on /v1/data_sources/{DS_TASKS}/query: No.\n"))
+
+    def serve_once(self, answer, reset=False):
+        """A local server that reads one request, sends `answer` and closes, with a reset when asked to: its port,
+        and the list of the requests it read."""
+        listener, read = socket.socket(), []
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(5)
+        listener.settimeout(30)
+        self.addCleanup(listener.close)
+
+        def serve():
+            try:
+                while True:
+                    conn, _ = listener.accept()
+                    with conn, contextlib.suppress(OSError):  # a client that goes away ends its own connection only
+                        conn.settimeout(10)
+                        read.append(conn.recv(65536))  # the request left and arrived
+                        if reset:
+                            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                        if answer:
+                            conn.sendall(answer)
+            except OSError:
+                pass
+        threading.Thread(target=serve, daemon=True).start()
+        return listener.getsockname()[1], read
+
     def test_the_real_transport_tells_a_lost_connection_from_one_never_made(self):
-        import socket
-
-        def closes_after_reading():
-            listener = socket.socket()
-            listener.bind(("127.0.0.1", 0))
-            listener.listen(1)
-            self.addCleanup(listener.close)
-
-            def serve():
-                conn, _ = listener.accept()
-                conn.recv(65536)  # the request left and arrived; the server closes without answering
-                conn.close()
-            threading.Thread(target=serve, daemon=True).start()
-            return listener.getsockname()[1]
-
+        self.enterContext(warnings.catch_warnings())  # urllib leaves the answer of a redirect it cannot read open
+        warnings.simplefilter("ignore", ResourceWarning)
         closed = socket.socket()
         closed.bind(("127.0.0.1", 0))
         refused_port = closed.getsockname()[1]
@@ -1281,37 +2007,262 @@ class WriteOutcomeTest(ClientTestCase):
         bypass.start()
         self.addCleanup(bypass.stop)
         self.settings(me="ana@example.com")
-        for port, case in ((closes_after_reading(), "in doubt"), (refused_port, "not sent")):
-            with self.subTest(case=case):
-                local = f"http://127.0.0.1:{port}"
+        self.fake.comments[PAGE] = []
+        eof = LOST["tls eof"]
 
-                def transport(method, url, headers, body=None, timeout=None, local=local):
-                    if method == "POST" and urlsplit(url).path == "/v1/comments":
-                        return self.n.urllib_transport(method, url.replace(API, local), headers, body, 5)
-                    return self.fake(method, url, headers, body, timeout)
+        def ok(body, length=None):
+            return (f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {length or len(body)}\r\n\r\n"
+                    + body).encode()
 
-                self.n.TRANSPORT = transport
-                code, out, err = self.run_cli("comments", "add", PAGE, "--body", "Ready")
-                self.assertEqual(code, 1, err)
-                self.assert_case(case, err)
+        def raising(target, error):
+            return lambda: mock.patch.object(*target, side_effect=error)
+
+        reading, beginning = (http.client.HTTPResponse, "read"), (http.client.HTTPResponse, "begin")
+        table = [  # name, what the server sends, reset, what is patched, scheme, the case of a write
+            ("closes without an answer", b"", False, None, "http", "in doubt"),
+            ("resets without an answer", b"", True, None, "http", "in doubt"),
+            ("a body cut short", ok("{", 40), False, None, "http", "in doubt"),
+            ("not http at all", b"garbage\r\n\r\n", False, None, "http", "in doubt"),
+            ("a broken chunk", b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n", False, None, "http", "in doubt"),
+            ("a page that is not JSON", ok("<html></html>"), False, None, "http", "in doubt"),
+            ("an empty answer", b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", False, None, "http", "in doubt"),
+            ("a redirect", b"HTTP/1.1 302 Found\r\nLocation: /v1/elsewhere\r\nContent-Length: 0\r\n\r\n", False, None, "http", "in doubt"),
+            ("a 503 whose body is cut", b"HTTP/1.1 503 Busy\r\nContent-Length: 40\r\n\r\n{", False, None, "http", "in doubt"),
+            ("a 400 whose body is cut", b"HTTP/1.1 400 Bad\r\nContent-Length: 40\r\n\r\n{", False, None, "http", "refused"),
+            ("a TLS error while the status is read", ok("{}"), False, raising(beginning, eof), "http", "in doubt"),
+            ("a TLS error while the body is read", ok("{}"), False, raising(reading, eof), "http", "in doubt"),
+            ("a reset while the body is read", ok("{}"), False, raising(reading, LOST["reset"]), "http", "in doubt"),
+            ("a timeout while the body is read", ok("{}"), False, raising(reading, LOST["timeout"]), "http", "in doubt"),
+            ("a TLS error while sending", ok("{}"), False, raising((socket.socket, "sendall"), eof), "http", "in doubt"),
+            ("a redirect to an address nothing can read", b"HTTP/1.1 302 Found\r\nLocation: http://[x/\r\nContent-Length: 0\r\n\r\n",
+             False, None, "http", "in doubt"),
+            ("a TLS handshake that fails", b"plain text, no TLS here", False, None, "https", "not sent"),
+            ("the name does not resolve", None, False, raising((socket, "create_connection"), socket.gaierror(-2, "Name unknown")),
+             "http", "not sent"),
+            ("no route to the host", None, False, raising((socket, "create_connection"), OSError(113, "No route to host")), "http", "not sent"),
+            ("connecting times out", None, False, raising((socket, "create_connection"), TimeoutError("timed out")), "http", "not sent"),
+            ("the connection is refused", None, False, None, "http", "not sent"),
+        ]
+        for name, answer, reset, patched, scheme, case in table:
+            for method, path, verb in (("POST", "/v1/comments", ("comments", "add", PAGE, "--body", "Ready")),
+                                       ("GET", "/v1/comments", ("comments", "list", PAGE))):
+                with self.subTest(name, method=method):
+                    port, read = self.serve_once(answer, reset) if answer is not None else (refused_port, [])
+                    local = f"{scheme}://127.0.0.1:{port}"
+
+                    def transport(wanted, url, headers, body=None, timeout=None):
+                        if (wanted, urlsplit(url).path) == (method, path):
+                            with (patched or contextlib.nullcontext)():
+                                return self.n.urllib_transport(wanted, url.replace(API, local), headers, body, 5)
+                        return self.fake(wanted, url, headers, body, timeout)
+
+                    self.n.TRANSPORT = transport
+                    code, out, err = self.run_cli(*verb)
+                    if method == "POST":
+                        self.assertEqual(code, 2 if case == "refused" else 1, err)
+                        self.assert_case(case, err)
+                        self.assertLessEqual(len(read), 1, "a write is never sent again")
+                    else:  # the same failures of a read: one line that says so, and never the words of a write
+                        self.assertEqual(code, 2 if case == "refused" else 1, err)
+                        self.assertNotRegex(err, r"(?i)in doubt|may have been|nothing changed|never left")
+                        self.assertRegex(err, r"could not reach|did not answer|not JSON|Notion answered (302|400|503)")
+                        self.assertEqual(len(err.splitlines()), 1, err)
+
+    def test_what_fails_before_a_connection_is_established_is_not_sent(self):
+        bypass = mock.patch.dict(os.environ, {"no_proxy": "", "NO_PROXY": ""})
+        bypass.start()
+        self.addCleanup(bypass.stop)
+        tunnels = {"refuses": b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n", "garbage": b"not http\r\n\r\n",
+                   "nothing": b"", "a line too long": b"HTTP/1.1 " + b"2" * 70000 + b"\r\n\r\n", "half a status": b"HTTP/1.1 2"}
+        for name, answer in tunnels.items():
+            for method in ("POST", "GET"):
+                with self.subTest(proxy=name, method=method):
+                    port, read = self.serve_once(answer)
+                    with mock.patch.dict(os.environ, {"https_proxy": f"http://127.0.0.1:{port}", "HTTPS_PROXY": f"http://127.0.0.1:{port}"}):
+                        proxied = load_client()  # the opener takes the proxies of the environment when it is built
+                    with self.assertRaises(proxied.Unsent):
+                        proxied.urllib_transport(method, "https://host.invalid/v1/comments", {}, b"{}" if method == "POST" else None, 5)
+                    self.assertTrue(read[0].startswith(b"CONNECT "))
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        local = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        closed.close()
+        for path in ("/v1/comments/a b", "/v1/p\u00e1ges", "/v1/a\nb", "/v1/a\x7fb"):
+            with self.subTest(path=path):
+                with self.assertRaises(self.n.Unsent):  # raised by http.client before it connects
+                    self.n.urllib_transport("POST", local + path, {}, b"{}", 5)
+                for method in ("POST", "PATCH", "GET"):
+                    self.fake.calls.clear()
+                    code, out, err = self.run_cli("api", method, path, "--data", "{}")
+                    self.assertEqual(code, 2, err)
+                    self.assertIn("the request never left this machine, so nothing changed", err)
+                    self.assertNotRegex(err, r"(?i)in doubt|may have")
+                    self.assertEqual(self.fake.calls, [])
+        self.n.TRANSPORT = lambda method, url, headers, body=None, timeout=None: self.n.urllib_transport(
+            method, url.replace(API, local).replace("/v1/comments", "/v1/com ments"), headers, body, 5)
+        code, out, err = self.run_cli("api", "POST", "/v1/comments", "--data", "{}")
+        self.assertEqual(code, 1, err)
+        self.assert_case("not sent", err)
+        for url in ("nonsense", "http://[x/"):  # not even a request
+            with self.assertRaises(self.n.Unsent):
+                self.n.urllib_transport("POST", url, {}, b"{}", 5)
+
+    def test_a_read_that_never_connected_is_tried_three_times_and_a_write_once(self):
+        for failing in (TimeoutError("timed out"), ConnectionRefusedError(111, "Connection refused"), socket.gaierror(-3, "Try again")):
+            for method, tries, waits in (("GET", 3, [1, 2]), ("POST", 1, [])):
+                with self.subTest(failing=type(failing).__name__, method=method):
+                    self.sleeps.clear()
+                    self.n.TRANSPORT = self.n.urllib_transport
+                    bypass = {"no_proxy": "*", "NO_PROXY": "*"}
+                    with mock.patch.dict(os.environ, bypass), mock.patch.object(socket, "create_connection", side_effect=failing) as dialled:
+                        code, out, err = self.run_cli("api", method, "/v1/comments", "--data", "{}")
+                    self.assertEqual((code, dialled.call_count, self.sleeps), (1, tries, waits), err)
+                    if method == "POST":
+                        self.assert_case("not sent", err)
+                    else:
+                        self.assertIn("could not reach api.notion.com", err)
+                    self.n.TRANSPORT = self.fake
+        # a create in doubt whose lookup cannot connect at first is still found
+        tries = []
+
+        def lookup(r):
+            tries.append(r)
+            if len(tries) < 3:
+                raise self.n.Unsent("TimeoutError: timed out")
+
+        def lost(r):
+            self.fake.create_page(r.json)
+            raise ConnectionResetError(104, "reset")
+
+        self.fake.on("POST", r"/v1/pages", lost)
+        self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", lookup)
+        code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--set", "title=Looked for")
+        self.assertEqual(code, 0, err)
+        self.assertIn("found by its title", out)
+
+    def test_a_read_that_fails_after_a_landed_write_never_hides_the_write(self):
+        failures = {"an address nothing can read": ValueError("Invalid IPv6 URL"), "any other": KeyError("id"), "lost": LOST["reset"],
+                    "not an object": b'{"results": ["x"], "has_more": false}'}
+
+        def failing(kind):
+            def handler(r):
+                if isinstance(failures[kind], bytes):
+                    return 200, failures[kind]
+                raise failures[kind]
+            return handler
+
+        upload, body = uid(0xF11E), self.tmp / "body.md"
+        body.write_text(f"![a](file-upload://{upload})")
+        relation = self.page["properties"]["Project"]
+        relation["has_more"] = True
+        for kind in failures:
+            with self.subTest(update=kind):  # the body landed and the page cannot be read to place the file
+                self.fake.overrides.clear()
+                self.fake.on("GET", r"/v1/blocks/[^/]+/children", failing(kind))
+                code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+                self.assertEqual(code, 4, err)
+                self.assertIn("written: body added at the end", err)
+                self.assertIn(f"file 'a' ({upload})", err)
+                self.assertIn(f"https://file-upload.invalid/{upload}", err)
+            with self.subTest(properties=kind):  # the properties landed and a stored one cannot be read to be printed
+                self.fake.overrides.clear()
+                self.fake.on("GET", rf"/v1/pages/{PAGE}/properties/.*", failing(kind))
+                with mock.patch.object(self.fake, "patch_page", lambda identifier, body: (200, self.page)):
+                    code, out, err = self.run_cli("update", PAGE, "--set", f"Project={page_url(WIKI)}", "--append-file", self.note())
+                self.assertEqual(code, 4, err)
+                self.assertIn(f"updated {self.page['url']}", out)
+                self.assertIn("written: properties Project; body added at the end. Not confirmed: the stored value of Project", err)
+                self.assertNotRegex(err, "(?i)in doubt|not sent|not written")
+                self.assertIn("Shipped.", self.fake.markdown[PAGE])
+            for lookup, pattern in (("GET", r"/v1/users/me"), ("POST", rf"/v1/data_sources/{DS_TASKS}/query")):
+                with self.subTest(create=kind, lookup=pattern):  # the create is in doubt and the page cannot be looked for
+                    self.fake.overrides.clear()
+                    self.fake.on(lookup, pattern, failing(kind))
+                    self.fake.on("POST", r"/v1/pages", ends_in("503"))
+                    code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--set", "title=Doubtful")
+                    self.assertEqual(code, 1, err)
+                    self.assertIn("In doubt: 'Doubtful'", err)
+                    self.assertIn("before creating it again", err)
+            with self.subTest(write_check=kind):  # the check's card was made: it is trashed, or named
+                self.fake.overrides.clear()
+                self.fake.on("GET", r"/v1/blocks/[^/]+/children", failing(kind))
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS, "--marker", "QA MARKER")
+                self.assertEqual(code, 1, out + err)
+                self.assertRegex(out, r"(?m)^write check stopped: .*\n(.*\n)?write check trash: ok")
+                self.fake.on("GET", r"/v1/pages/[^/]+", lambda r, kind=kind: failing(kind)(r) if len(
+                    self.fake.sent("PATCH", r.path)) > 1 else None)
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS, "--marker", "QA MARKER")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("trash the card 'QA MARKER doctor", out)
+                self.assertIn("by hand", out)
+
+    def note(self):
+        path = self.tmp / "note.md"
+        path.write_text("Shipped.\n")
+        return path
+
+    def test_the_transport_raises_only_its_own_failures(self):
+        # download and send read them: Unsent, a timeout or a ConnectionError, whatever the standard library raised.
+        bypass = mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"})
+        bypass.start()
+        self.addCleanup(bypass.stop)
+        port, _ = self.serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+        for kind, error_ in LOST.items():
+            for target in ("begin", "read"):
+                with self.subTest(kind=kind, target=target), mock.patch.object(http.client.HTTPResponse, target, side_effect=error_):
+                    with self.assertRaises(TimeoutError if kind == "timeout" else ConnectionError) as raised:
+                        self.n.urllib_transport("GET", f"http://127.0.0.1:{port}/x", {}, None, 5)
+                    self.assertNotIsInstance(raised.exception, self.n.Unsent)
 
     def test_a_lost_connection_after_a_write_left_is_in_doubt(self):
         note = self.tmp / "note.md"
         note.write_text("Shipped.\n")
+        before = self.fake.markdown[PAGE]
+        lost = {kind: ends_in(kind) for kind in (*LOST, *UNREADABLE, *OTHER_SHAPE)}
+        for kind, fails in lost.items():
+            with self.subTest(update=kind):
+                self.fake.overrides.clear()
+                self.fake.calls.clear()
+                self.fake.markdown[PAGE] = before
 
-        def applied_then_reset(r):
-            self.fake.patch_markdown(PAGE, r.json)
-            raise ConnectionResetError(104, "Connection reset by peer")
+                def applied_then_lost(r, fails=fails):
+                    self.fake.patch_markdown(PAGE, r.json)
+                    return fails(r)
 
-        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", applied_then_reset)
-        code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--append-file", note)
-        self.assertEqual(code, 4, err)
-        self.assertIn("Shipped.", self.fake.markdown[PAGE])
-        self.assertEqual(len(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}/markdown")), 1)
-        self.assertRegex(err, r"written: properties Status\b")
-        self.assertIn("In doubt: body added at the end", err)
-        self.assertNotIn("Not written", err)
-        self.assertNotIn("nothing changed", err)
+                self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", applied_then_lost)
+                code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--append-file", note)
+                self.assertEqual(code, 4, err)
+                self.assertIn("Shipped.", self.fake.markdown[PAGE])
+                self.assertEqual(len(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}/markdown")), 1)
+                self.assertRegex(err, r"written: properties Status\b")
+                self.assertIn("In doubt: body added at the end", err)
+                self.assertNotIn("Not written", err)
+                self.assertNotIn("nothing changed", err)
+            for landed in (True, False):
+                with self.subTest(create=kind, landed=landed):
+                    self.fake.overrides.clear()
+                    self.fake.calls.clear()
+                    title = f"Lost {kind} {landed}"
+
+                    def made_then_lost(r, fails=fails, landed=landed):
+                        if landed:
+                            self.fake.create_page(r.json)
+                        return fails(r)
+
+                    self.fake.on("POST", r"/v1/pages", made_then_lost)
+                    code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", f"title={title}")
+                    self.assertEqual(code, 0 if landed else 1, out + err)
+                    self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+                    self.assertIn("found by its title" if landed else f"In doubt: {title!r}", out + err)
+
+        for kind in (*LOST, *UNREADABLE):
+            with self.subTest(read=kind):
+                self.fake.overrides.clear()
+                self.fake.on("GET", rf"/v1/pages/{PAGE}", ends_in(kind))
+                code, out, err = self.run_cli("fetch", PAGE)
+                self.assertEqual(code, 1, err)
+                self.assertRegex(err, r"could not reach api\.notion\.com|did not answer|with a body that is not JSON")
+                self.assertNotRegex(err, r"(?i)in doubt|may have been|nothing changed")
 
         pages = self.tmp / "pages.json"
         for landed in (True, False):
@@ -1618,6 +2569,16 @@ class QueryTest(ClientTestCase):
                 self.assertEqual(code, 0, err)
                 self.assertEqual(self.last_filter(), expected)
 
+    def test_where_sends_a_date_as_it_was_written(self):
+        # Notion reads a date-only value as a UTC day and an instant by its offset: neither is changed on the way.
+        for value in ("2026-11-03", "2026-11-03T00:00:00-03:00", "2026-11-03T00:00:00Z", "one_week_ago"):
+            with self.subTest(value=value):
+                code, out, err = self.run_cli("query", "Tasks", "--where", f"created >= {value} AND \"Done at\" < {value}")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.last_filter(), {"and": [
+                    {"timestamp": "created_time", "created_time": {"on_or_after": value}},
+                    {"property": "Done at", "date": {"before": value}}]})
+
     def test_query_sends_the_compiled_filter(self):
         code, out, err = self.run_cli("query", "Tasks", "--where",
                                       "Status = 'Done' AND Tags has 'Helpdesk' AND created >= 2026-11-01")
@@ -1686,6 +2647,40 @@ class QueryTest(ClientTestCase):
                 self.assertIn(named, err)
         self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
 
+    def test_where_refuses_a_type_the_api_cannot_filter(self):
+        # A type with no filter (a place) is refused here: the API answers a page of alternatives that name none.
+        self.fake.data_sources[DS_TASKS]["properties"]["Where"] = {"id": "pl", "name": "Where", "type": "place", "place": {}}
+        for where in ("Where is empty", "Where is not empty", "Where = 'x'"):
+            with self.subTest(where=where):
+                code, out, err = self.run_cli("query", "Tasks", "--where", where)
+                self.assertEqual(code, 2)
+                self.assertIn("Where is a place property, which the", err)
+        self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
+
+    def test_is_empty_takes_the_types_the_reference_lists_and_no_other(self):
+        # Over every property type: the reference's `is empty` row is what the client compiles, and every other
+        # type is refused in words that say the condition, not the API, cannot filter it.
+        listed = ["title", "rich_text", "url", "email", "phone_number", "number", "select", "status", "multi_select", "date",
+                  "people", "created_by", "last_edited_by", "relation", "files"]
+        others = ["checkbox", "unique_id", "created_time", "last_edited_time", "formula", "rollup", "place", "button",
+                  "verification"]
+        schema = self.fake.data_sources[DS_TASKS]["properties"]
+        for kind in listed + others:
+            schema[f"P {kind}"] = {"id": f"p-{kind}", "name": f"P {kind}", "type": kind, kind: {}}
+        for kind in listed + others:
+            with self.subTest(kind):
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("query", COLLECTION + DS_TASKS, "--count", "--where", f'"P {kind}" is empty')
+                self.assertEqual(code, 0 if kind in listed else 2, err)
+                self.assertNotIn("the API cannot filter", err)
+                if kind in ("place", "button", "verification"):
+                    self.assertIn(f"P {kind} is a {kind} property, which the condition cannot filter", err)
+        row = next(line for line in (SKILL_DIR / "references" / "properties-and-filters.md").read_text().splitlines()
+                   if "`is_empty`, `is_not_empty`" in line)
+        words = dict(zip(listed, ["title", "text", "url", "e-mail", "phone", "number", "select", "status", "multi-select",
+                                  "date", "person", "created by", "edited by", "relation", "files"]))
+        self.assertEqual(row.split("|")[1].strip(), ", ".join(words.values()) + " (no other type)")
+
     def rows(self, statuses):
         for i, status in enumerate(statuses):
             self.fake.add_page(task_page(uid(0x10000 + i), 1000 + i, f"Row {i}", status=status))
@@ -1743,6 +2738,220 @@ class QueryTest(ClientTestCase):
         sent = self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query")[-1].json
         self.assertEqual(sent["sorts"], [{"timestamp": "created_time", "direction": "descending"}])
 
+    def test_select_takes_every_name_where_and_order_take(self):
+        # Every built-in name --where and --order accept is a --select column too and prints the page's own value.
+        self.page["last_edited_time"] = "2026-11-21T08:15:00.000Z"
+        made, edited = self.page["created_time"], self.page["last_edited_time"]
+        table = [("created", "created_time", made), ("Created", "created_time", made),
+                 ("created_time", "created_time", made), ("edited", "last_edited_time", edited),
+                 ("last_edited", "last_edited_time", edited), ("last_edited_time", "last_edited_time", edited),
+                 ("updated", "last_edited_time", edited), ("Updated", "last_edited_time", edited),
+                 ("id", "Task ID", key(120)), ("key", "Task ID", key(120)),
+                 ("title", "Task name", "Export invoices"), ("name", "Task name", "Export invoices")]
+        for wanted, label, value in table:
+            with self.subTest(select=wanted):
+                if label.endswith("_time"):  # --where and --order take it, so --select does
+                    code, out, err = self.run_cli("query", "Tasks", "--where", f"{wanted} >= 2026-01-01", "--order", f"{wanted} desc")
+                    self.assertEqual(code, 0, err)
+                code, out, err = self.run_cli("query", "Tasks", "--select", wanted)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out.splitlines()[:2], [f"{label} | url", f"{value} | {self.page['url']}"])
+                code, out, err = self.run_cli("query", "Tasks", "--select", wanted, "--json")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out)[0]["properties"], {label: value})
+
+    def named_like_built_ins(self, **renames):
+        """The tasks data source with some properties renamed, in the schema and in the page."""
+        names = {old.replace("_", " "): new for old, new in renames.items()}
+        schema = self.fake.data_sources[DS_TASKS]["properties"]
+        self.fake.data_sources[DS_TASKS]["properties"] = {
+            names.get(n, n): dict(p, name=names.get(n, n)) for n, p in schema.items()}
+        self.page["properties"] = {names.get(n, n): v for n, v in self.page["properties"].items()}
+
+    def test_a_property_named_like_a_built_in_column_prints_its_values(self):
+        # `ID` is the name Notion gives the unique id: in every output that reads a column by the property's name,
+        # the property wins over the built-in and its value is there, whatever key the short format gives it.
+        link, url = "https://example.com/pr/1", self.page["url"]
+        coll = COLLECTION + DS_TASKS
+        original = (dict(self.fake.data_sources[DS_TASKS]["properties"]), dict(self.page["properties"]))
+        workspaces = {
+            "the unique id is ID and a url property is URL": (
+                dict(Task_ID="ID", Pull_Request="URL"),
+                [((), "ID | Task name | Status | url", f"{key(120)} | Export invoices | Done | {url}"),
+                 (("--select", "id"), "ID | url", f"{key(120)} | {url}"),
+                 (("--select", "key"), "ID | url", f"{key(120)} | {url}"),
+                 (("--select", "url"), "URL | url", f"{link} | {url}"),
+                 (("--select", "URL,Task name,ID"), "URL | Task name | ID | url",
+                  f"{link} | Export invoices | {key(120)} | {url}")],
+                {"ID": key(120), "URL": link},
+                {"userDefined:ID": key(120), "userDefined:URL": link}),
+            "a text property is id and a date property is Url": (
+                dict(Notes="id", Done_at="Url"),
+                [(("--select", "id"), "id | url", f"Monthly export | {url}"),
+                 (("--select", "ID"), "id | url", f"Monthly export | {url}"),
+                 (("--select", "url,key"), "Url | Task ID | url", f"2026-11-22 | {key(120)} | {url}")],
+                {"id": "Monthly export", "Url": "2026-11-22"},
+                {"userDefined:id": "Monthly export", "date:Url:start": "2026-11-22", "date:Url:end": None,
+                 "date:Url:is_datetime": 0}),
+        }
+        for workspace, (renames, table, groups, stored) in workspaces.items():
+            shutil.rmtree(self.home / ".cache", ignore_errors=True)
+            self.fake.data_sources[DS_TASKS]["properties"], self.page["properties"] = dict(original[0]), dict(original[1])
+            self.page["properties"]["Pull Request"] = {"id": "pr", "type": "url", "url": link}
+            self.named_like_built_ins(**renames)
+            for flags, header, row in table:
+                with self.subTest(workspace, columns=flags):
+                    code, out, err = self.run_cli("query", coll, *flags)
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(out.splitlines()[:2], [header, row])
+            for name, value in groups.items():
+                with self.subTest(workspace, group_by=name):
+                    code, out, err = self.run_cli("query", coll, "--group-by", name)
+                    self.assertEqual((code, out), (0, f"{value} 1\n"), err)
+                    code, out, err = self.run_cli("query", coll, "--group-by", name, "--json")
+                    self.assertEqual(json.loads(out), {value: 1})
+            with self.subTest(workspace, output="--json"):
+                code, out, err = self.run_cli("query", coll, "--select", ",".join(groups), "--json")
+                self.assertEqual(json.loads(out)[0]["properties"], stored)
+
+    def test_the_name_a_built_in_clash_is_printed_under_is_taken_everywhere(self):
+        self.page["properties"]["Pull Request"] = {"id": "pr", "type": "url", "url": "https://example.com/pr/1"}
+        self.named_like_built_ins(Task_ID="ID", Notes="url", Pull_Request="userDefined:odd", Done_at="Id")
+        coll, query = COLLECTION + DS_TASKS, rf"/v1/data_sources/{DS_TASKS}/query"
+        code, out, err = self.run_cli("query", coll, "--json")
+        printed = [name for name in json.loads(out)[0]["properties"] if name.startswith("userDefined:")]
+        self.assertEqual(sorted(printed), ["userDefined:ID", "userDefined:odd", "userDefined:url"])
+        real = {"userDefined:ID": "ID", "userDefined:url": "url", "userDefined:odd": "userDefined:odd", "userdefined:URL": "url"}
+        for name, prop in real.items():
+            with self.subTest(name):
+                code, out, err = self.run_cli("query", coll, "--where", f"{name} is not empty" if prop != "ID" else f"{name} = 120")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.fake.sent("POST", query)[-1].json["filter"]["property"], prop)
+                code, out, err = self.run_cli("query", coll, "--order", f"{name} desc", "--select", name)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.fake.sent("POST", query)[-1].json["sorts"], [{"property": prop, "direction": "descending"}])
+                self.assertEqual(out.splitlines()[0], f"{prop} | url")
+                self.assertNotIn("(empty)", self.run_cli("query", coll, "--group-by", name)[1])
+                if prop != "ID":  # the unique id is computed
+                    code, out, err = self.run_cli("update", PAGE, "--set", f"{name}=https://example.com/2")
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(list(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]), [prop])
+        for where in (("--where", "userDefined:nothing = 1"), ("--order", "userDefined:nothing"), ("--select", "userDefined:created"), ("--group-by", "userDefined:")):
+            with self.subTest(where):  # the prefix names a property, never a built-in column
+                self.assertEqual(self.run_cli("query", coll, *where)[0], 2)
+
+    def test_the_write_check_reads_back_a_property_named_like_a_built_in_column(self):
+        for name in ("ID", "url"):
+            with self.subTest(checkbox=name):
+                self.fake.data_sources[DS_TASKS] = data_source(DS_TASKS, "Tasks", tasks_schema(), DB_TASKS)
+                shutil.rmtree(self.home / ".cache", ignore_errors=True)
+                schema = self.fake.data_sources[DS_TASKS]["properties"]
+                self.fake.data_sources[DS_TASKS]["properties"] = {
+                    (name if n == "Completed?" else n): dict(p, name=name if n == "Completed?" else n)
+                    for n, p in schema.items()}
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS, "--marker", "QA MARK")
+                self.assertIn(f"write check property ({name}): ok", out, err)
+
+    def test_group_by_a_built_in_name_counts_by_the_page_s_own_value(self):
+        # --group-by reads every name --select takes, the same way: a built-in prints the page's own value, and a
+        # property of that name wins. No row is ever counted empty because the name is not a property.
+        self.fake.pages.clear()
+        for i, (day, status) in enumerate([("01", "Done"), ("01", "Done"), ("02", "Rollout")]):
+            row = self.fake.add_page(task_page(uid(0x10000 + i), 1000 + i, f"Row {i}", status=status,
+                                               created_time=f"2026-11-{day}T10:00:00.000Z"))
+            row["last_edited_time"] = f"2026-11-1{day[1]}T08:00:00.000Z"
+        made = {"2026-11-01T10:00:00.000Z": 2, "2026-11-02T10:00:00.000Z": 1}
+        edited = {"2026-11-11T08:00:00.000Z": 2, "2026-11-12T08:00:00.000Z": 1}
+        each = {key(1000): 1, key(1001): 1, key(1002): 1}
+        titles = {"Row 0": 1, "Row 1": 1, "Row 2": 1}
+        table = [("created", made), ("Created", made), ("created_time", made), ("edited", edited), ("last_edited", edited),
+                 ("last_edited_time", edited), ("updated", edited), ("id", each), ("key", each), ("title", titles),
+                 ("name", titles)]
+        for name, counts in table:
+            with self.subTest(group_by=name):
+                code, out, err = self.run_cli("query", "Tasks", "--group-by", name)
+                self.assertEqual(code, 0, err)
+                self.assertNotIn("(empty)", out)
+                self.assertEqual(sorted(out.splitlines()), sorted(f"{value} {n}" for value, n in counts.items()))
+                code, out, err = self.run_cli("query", "Tasks", "--group-by", name, "--json")
+                self.assertEqual(json.loads(out), counts)
+        with self.subTest("a property of that name wins"):
+            self.fake.data_sources[DS_TASKS]["properties"]["Updated"] = {"id": "up", "name": "Updated", "type": "rich_text",
+                                                                          "rich_text": {}}
+            for row in self.fake.pages.values():
+                row["properties"]["Updated"] = {"id": "up", "type": "rich_text", "rich_text": text("by hand")}
+            shutil.rmtree(self.home / ".cache")
+            code, out, err = self.run_cli("query", "Tasks", "--group-by", "updated")
+            self.assertEqual((code, out), (0, "by hand 3\n"), err)
+        with self.subTest("a built-in column beside a property that has its column name"):
+            self.fake.data_sources[DS_TASKS]["properties"]["created_time"] = {
+                "id": "own", "name": "created_time", "type": "rich_text", "rich_text": {}}
+            for row in self.fake.pages.values():
+                row["properties"]["created_time"] = {"id": "own", "type": "rich_text", "rich_text": text("typed")}
+            shutil.rmtree(self.home / ".cache")
+            code, out, err = self.run_cli("query", "Tasks", "--select", "created_time,created")
+            self.assertEqual(code, 0, err)
+            self.assertIn("typed | 2026-11-01T10:00:00.000Z | ", out)
+
+    def test_select_prefers_a_property_of_the_same_name_as_where_does(self):
+        self.page["last_edited_time"] = "2026-11-21T08:15:00.000Z"
+        self.fake.data_sources[DS_TASKS]["properties"]["Updated"] = {"id": "up", "name": "Updated", "type": "rich_text", "rich_text": {}}
+        self.page["properties"]["Updated"] = {"id": "up", "type": "rich_text", "rich_text": text("by hand")}
+        for wanted in ("updated", "Updated"):
+            with self.subTest(select=wanted):
+                code, out, err = self.run_cli("query", "Tasks", "--select", wanted)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out.splitlines()[:2], ["Updated | url", f"by hand | {self.page['url']}"])
+                code, out, err = self.run_cli("query", "Tasks", "--where", f"{wanted} contains hand")
+                self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query")[-1].json["filter"],
+                                 {"property": "Updated", "rich_text": {"contains": "hand"}})
+        code, out, err = self.run_cli("query", "Tasks", "--select", "edited")  # no property of that name: the page's value
+        self.assertEqual(out.splitlines()[:2], ["last_edited_time | url", f"2026-11-21T08:15:00.000Z | {self.page['url']}"])
+
+
+class JsonOutputTest(ClientTestCase):
+    def test_json_stdout_is_one_document_for_every_verb_that_takes_json(self):
+        # Over every verb whose parser has --json: stdout parses as one JSON document, notes go to stderr.
+        for i in range(60):
+            self.fake.add_page(task_page(uid(0x10000 + i), 1000 + i, f"Row {i}", status="Rollout"))
+        self.fake.on("POST", rf"/v1/data_sources/{DS_PROJECTS}/query",
+                     lambda r: (200, {"object": "list", "results": [], "has_more": False, "next_cursor": None}))
+        rows = [
+            (("fetch", PAGE), dict, ""),
+            (("fetch", PAGE, "--discussions"), dict, ""),
+            (("fetch", PAGE, "--props-only"), dict, ""),
+            (("fetch", "Tasks"), dict, ""),
+            (("query", "Tasks"), list, "11 more rows matched"),
+            (("query", "Tasks", "--limit", "5"), list, "56 more rows matched"),
+            (("query", "Tasks", "--limit", "0"), list, "61 more rows matched"),
+            (("query", "Tasks", "--max-rows", "20"), list, "stopped paging at 20 rows"),
+            (("query", "Projects"), list, "no row matched"),
+            (("query", "Tasks", "--count"), int, ""),
+            (("query", "Tasks", "--count", "--max-rows", "20"), int, "stopped paging at 20 rows"),
+            (("query", "Projects", "--count"), int, ""),
+            (("query", "Tasks", "--group-by", "Status"), dict, ""),
+            (("query", "Tasks", "--group-by", "Status", "--max-rows", "20"), dict, "stopped paging at 20 rows"),
+            (("query", "Projects", "--group-by", "Project ID"), dict, ""),
+        ]
+        sub = next(a for a in self.n.build_parser()._actions if hasattr(a, "choices") and isinstance(a.choices, dict))
+        takes_json = {name for name, p in sub.choices.items() if "--json" in p._option_string_actions}
+        self.assertEqual({args[0] for args, *_ in rows}, takes_json)
+        for args, kind, note in rows:
+            with self.subTest(args=args):
+                code, out, err = self.run_cli(*args, "--json")
+                self.assertEqual(code, 0, err)
+                self.assertIsInstance(json.loads(out), kind)
+                self.assertIn(note, err)
+                if not note:
+                    self.assertEqual(err, "")
+                plain_code, plain_out, plain_err = self.run_cli(*args)
+                self.assertEqual((plain_code, plain_err), (0, ""))
+                self.assertIn(note, plain_out)
+        code, out, err = self.run_cli("query", "Tasks", "--group-by", "Status", "--json")
+        self.assertEqual(list(json.loads(out).items()), [("Rollout", 60), ("Done", 1)])
+        code, out, err = self.run_cli("fetch", uid(0xDEAD), "--json")
+        self.assertEqual((code, out), (1, ""))
+
 
 class SearchTest(ClientTestCase):
     def setUp(self):
@@ -1768,6 +2977,148 @@ class SearchTest(ClientTestCase):
         self.assertIn("Tasks", noted)
         wiki = [h for h in hits if self.wiki["url"] in h][0]
         self.assertIn("matched: title", wiki)
+
+    def test_search_says_when_a_title_only_resembles_the_words(self):
+        # The API's search ranks by likeness: it returns titles that hold none of the words as written.
+        self.fake.on("POST", r"/v1/search", lambda r: (200, {"object": "list", "results": [self.wiki, self.noted],
+                                                             "has_more": False, "next_cursor": None})
+                     if (r.json or {}).get("query") else None)
+        code, out, err = self.run_cli("search", "invoice glossary")
+        self.assertEqual(code, 0, err)
+        by_url = {url: line for line in self.hits(out) for url in (self.wiki["url"], self.noted["url"]) if url in line}
+        self.assertTrue(by_url[self.wiki["url"]].endswith("matched: title"))
+        self.assertTrue(by_url[self.noted["url"]].endswith("matched: similar title"))
+
+    def test_a_hit_that_holds_the_words_in_a_text_is_never_called_a_similar_title(self):
+        # Wherever the page comes from - the title search, the rows of a data source, both, a key - the label
+        # says what holds the words, and a mere likeness is printed after every real match.
+        likeness = self.fake.add_page(child_page(uid(0x7003), "Invoyce notes", WIKI))
+        stale = dict(self.noted, properties=dict(self.noted["properties"], Notes={"id": "nt", "type": "rich_text",
+                                                                                  "rich_text": []}))
+        outside = task_page(uid(0x123), 123, "Shared elsewhere", notes="The invoice of March")
+        outside["parent"] = {"type": "page_id", "page_id": WIKI}
+
+        def answers(titles, rows):
+            self.fake.overrides.clear()
+            self.fake.on("POST", r"/v1/search", lambda r: (200, {"object": "list", "results": titles, "has_more": False,
+                                                                 "next_cursor": None}) if (r.json or {}).get("query") else None)
+            self.fake.on("POST", r"/v1/data_sources/([^/]+)/query", lambda r: (200, {
+                "object": "list", "results": rows if r.path.split("/")[3] == DS_TASKS else [], "has_more": False,
+                "next_cursor": None}) if "unique_id" not in json.dumps(r.json) else None)
+
+        table = [
+            ("the title search and the rows return it", [likeness, self.noted], [self.noted], self.noted, "Notes"),
+            ("no row query returns it", [likeness, self.noted], [], self.noted, "Notes"),
+            ("the title search holds an older copy of it", [likeness, stale], [self.noted], self.noted, "Notes"),
+            ("it is in no connected data source", [likeness, outside], [], outside, "Notes"),
+        ]
+        for name, titles, rows, page, label in table:
+            with self.subTest(name):
+                answers(titles, rows)
+                code, out, err = self.run_cli("search", "invoice")
+                self.assertEqual(code, 0, err)
+                hits = self.hits(out)
+                self.assertTrue(hits[0].endswith(f"matched: {label}") and page["url"] in hits[0], out)
+                self.assertTrue(hits[-1].endswith("matched: similar title") and likeness["url"] in hits[-1], out)
+                self.assertEqual(len(hits), 2, out)
+                code, out, err = self.run_cli("search", "invoice", "--limit", "1")  # the real match takes the place
+                self.assertIn(page["url"], self.hits(out)[0])
+                self.assertIn("1 more hits", out)
+        with self.subTest("a likeness comes after the matches of a later data source"):
+            answers([likeness], [self.page, self.noted])
+            code, out, err = self.run_cli("search", "invoice")
+            self.assertEqual([line.rsplit("matched: ", 1)[1] for line in self.hits(out)],
+                             ["Task name", "Notes", "similar title"], out)
+        with self.subTest("a hit by key keeps its label"):
+            answers([self.noted], [self.noted])
+            code, out, err = self.run_cli("search", key(121))
+            self.assertTrue(self.hits(out)[0].endswith("matched: key"), out)
+
+    def test_search_says_at_least_when_a_source_was_cut_short(self):
+        def tasks_answer(rows, more=False):
+            def answer(r):
+                tasks = r.path.split("/")[3] == DS_TASKS
+                return 200, {"object": "list", "results": rows if tasks else [],
+                             "has_more": more and tasks, "next_cursor": "next" if more and tasks else None}
+            self.fake.on("POST", r"/v1/data_sources/([^/]+)/query", answer)
+
+        code, out, err = self.run_cli("search", "invoice", "--limit", "2")  # every source gave all it has: the count is exact
+        self.assertEqual(code, 0, err)
+        self.assertIn("… 1 more hits (--limit N shows them)", out.splitlines())
+        third = self.fake.add_page(task_page(uid(0x122), 122, "Invoice backlog"))
+        cuts = {"a source answered more rows than --limit": (lambda: tasks_answer([self.page, self.noted, third])),
+                "a source has more pages": (lambda: tasks_answer([self.page, self.noted], more=True))}
+        for name, cut in cuts.items():
+            with self.subTest(name):
+                cut()
+                code, out, err = self.run_cli("search", "invoice", "--limit", "2")
+                self.assertEqual(code, 0, err)
+                # four distinct pages were received: the page, the noted one, the glossary and the third
+                self.assertIn("… at least 2 more hits (--limit N shows them)", out.splitlines())
+
+    def test_a_search_that_cut_a_source_short_says_so_whatever_the_count_of_hits(self):
+        # Over every source (the title search, each data source, --in), with the merged hits above, at and below
+        # --limit: a search that did not print or read everything says so, and one that did says nothing.
+        within = ("search", "invoice", "--in", COLLECTION + DS_TASKS)
+        merged = ("search", "invoice")
+        silent = None
+        unsure = "… more may match: a source was cut short (a higher --limit reads further)"
+        invoices = [task_page(uid(0x30000 + i), 4000 + i, f"Invoice {i}") for i in range(130)]
+        trashed = [dict(row, in_trash=True) for row in invoices]
+
+        def of(rows, more=False):
+            return {"object": "list", "results": rows, "has_more": more, "next_cursor": "next" if more else None}
+
+        def sources(tasks=(), titles=(), tasks_more=False, titles_more=False):
+            def rows(r):
+                return 200, of(list(tasks), tasks_more) if r.path.split("/")[3] == DS_TASKS else of([])
+            self.fake.on("POST", r"/v1/data_sources/([^/]+)/query", rows)
+            self.fake.on("POST", r"/v1/search", lambda r: (200, of(list(titles), titles_more))
+                         if (r.json or {}).get("query") else None)
+
+        table = [
+            # what the sources hold, the command, hits printed, the line after them
+            ("--in, more rows than --limit", dict(tasks=invoices[:31]), within, 10,
+             "… at least 21 more hits (--limit N shows them)"),
+            ("one data source, more rows than --limit", dict(tasks=invoices[:31]), merged, 10,
+             "… at least 21 more hits (--limit N shows them)"),
+            ("title hits and row hits are the same pages", dict(tasks=invoices[:31], titles=invoices[:31]), merged, 10,
+             "… at least 21 more hits (--limit N shows them)"),
+            ("only the title search has more than --limit", dict(titles=invoices[:31]), merged, 10,
+             "… at least 21 more hits (--limit N shows them)"),
+            ("--in, a source with more pages and one page twice", dict(tasks=invoices[:2] * 2, tasks_more=True),
+             within + ("--limit", "3"), 2, unsure),
+            ("title and rows the same pages, both with more", dict(tasks=invoices[:2], titles=invoices[:2],
+             tasks_more=True, titles_more=True), merged + ("--limit", "3"), 2, unsure),
+            ("only the title search has more pages", dict(titles=invoices[:2], titles_more=True),
+             merged + ("--limit", "3"), 2, unsure),
+            ("a cut source of trashed pages leaves fewer than --limit", dict(tasks=invoices[:2] + trashed[2:12]), within, 2,
+             unsure),
+            ("a cut source of trashed pages leaves no hit", dict(tasks=trashed[:12]), within, 0, unsure),
+            ("as many rows as --limit, and no more", dict(tasks=invoices[:10]), within, 10, silent),
+            ("fewer rows than --limit", dict(tasks=invoices[:3], titles=invoices[:3]), merged, 3, silent),
+            ("nothing at all", dict(), merged, 0, silent),
+        ]
+        for name, held, command, printed, last in table:
+            with self.subTest(name):
+                self.fake.overrides.clear()
+                sources(**held)
+                code, out, err = self.run_cli(*command)
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(len(self.hits(out)), printed, out)
+                self.assertEqual([line for line in out.splitlines() if line.startswith("…")], [last] if last else [], out)
+                self.assertEqual("no hit for 'invoice'" in out, printed == 0, out)
+        self.fake.overrides.clear()
+        for page in invoices:  # the fake pages its rows as the API does: 130 of them, 100 to an answer
+            self.fake.add_page(page)
+        self.fake.on("POST", r"/v1/search", lambda r: (200, of([])) if (r.json or {}).get("query") else None)
+        # 132 rows match: the 130 above and the 2 of the setup
+        for limit, line in (("10", "… at least 90 more hits (--limit N shows them)"),
+                            ("120", "… at least 12 more hits (--limit N shows them)"), ("500", None)):
+            with self.subTest("a data source read page by page", limit=limit):
+                code, out, err = self.run_cli(*within, "--limit", limit)
+                self.assertEqual(code, 0, err)
+                self.assertEqual([found for found in out.splitlines() if found.startswith("…")], [line] if line else [])
 
     def test_search_key_first_and_page_url(self):
         code, out, err = self.run_cli("search", key(121))
@@ -1808,6 +3159,75 @@ class CommentsTest(ClientTestCase):
         self.assertEqual(sent["discussion_id"], created["discussion_id"])
         self.assertNotIn("parent", sent)
         self.assertEqual(sent["markdown"], "Merged **today**")
+
+    def test_a_link_in_a_comment_is_printed_as_text_properties_print_it(self):
+        discussion = uid(0xC0)
+        runs = [run("see "), run("the ", "https://example.com/a"), run("runbook", "https://example.com/a", bold=True),
+                run(" or "), run("write", "mailto:ana@example.com"), run(" now")]
+        printed = "see [the runbook](https://example.com/a) or [write](mailto:ana@example.com) now"
+        self.fake.comments[PAGE] = [{"object": "comment", "id": uid(0xC1), "discussion_id": discussion,
+                                     "created_by": {"object": "user", "id": ANA}, "rich_text": runs}]
+        self.assertEqual(self.n.linked(runs), printed)  # the one renderer text properties use
+        code, out, err = self.run_cli("comments", "list", PAGE)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"  Ana Lima [{uid(0xC1)}]: {printed}", out.splitlines())
+        code, out, err = self.run_cli("fetch", PAGE, "--discussions")
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"  Ana Lima: {printed}", out.splitlines())
+        code, out, err = self.run_cli("fetch", PAGE, "--discussions", "--json")
+        self.assertEqual(json.loads(out)["discussions"][discussion][0]["rich_text"], runs)  # the raw runs keep their address
+
+    def test_a_comment_added_with_a_link_reads_back_in_the_same_form(self):
+        said = "Docs are at [the runbook](https://example.com/runbook) now"
+        code, out, err = self.run_cli("comments", "add", PAGE, "--body", said)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.comments[PAGE][-1]["rich_text"][1]["text"]["link"], {"url": "https://example.com/runbook"})
+        for command in (("comments", "list", PAGE), ("fetch", PAGE, "--discussions")):
+            with self.subTest(command=command):
+                code, out, err = self.run_cli(*command)
+                self.assertEqual(code, 0, err)
+                self.assertTrue(any(line.endswith(": " + said) for line in out.splitlines()), out)
+
+    def test_an_empty_comment_is_refused_and_not_sent(self):
+        # The API accepts an empty comment and posts it, so the client does not send one.
+        blank = self.tmp / "blank.md"
+        blank.write_text(" \n")
+        for action, target in (("add", PAGE), ("reply", uid(0xCA)), ("edit", uid(0xC9))):
+            for body in (("--body", ""), ("--body", "  "), ("--body-file", blank)):
+                with self.subTest(action=action, body=body):
+                    code, out, err = self.run_cli("comments", action, target, *body)
+                    self.assertEqual(code, 2)
+                    self.assertIn("nothing was sent", err)
+        self.assertEqual(self.writes(), [])
+
+    def test_a_comment_that_would_show_nothing_is_refused_and_any_text_is_sent(self):
+        # Characters with no shape and tags that show nothing by themselves are an empty comment, in add, reply and
+        # edit, from --body and from --body-file; anything that shows is sent as written.
+        self.run_cli("comments", "add", PAGE, "--body", "First")
+        comment = self.fake.comments[PAGE][0]
+        targets = {"add": PAGE, "reply": comment["discussion_id"], "edit": comment["id"]}
+        blank = [chr(0x200B), chr(0xFEFF), chr(0x2060), chr(0x200D) + " \n" + chr(0xA0), "<p />", "<p></p>", "<br>", "<br/>",
+                 "<empty-block/>", '<span color="red"></span>', "<DIV>\n<br />\n</DIV>", " <p>" + chr(0x200B) + "</p> "]
+        shown = ["a", "a" + chr(0x200B) + "b", "<p>kept</p>", '<span underline="true">x</span>', "`<p />`", "<br> after",
+                 '<mention-user url="user://' + ANA + '"/>', "<paragraph/>", "<", "👍"]
+        path = self.tmp / "comment.md"
+        for action, target in targets.items():
+            for source in ("--body", "--body-file"):
+                for body in blank:
+                    with self.subTest(action=action, source=source, blank=ascii(body)):
+                        path.write_text(body, encoding="utf-8")
+                        self.fake.calls.clear()
+                        code, out, err = self.run_cli("comments", action, target, source,
+                                                      body if source == "--body" else path)
+                        self.assertEqual((code, out), (2, ""), err)
+                        self.assertIn("the comment is empty; nothing was sent", err)
+                        self.assertEqual(self.writes(), [])
+        for body in shown:
+            with self.subTest(sent=ascii(body)):
+                self.fake.calls.clear()
+                code, out, err = self.run_cli("comments", "add", PAGE, "--body", body)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(self.writes()[-1].json["markdown"], body)
 
     def test_comment_display_name_by_token_kind(self):
         self.settings(me="ana@example.com")
@@ -1855,6 +3275,811 @@ class FilesTest(ClientTestCase):
         self.assertIn(b"fake image", sent.raw)
         self.assertIn(b'name="file"; filename="screen.png"', sent.raw)
         self.assertIn(f"![screen.png](file-upload://{upload_id})", out)
+        for odd in ("a]b[c.png", "a`b.png", "a`b].txt", "x<y>.txt", "[[.png", "a (1) é.png"):  # the printed line is always a file
+            with self.subTest(name=odd):
+                (self.tmp / odd).write_bytes(b"x")
+                code, out, err = self.run_cli("upload", self.tmp / odd)
+                line = next(line for line in out.splitlines() if line.startswith(("!", "<")))
+                got, files = self.n.hold_files("a ` b\n\n```\ncode\n```\n\n" + line, "body.md")
+                self.assertEqual(len(files), 1, line)
+
+    def placed(self, page_id):
+        """(type, uploaded or external address) of each media block of a page, in its toggles too."""
+        found = []
+        for block in self.fake.children.get(page_id, []):
+            content = block[block["type"]]
+            if block["type"] in self.n.MEDIA:
+                found.append((block["type"], content[content["type"]]["url"].split("?")[0]))
+            found += self.placed(block["id"])
+        return found
+
+    def test_the_line_upload_prints_places_the_file_in_a_body(self):
+        # The markdown endpoints store file-upload:// as an empty block: the client gives the block its file.
+        image, note = self.tmp / "screen.png", self.tmp / "note.txt"
+        image.write_bytes(b"png")
+        note.write_bytes(b"text")
+        lines = {}
+        for path in (image, note):
+            code, out, err = self.run_cli("upload", path)
+            lines[path.name] = next(line for line in out.splitlines() if line.startswith(("!", "<")))
+        ids = {name: re.search(r"file-upload://([0-9a-f-]+)", line).group(1) for name, line in lines.items()}
+        hosted = {name: "https://files.example.com/" + i for name, i in ids.items()}
+        body = self.tmp / "body.md"
+        body.write_text("Shot:\n\n" + lines["screen.png"] + "\n\n<toggle>\nMore\n\n" + lines["note.txt"] + "\n</toggle>\n\n"
+                        "```\n" + lines["screen.png"] + "\n```\n\n![out](https://example.com/out.png)\n")
+        expected = [("image", hosted["screen.png"]), ("file", hosted["note.txt"]), ("image", "https://example.com/out.png")]
+        for verb in (("update", PAGE, "--replace-file", body), ("create", "--parent", "Tasks", "--set", "title=With files",
+                                                                  "--body-file", body)):
+            with self.subTest(verb=verb[0]):
+                self.fake.calls.clear()
+                code, out, err = self.run_cli(*verb)
+                self.assertEqual(code, 0, err)
+                self.assertIn("uploaded files placed: 2", out)
+                page = PAGE if verb[0] == "update" else list(self.fake.pages)[-1]
+                placed = self.placed(page)
+                self.assertEqual(sorted(p for p in placed if p != ("image", "")), sorted(expected))
+                sent = [c.json for c in self.fake.sent("PATCH", r"/v1/blocks/[^/]+")]
+                self.assertEqual(sent, [{"image": {"file_upload": {"id": ids["screen.png"]}}},
+                                        {"file": {"file_upload": {"id": ids["note.txt"]}}}])
+        (self.tmp / "plain.md").write_text("One line")
+        self.run_cli("update", PAGE, "--replace-file", self.tmp / "plain.md")
+        code, out, err = self.run_cli("update", PAGE, "--edit", "One line", lines["screen.png"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.placed(PAGE), [("image", hosted["screen.png"])])
+        self.fake.calls.clear()
+        code, out, err = self.run_cli("update", PAGE, "--replace-file", self.tmp / "plain.md")
+        self.assertEqual(self.fake.sent("GET", r"/v1/blocks/.*"), [])  # no upload, no extra read
+
+    def test_an_upload_that_cannot_be_placed_exits_4_saying_what_landed(self):
+        # Three files; the request that places the 1st, the 2nd or the 3rd ends in each way a write can end. Whatever
+        # lands is named as written, the failing one is in its own case, the later ones were not sent, and the
+        # commands of the message finish the job.
+        names = {uid(0xA001): "one.png", uid(0xA002): "two.txt", uid(0xA003): "three.png"}
+        text_ = ("\n\n".join(f"![{name}](file-upload://{i})" if name.endswith("png") else f'<file source="file-upload://{i}">{name}</file>'
+                             for i, name in names.items()))
+        body, pages = self.tmp / "body.md", self.tmp / "pages.json"
+        body.write_text(text_)
+        pages.write_text(json.dumps([{"properties": {"Task name": "First"}, "content": text_}, {"properties": {"Task name": "Second"}}]))
+        verbs = {  # name -> arguments, what was written before the files
+            "replace": (("update", PAGE, "--set", "Status=Rollout", "--replace-file", body), "written: properties Status; body replaced"),
+            "append": (("update", PAGE, "--append-file", body), "written: body added at the end"),
+            "prepend": (("update", PAGE, "--prepend-file", body), "written: body added at the start"),
+            "edit": (("update", PAGE, "--edit", "by hand", "by hand.\n\n" + text_ + "\n\n"), "written: body edits 1"),
+            "create": (("create", "--parent", "Tasks", "--set", "title=With files", "--body-file", body), "written: created "),
+            "pages": (("create", "--parent", "Tasks", "--pages-file", pages), "written: created "),
+        }
+        for verb, (args, before) in verbs.items():
+            for failing in (1, 2, 3):
+                for outcome, case in dict(WRITE_OUTCOMES, **{"401": "refused"}).items():
+                    with self.subTest(verb=verb, failing=failing, outcome=outcome):
+                        self.fake.overrides.clear()
+                        self.fake.calls.clear()
+                        self.fake.markdown[PAGE] = "## Context\n\nThe finance team exports invoices by hand.\n"
+                        state, fails = {"sent": 0}, ends_in(outcome)
+
+                        def place(r, state=state, fails=fails, failing=failing):
+                            state["sent"] += 1
+                            return fails(r) if state["sent"] >= failing else None
+
+                        self.fake.on("PATCH", r"/v1/blocks/[^/]+", place)
+                        code, out, err = self.run_cli(*args)
+                        self.assertEqual(code, 4, err)
+                        self.assertIn(before, err)
+                        self.assertNotRegex(err, r"nothing changed|never left this machine|nothing was made")
+                        page = PAGE if verb not in ("create", "pages") else list(self.fake.pages)[-1]
+                        blocks = {b["id"]: b for b in self.fake.children[page]}
+                        label = {"refused": "Not written", "not sent": "Not sent", "in doubt": "In doubt"}[case]
+                        for place_, (upload, name) in enumerate(names.items(), 1):
+                            said = f"file '{name}' ({upload})"
+                            if place_ < failing:
+                                self.assertRegex(err, rf"written: .*{re.escape(said)} placed in block .*\. {label}: ")
+                            elif place_ == failing:
+                                self.assertRegex(err, rf"{label}: {re.escape(said)} in block ")
+                                self.assertNotIn(f"{said} placed", err)
+                            else:
+                                self.assertRegex(err, rf"not sent: .*{re.escape(said)} in block ")
+                                self.assertNotIn(f"{said} placed", err)
+                        self.assertTrue(blocks)
+                        if verb == "pages":
+                            self.assertIn("the create of 'Second'", err)
+                            self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+                        commands = self.commands(err)
+                        self.assertEqual([c[-1] for c in commands], [f"file-upload://{u}" for u in list(names)[failing - 1:]])
+                        self.fake.overrides.clear()
+                        for command in commands:
+                            code, out, err = self.run_cli(*command)
+                            self.assertEqual(code, 0, err)
+                            self.assertIn("uploaded files placed: 1", out)
+                        self.assert_all_placed(page, names)
+                        for command in commands:  # safe to run again: there is nothing left to place
+                            code, out, err = self.run_cli(*command)
+                            self.assertEqual(code, 1, err)
+                            self.assertIn("no edit matched the body, so nothing was changed", err)
+
+    def test_files_that_cannot_be_read_back_are_named_with_the_command_that_places_them(self):
+        upload, body = uid(0xF11E), self.tmp / "body.md"
+        body.write_text(f"![a](file-upload://{upload})")
+        for status in (403, 404, "timeout", "tls eof"):
+            for when in ("to place", "to confirm"):
+                with self.subTest(status=status, when=when):
+                    self.fake.overrides.clear()
+                    self.fake.calls.clear()
+                    reads, fails = [], (ends_in(status) if isinstance(status, str) else lambda r, s=status: error(s, "restricted_resource", "No."))
+
+                    def read(r, reads=reads, fails=fails, when=when):
+                        reads.append(r)
+                        return fails(r)
+
+                    self.fake.on("GET", rf"/v1/blocks/{PAGE}/children" if when == "to place" else rf"/v1/pages/{PAGE}/markdown", lambda r:
+                                 None if when == "to confirm" and not self.fake.sent("PATCH", r"/v1/blocks/[^/]+") else read(r))
+                    code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--replace-file", body)
+                    self.assertEqual(code, 4, err)
+                    self.assertNotRegex(err, r"nothing changed|never left this machine")
+                    placed = self.fake.sent("PATCH", r"/v1/blocks/[^/]+")
+                    if when == "to place":
+                        self.assertEqual(placed, [])
+                        self.assertIn(f"Not sent: file 'a' ({upload}) (the page could not be read to place them", err)
+                        self.assertIn("The page still holds the placeholder", err)
+                        self.assertEqual(self.commands(err), [["update", self.page["url"], "--edit",
+                                                               f"https://file-upload.invalid/{upload}", f"file-upload://{upload}"]])
+                    else:
+                        self.assertEqual(len(placed), 1)
+                        self.assertIn(f"file 'a' ({upload}) placed in block", err)
+                        self.assertIn("Not confirmed: the page could not be read again", err)
+                    self.assertNotIn("uploaded files placed", out)
+
+    def test_a_placeholder_left_after_placing_exits_4_naming_the_file_and_the_command(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        body = self.tmp / "body.md"
+        # a block that took its file and still holds the placeholder
+        body.write_text(f"![a](file-upload://{one})\n\n![b](file-upload://{two})\n")
+        self.fake.on("PATCH", r"/v1/blocks/[^/]+", lambda r: (200, self.fake.blocks[r.path.split("/")[3]])
+                     if two in json.dumps(r.json) else None)
+        code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+        self.assertEqual(code, 4, err)
+        self.assertIn(f"file 'a' ({one}) placed in block", err)
+        self.assertRegex(err, rf"In doubt: file 'b' \({two}\) in block .*still holds the placeholder")
+        self.assertEqual([c[-1] for c in self.commands(err)], [f"file-upload://{two}"])
+        self.fake.overrides.clear()
+        # a reference that lands where no block is made of it: the new text of an edit, inside a fence of the page
+        self.fake.markdown[PAGE] = "Intro\n\n```\nHERE\n```\n"
+        for first in (True, False):  # with a file that can be placed, and alone
+            with self.subTest(with_another=first):
+                self.fake.calls.clear()
+                args = ("--prepend-file", body) if first else ()
+                body.write_text(f"![a](file-upload://{one})\n")
+                code, out, err = self.run_cli("update", PAGE, *args, "--edit", "HERE" if first else "Intro", f"![b](file-upload://{two})"
+                                              if first else f"text\n\n```\n![b](file-upload://{two})\n```")
+                if not first:
+                    self.assertEqual(code, 0, err)  # in code: text, and no file of this command
+                    continue
+                self.assertEqual(code, 4, err)
+                self.assertIn("written: body edits 1", err)
+                self.assertRegex(err, rf"Not sent: file 'b' \({two}\) \(.*stands in a code block")
+                self.assertIn(f"![b](file-upload://{two})", err)
+                self.assertIn("--append-file", err)
+                self.assertIn("not sent: body added at the start", err)
+                self.assertNotRegex(err, r"nothing changed|never left this machine")
+        # a file no block was made of at all
+        self.fake.store_blocks = lambda identifier, markdown: self.fake.children.__setitem__(identifier, [])
+        body.write_text(f"![a](file-upload://{one})\n")
+        code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+        self.assertEqual(code, 4, err)
+        self.assertIn(f"Not sent: file 'a' ({one}) (no block of the page holds file 'a' ({one}))", err)
+
+    def test_a_rerun_never_leaves_a_placeholder_nor_takes_one_for_another_file(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        start, note, other = "## Context\n", self.tmp / "note.md", self.tmp / "other.md"
+        note.write_text(f"![a](file-upload://{one})\n")
+        other.write_text(f"![b](file-upload://{two})\n")
+
+        def lost_placement():
+            self.fake.overrides.clear()
+            self.fake.on("PATCH", r"/v1/blocks/[^/]+", ends_in("503"))
+
+        # append, its placement lost, then the same append again
+        self.fake.markdown[PAGE] = start
+        lost_placement()
+        code, out, err = self.run_cli("update", PAGE, "--append-file", note)
+        self.assertEqual(code, 4, err)
+        self.fake.overrides.clear()
+        code, out, err = self.run_cli("update", PAGE, "--append-file", note)
+        self.assertEqual(code, 0, err)
+        self.assert_all_placed(PAGE, {one: 2})
+        self.assertEqual(err, "")
+
+        # the placeholder of another upload is never given this command's file, and it is named
+        self.fake.markdown[PAGE] = start
+        lost_placement()
+        self.run_cli("update", PAGE, "--append-file", note)
+        self.fake.overrides.clear()
+        code, out, err = self.run_cli("update", PAGE, "--append-file", other)
+        self.assertEqual(code, 0, err)
+        left = [b for b in self.fake.children[PAGE] if b["type"] == "image" and b["image"]["type"] == "external"]
+        self.assertEqual([b["image"]["external"]["url"] for b in left], [f"https://file-upload.invalid/{one}"])
+        self.assertEqual(self.placed(PAGE)[1], ("image", "https://files.example.com/" + two))
+        self.assertRegex(err, rf"^warning: {re.escape(self.page['url'])} holds the placeholder of another upload, .*\({one}\)")
+        self.assertIn(f"--edit 'https://file-upload.invalid/{one}' 'file-upload://{one}'", err)
+        self.assertEqual(len(err.splitlines()), 1, err)
+        three = uid(0xF13E)  # the upload expired: a new one takes its place
+        code, out, err = self.run_cli("update", PAGE, "--edit", f"https://file-upload.invalid/{one}", f"file-upload://{three}")
+        self.assertEqual(code, 0, err)
+        self.assert_all_placed(PAGE, {two: 1, three: 1})
+
+        # prepend lands with its file, the append of the same file is refused; only what was not written is run again
+        self.fake.markdown[PAGE] = start
+        self.fake.calls.clear()
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", lambda r: error(400, "validation_error", "No.")
+                     if r.json["insert_content"]["position"]["type"] == "end" else None)
+        code, out, err = self.run_cli("update", PAGE, "--prepend-file", note, "--append-file", note)
+        self.assertEqual(code, 4, err)
+        self.assertRegex(err, rf"written: body added at the start; file 'a' \({one}\) placed in block \S+\. Not written: body added at the end")
+        self.assertIn(f"not sent: file 'a' ({one})", err)
+        self.assertIn("Rerun only what was not written or not sent", err)
+        self.assertNotIn("nothing changed", err)
+        self.assert_all_placed(PAGE, {one: 1})
+        self.fake.overrides.clear()
+        code, out, err = self.run_cli("update", PAGE, "--append-file", note)
+        self.assertEqual(code, 0, err)
+        self.assert_all_placed(PAGE, {one: 2})
+
+        # the body write itself in doubt: the file was not sent, and the message says how to place it if it landed
+        self.fake.markdown[PAGE] = start
+
+        def landed_then_lost(r):
+            self.fake.patch_markdown(PAGE, r.json)
+            return ends_in("tls eof")(r)
+
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", landed_then_lost)
+        code, out, err = self.run_cli("update", PAGE, "--append-file", note)
+        self.assertEqual(code, 1, err)
+        self.assertIn("In doubt: body added at the end", err)
+        self.assertIn(f"not sent: file 'a' ({one})", err)
+        self.fake.overrides.clear()
+        for command in self.commands(err):
+            code, out, err = self.run_cli(*command)
+            self.assertEqual(code, 0, err)
+        self.assert_all_placed(PAGE, {one: 1})
+
+        # a create in doubt that landed is found by its title and its file is placed in it; not found, it is named
+        def made_then_lost(r):
+            self.fake.create_page(r.json)
+            return ends_in("tls eof")(r)
+
+        self.fake.on("POST", r"/v1/pages", made_then_lost)
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Found later", "--body-file", note)
+        self.assertEqual(code, 0, err)
+        self.assert_all_placed(list(self.fake.pages)[-1], {one: 1})
+        self.fake.overrides.clear()
+        self.fake.on("POST", r"/v1/pages", ends_in("tls eof"))
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Never found", "--body-file", note)
+        self.assertEqual(code, 1, err)
+        self.assertIn("In doubt: 'Never found'", err)
+        self.assertIn(f"`notion update <its url> --edit 'https://file-upload.invalid/{one}' 'file-upload://{one}'`", err)
+
+    def reported(self, err):
+        """What a report says of each `file …` label, by case: written, refused, in doubt, not sent."""
+        said = err.split(". Add it on a line")[0].split(". The page still holds")[0].split(". The page may still hold")[0]
+        cases = re.split(r"(written: |Not written: |Not sent: |In doubt: |; not sent: |Not confirmed: )", said)
+        out = {}
+        for mark, text_ in zip(cases[1::2], cases[2::2]):
+            text_ = re.sub(r"\((?:file '|no block|the page|Notion answered)[^()]*(?:\([^()]*\)[^()]*)*\)", "", text_)  # the reason
+            out.setdefault(mark.strip("; "), []).extend(re.findall(r"file (?:'[^']*' )?\(?([0-9a-f-]{36})\)?((?: placed)? in block [0-9a-f-]+)?", text_))
+        return out
+
+    def test_a_placed_file_is_written_whatever_code_or_text_says_its_address(self):
+        one, held = uid(0xF11E), f"https://file-upload.invalid/{uid(0xF11E)}"
+        image = f"![a](file-upload://{one})"
+        bodies = {"a fence": f"{image}\n\n```\n{held}\n```\n", "a fence with the line": f"```\n![a]({held})\n```\n\n{image}",
+                  "inline code": f"see `{held}`\n\n{image}", "code tags": f"see <code>{held}</code>\n\n{image}", "both": f"`{held}`\n\n{image}\n\n~~~\n{image}\n~~~"}
+        body = self.tmp / "body.md"
+        for name, markdown in bodies.items():
+            for verb in (("update", PAGE, "--replace-file", body), ("update", PAGE, "--append-file", body), ("update", PAGE, "--prepend-file", body),
+                         ("create", "--parent", "Tasks", "--set", "title=x", "--body-file", body)):
+                with self.subTest(body=name, verb=verb[2]):
+                    self.fake.markdown[PAGE] = f"Start\n\nthe client said `{held}`\n"
+                    body.write_text(markdown)
+                    code, out, err = self.run_cli(*verb)
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertIn("uploaded files placed: 1", out)
+                    page = PAGE if verb[0] == "update" else list(self.fake.pages)[-1]
+                    self.assert_all_placed(page, {one: 1})
+        # the address as text of the page: the file is placed, exit 0, and the text is named, never silent
+        kept = f'A sentence with \\<file source="{held}">a\\</file> inside.'
+        body.write_text(image)
+        for verb in ("--append-file", "--prepend-file"):
+            with self.subTest(text=verb):
+                self.fake.markdown[PAGE] = kept
+                code, out, err = self.run_cli("update", PAGE, verb, body)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(err.strip(), f"warning: {self.page['url']} holds {held} in text, where Notion cannot show a file: take it out")
+        # an edit puts the file where no block is made of it, beside one that is: each is in one case, once
+        two = uid(0xF12E)
+        self.fake.markdown[PAGE] = "Intro\n\n```\nHERE\n```\n\nthere\n"
+        code, out, err = self.run_cli("update", PAGE, "--edit", "HERE", f"![b](file-upload://{two})", "--edit", "there", image)
+        self.assertEqual(code, 4, err)
+        cases = self.reported(err)
+        self.assertEqual([u for u, _ in cases["written:"]], [one])
+        self.assertEqual([u for u, _ in cases["Not sent:"]], [two])
+        self.assertEqual(set(cases), {"written:", "Not sent:"}, err)
+        # the same upload twice and one place of it only: the place that is not is counted, not the whole file
+        self.fake.markdown[PAGE] = "Intro\n\n```\nHERE\n```\n\nthere\n"
+        code, out, err = self.run_cli("update", PAGE, "--edit", "HERE", image, "--edit", "there", image)
+        self.assertEqual(code, 4, err)
+        self.assertRegex(err, rf"written: body edits 1, 2; file 'a' \({one}\) placed in block \S+\. Not sent: file 'a' \({one}\) \(1 of its 2 places\)")
+        # a block that says it took the file and still holds the placeholder is in doubt and not written
+        self.fake.markdown[PAGE] = "Start"
+        self.fake.on("PATCH", r"/v1/blocks/[^/]+", lambda r: (200, self.fake.blocks[r.path.split("/")[3]]))
+        code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+        self.assertEqual(code, 4, err)
+        self.assertEqual(set(self.reported(err)), {"written:", "In doubt:"}, err)
+        self.assertNotIn("placed in block", err)
+        command = self.commands(err)[0]
+        code, out, err = self.run_cli(*command)  # a command that only places and wrote nothing for sure: no empty "written:"
+        self.assertEqual(code, 1, err)
+        self.assertRegex(err, rf"^In doubt: file {one} in block ")
+        self.assertNotIn("written:", err)
+        self.fake.overrides.clear()
+        self.assertEqual(self.run_cli(*command)[0], 0)
+        self.assert_all_placed(PAGE, {one: 1})
+
+    def test_a_block_that_cannot_be_read_never_stops_a_file_that_is_elsewhere(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        image, body = f"![a](file-upload://{one})", self.tmp / "body.md"
+        toggles = "\n\n".join(f"<toggle>\nT{i}\n\ninside {i}\n</toggle>" for i in range(3))
+        for status in (400, 403, 404):
+            for deep in (False, True):
+                with self.subTest(status=status, deep=deep):
+                    self.fake.overrides.clear()
+                    self.fake.calls.clear()
+                    body.write_text(f"{toggles}\n\n" + (f"<toggle>\nTitle\n\n{image}\n</toggle>" if deep else image))
+                    self.fake.markdown[PAGE] = "Start"
+
+                    def unreadable(r):
+                        first = next(b["id"] for b in self.fake.children[PAGE] if b["type"] == "toggle")
+                        return error(status, "restricted_resource", "No.") if r.path.split("/")[3] == first else None
+
+                    self.fake.on("GET", r"/v1/blocks/[^/]+/children", unreadable)
+                    code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+                    self.assertEqual(code, 0, err)
+                    self.assert_all_placed(PAGE, {one: 1})
+                    if deep:  # it was in the way: named, and the search went on
+                        blocked = next(b["id"] for b in self.fake.children[PAGE] if b["type"] == "toggle")
+                        self.assertRegex(err, rf"^warning: the blocks inside block {blocked} could not be read")
+                    else:  # nothing under the page's own list had to be read
+                        self.assertEqual(err, "")
+                        self.assertEqual(len(self.fake.sent("GET", r"/v1/blocks/[^/]+/children")), 1)
+        # the file itself is in the block that cannot be read: reported once, the other file placed, and the advice finishes the job
+        with self.subTest("the file is in there"):
+            self.fake.overrides.clear()
+            body.write_text(f"<toggle>\nT\n\n{image}\n</toggle>\n\n![b](file-upload://{two})")
+            self.fake.on("GET", r"/v1/blocks/[^/]+/children", lambda r: error(404, "object_not_found", "No.")
+                         if r.path.split("/")[3] == self.fake.children[PAGE][0]["id"] and len(self.fake.children[PAGE]) < 4 else None)
+            code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+            self.assertEqual(code, 4, err)
+            blocked = self.fake.children[PAGE][0]["id"]
+            self.assertRegex(err, rf"written: body replaced; file 'b' \({two}\) placed in block \S+\. Not sent: file 'a' \({one}\) \(file 'a' "
+                                  rf"\({one}\) stands in a block that could not be read \({blocked}\)\)")
+            self.assertEqual(self.advised(err), [image])
+            body.write_text(self.advised(err)[0])
+            self.fake.on("GET", rf"/v1/blocks/{blocked}/children", lambda r: error(404, "object_not_found", "No."))
+            code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+            self.assertEqual(code, 0, err)
+            self.assertIn(f"holds the placeholder of another upload, or of another place of one ({one})", err)
+            self.assertIn(("image", "https://files.example.com/" + one), self.placed(PAGE))
+        # any other failure below the page's own list ends the search, with what was found placed and the command to go on
+        with self.subTest("lost on the way"):
+            self.fake.overrides.clear()
+            body.write_text(f"<toggle>\nT\n\n{image}\n</toggle>\n\n<toggle>\nU\n\nx\n</toggle>\n\n![b](file-upload://{two})")
+            self.fake.on("GET", r"/v1/blocks/[^/]+/children", lambda r: ends_in("500")(r) if r.path.split("/")[3] != PAGE else None)
+            code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+            self.assertEqual(code, 4, err)
+            self.assertEqual({k: [u for u, _ in v] for k, v in self.reported(err).items()}, {"written:": [two], "Not sent:": [one]}, err)
+            self.assertIn("the page could not be read to the end", err)
+            self.fake.overrides.clear()
+            for command in self.commands(err):
+                self.assertEqual(self.run_cli(*command)[0], 0)
+            self.assert_all_placed(PAGE, {one: 1, two: 1})
+
+    def advised(self, err):
+        """The lines a message says to add to the page."""
+        return re.findall(r"put `([^`]+)` in a file F and run `notion update \S+ --append-file F`", err)
+
+    def test_placing_a_file_reads_no_more_of_the_page_than_it_takes(self):
+        one = uid(0xF11E)
+        image, body = f"![a](file-upload://{one})", self.tmp / "body.md"
+        toggles = "\n\n".join(f"<toggle>\nT{i}\n\ninside {i}\n</toggle>" for i in range(60))
+        nested = f"<toggle>\nOuter\n\n<toggle>\nInner\n\n{image}\n</toggle>\n</toggle>"
+        for name, verb, written, reads in (("append", "--append-file", image, 1), ("prepend", "--prepend-file", image, 1),
+                                           ("append in a toggle", "--append-file", f"<toggle>\nNew\n\n{image}\n</toggle>", 2),
+                                           ("append in a toggle in a toggle", "--append-file", nested, 3),
+                                           ("prepend in a toggle in a toggle", "--prepend-file", nested, 3), ("edit", "--edit", image, 1)):
+            with self.subTest(name):
+                self.fake.markdown[PAGE] = toggles + "\n\nlast\n"
+                self.fake.calls.clear()
+                body.write_text(written)
+                code, out, err = self.run_cli("update", PAGE, verb, *(("last", written) if verb == "--edit" else (body,)))
+                self.assertEqual((code, err), (0, ""))
+                self.assert_all_placed(PAGE, {one: 1})
+                self.assertEqual(len(self.fake.sent("GET", r"/v1/blocks/.*")), reads)
+                self.assertEqual(len(self.fake.sent("GET", r"/v1/pages/[^/]+/markdown")), 2 if verb == "--edit" else 1)
+        # a long page is read from its start, and no further than the file when it was put there
+        self.fake.markdown[PAGE] = "\n\n".join(f"line {i}" for i in range(250))
+        for verb, pages in (("--prepend-file", 1), ("--append-file", 3)):
+            with self.subTest(verb, pages=pages):
+                self.fake.calls.clear()
+                self.fake.overrides.clear()
+
+                def paged(r):
+                    start = int(r.query.get("start_cursor", ["0"])[0])
+                    blocks = self.fake.children[PAGE]
+                    more = start + 100 < len(blocks)
+                    return 200, {"object": "list", "results": blocks[start:start + 100], "has_more": more, "next_cursor": str(start + 100) if more else None}
+
+                self.fake.on("GET", rf"/v1/blocks/{PAGE}/children", paged)
+                body.write_text(image)
+                code, out, err = self.run_cli("update", PAGE, verb, body)
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(len(self.fake.sent("GET", r"/v1/blocks/.*")), pages)
+                self.fake.markdown[PAGE] = "\n\n".join(f"line {i}" for i in range(250))
+
+    def test_the_command_that_finishes_the_job_works_in_every_state(self):
+        one, two, new = uid(0xF11E), uid(0xF12E), uid(0xF99E)
+        image, body = f"![a](file-upload://{one})", self.tmp / "body.md"
+
+        def left(*args):
+            self.fake.overrides.clear()
+            self.fake.on("PATCH", r"/v1/blocks/[^/]+", ends_in("503"))
+            code, out, err = self.run_cli(*args)
+            self.assertEqual(code, 4, err)
+            self.fake.overrides.clear()
+            return self.commands(err)[0]
+
+        states = {  # how the page was left -> how many blocks wait for the upload
+            "once": ([image], 1), "twice in one body": ([f"{image}\n\n{image}"], 2), "two failed appends": ([image, image], 2),
+            "in a toggle and out of it": ([f"<toggle>\nT\n\n{image}\n</toggle>\n\n{image}"], 2),
+            "with other captions": ([f"{image}\n\n![b](file-upload://{one})\n\n<file source=\"file-upload://{one}\">c</file>"], 3),
+            "beside code that says it": ([f"```\nhttps://file-upload.invalid/{one}\n![a](https://file-upload.invalid/{one})\n```\n\n{image}"], 1),
+        }
+        for name, (bodies, count) in states.items():
+            for expired in (False, True):
+                with self.subTest(state=name, expired=expired):
+                    self.fake.markdown[PAGE] = "Start"
+                    for markdown in bodies:
+                        body.write_text(markdown)
+                        command = left("update", PAGE, "--append-file", body)
+                    if expired:  # as the message says: the new upload's id in the second part
+                        command[-1] = f"file-upload://{new}"
+                    self.fake.calls.clear()
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertIn(f"uploaded files placed: {count}", out)
+                    self.assert_all_placed(PAGE, {new if expired else one: count})
+                    self.assertEqual(self.fake.sent("PATCH", r"/v1/pages/.*"), [], "placing writes no text")
+                    before = self.fake.markdown[PAGE]
+                    code, out, err = self.run_cli(*command)  # safe to run twice
+                    self.assertEqual(code, 1, err)
+                    self.assertIn("no edit matched the body, so nothing was changed", err)
+                    self.assertEqual(self.fake.markdown[PAGE], before)
+        # a file its block cannot take, as Notion refuses a PDF in an image block: the block is written again as a <file>
+        for verb in ("--append-file", "--replace-file"):
+            for markdown, count in ((image, 1), (f"{image}\n\n{image}\n\n![it's a \\] b](file-upload://{one})", 3),
+                                    (f'<pdf source="file-upload://{one}">a</pdf>', 1), (f'<pdf source="file-upload://{one}" />', 1)):
+                with self.subTest(wrong_kind=markdown, verb=verb):
+                    self.fake.kinds = {one: "productivity"}
+                    self.fake.markdown[PAGE] = "Start"
+                    body.write_text(markdown)
+                    code, out, err = self.run_cli("update", PAGE, verb, body)
+                    self.assertEqual(code, 4, err)
+                    self.assertIn("files are expected", err)
+                    command = shlex.split(re.search(r"`notion (update .*? --edit '[^']+' '.*?)` \(it says", err).group(1))
+                    self.assertTrue(command[-1].startswith(f'<file source="file-upload://{one}">'), command)
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertEqual(self.placed(PAGE), [("file", "https://files.example.com/" + one)] * count)
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual(code, 1, err)
+                    self.assertIn("nothing was changed", err)
+        # code that quotes the same line is never rewritten, and a placeholder that is only text is said to be
+        self.fake.kinds = {one: "pdf"}
+        held = f"https://file-upload.invalid/{one}"
+        self.fake.markdown[PAGE] = before = f"![a]({held})\n\n```\n![a]({held})\n```\n"
+        for new_text, said in ((f'<file source="file-upload://{one}">a</file>', "matches inside code too"),):
+            code, out, err = self.run_cli("update", PAGE, "--edit", held, new_text)
+            self.assertEqual((code, self.fake.markdown[PAGE]), (1, before), err)
+            self.assertIn(said, err)
+        self.fake.markdown[PAGE] = f"Only {held} in text\n"
+        code, out, err = self.run_cli("update", PAGE, "--edit", held, f"file-upload://{one}")
+        self.assertEqual(code, 1, err)
+        self.assertIn("it stands only in text, which cannot hold a file", err)
+        code, out, err = self.run_cli("update", PAGE, "--edit", held, "the file above")  # an ordinary edit still takes it out
+        self.assertEqual((code, self.fake.markdown[PAGE]), (0, "Only the file above in text\n"), err)
+        # one left deep in the page by an earlier command, and the same file appended: both are placed, none is in doubt
+        self.fake.kinds = {}
+        self.fake.markdown[PAGE] = "Start"
+        body.write_text(f"<toggle>\nT\n\n{image}\n</toggle>")
+        left("update", PAGE, "--append-file", body)
+        body.write_text(image)
+        code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+        self.assertEqual((code, err), (0, ""))
+        self.assert_all_placed(PAGE, {one: 2})
+        # a page too long to be read whole: the command looks for the block all the same
+        self.fake.kinds = {}
+        body.write_text(image)
+        self.fake.markdown[PAGE] = "Start"
+        command = left("update", PAGE, "--append-file", body)
+        self.fake.on("GET", rf"/v1/pages/{PAGE}/markdown", lambda r: (200, {"object": "page_markdown", "id": PAGE, "markdown": "Start", "truncated": True}))
+        code, out, err = self.run_cli(*command)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.placed(PAGE), [("image", "https://files.example.com/" + one)])
+        code, out, err = self.run_cli(*command)  # nothing waits: nothing is written, and that is what it says
+        self.assertEqual(code, 1, err)
+        self.assertRegex(err, rf"^Not sent: file {one} \(no block of the page holds file {one}\): .*nothing changed")
+        self.assertNotIn("written:", err)
+
+    def test_every_placeholder_left_by_another_command_is_named(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        held, body = f"https://file-upload.invalid/{one}", self.tmp / "body.md"
+        body.write_text(f"![b](file-upload://{two})")
+        media = rf"warning: \S+ holds the placeholder of another upload, .*\({one}\).*--edit '{held}' 'file-upload://{one}'"
+        in_text = rf"warning: \S+ holds {held} in text, where Notion cannot show a file: take it out"
+        pages = {  # the page as it was left -> what is said of it
+            "an image": (f"![a]({held})", [media]), "in a toggle": (f"<toggle>\nT\n\n![a]({held})\n</toggle>", [media]),
+            "a tag over lines": (f'<file source="{held}">\na\n</file>', [media]), "twice": (f"![a]({held})\n\n![c]({held})", [media]),
+            "a tag kept as text": (f'Text \\<file source="[{held}">a\\</file>]({held}%22) here', [in_text]), "a linked address": (f"see [{held}]({held})", [in_text]),
+            "a table cell": (f"| a |\n| --- |\n| {held} |", [in_text]), "a bookmark": (f'<bookmark source="{held}" />', [in_text]),
+            "both": (f"![a]({held})\n\nand {held}", [media, in_text]), "code only": (f"`{held}`\n\n```\n{held}\n```\n\n<code>{held}</code>", []),
+        }
+        for name, (page, said) in pages.items():
+            for verb in ("--append-file", "--prepend-file", "--edit"):
+                with self.subTest(page=name, verb=verb):
+                    self.fake.overrides.clear()
+                    self.fake.markdown[PAGE] = page + "\n\nHERE\n"
+                    args = ("HERE", body.read_text()) if verb == "--edit" else (body,)
+                    code, out, err = self.run_cli("update", PAGE, verb, *args)
+                    self.assertEqual(code, 0, err)
+                    self.assertIn("uploaded files placed: 1", out)
+                    self.assertEqual(len(err.splitlines()), len(said), err)
+                    for line, pattern in zip(err.splitlines(), said):
+                        self.assertRegex(line, pattern)
+                    # also when this command's own file is not placed: exit 4 for its own work, and the others named
+                    self.fake.markdown[PAGE] = page + "\n\nHERE\n"
+                    self.fake.on("PATCH", r"/v1/blocks/[^/]+", ends_in("503"))
+                    code, out, err = self.run_cli("update", PAGE, verb, *args)
+                    self.assertEqual(code, 4, err)
+                    for pattern in said:
+                        self.assertRegex(err, pattern)
+        self.fake.overrides.clear()  # two writes of one command: said once
+        self.fake.markdown[PAGE] = f"![a]({held})"
+        code, out, err = self.run_cli("update", PAGE, "--prepend-file", body, "--append-file", body)
+        self.assertEqual((code, len(err.splitlines())), (0, 1), err)
+
+    def test_the_advice_for_a_file_with_no_block_is_the_form_it_was_written_in(self):
+        one, body = uid(0xF11E), self.tmp / "advice.md"
+        for written, advised, kind in (
+                (f'<pdf source="file-upload://{one}">r.pdf</pdf>', f'<pdf source="file-upload://{one}">r.pdf</pdf>', "pdf"),
+                (f'<file source="file-upload://{one}">r.pdf</file>', f'<file source="file-upload://{one}">r.pdf</file>', "pdf"),
+                (f'<file source="file-upload://{one}" />', f'<file source="file-upload://{one}"></file>', "file"),
+                (f'<img src="file-upload://{one}" />', f"![](file-upload://{one})", "image"),
+                (f"![shot](file-upload://{one})", f"![shot](file-upload://{one})", "image")):
+            with self.subTest(written):
+                self.fake.kinds = {one: kind}
+                self.fake.markdown[PAGE] = "Intro\n\n```\nHERE\n```\n"
+                code, out, err = self.run_cli("update", PAGE, "--edit", "HERE", written)
+                self.assertEqual(code, 4, err)
+                self.assertEqual(self.advised(err), [advised])
+                body.write_text(self.advised(err)[0])
+                code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual([url for _, url in self.placed(PAGE)], ["https://files.example.com/" + one])
+
+    def test_a_body_that_holds_a_placeholder_is_refused_unless_the_command_supplies_its_file(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        stale, body, pages = f"https://file-upload.invalid/{one}", self.tmp / "body.md", self.tmp / "pages.json"
+        self.fake.markdown[PAGE] = f"![a]({stale})\n"
+        forms = [f"![a]({stale})", f"Intro\n\n> ![a]({stale})", f'<file source="{stale}">\na\n</file>', f"<toggle>\nT\n\n![a]({stale})\n</toggle>"]
+        for form in forms:
+            body.write_text(form)
+            pages.write_text(json.dumps([{"properties": {"Task name": "One"}, "content": form}]))
+            for verb in (("update", PAGE, "--set", "Status=Rollout", "--replace-file", body), ("update", PAGE, "--append-file", body),
+                         ("update", PAGE, "--prepend-file", body), ("update", PAGE, "--edit", "![a]", form + "\n\n![a]"),
+                         ("create", "--parent", "Tasks", "--set", "title=x", "--body-file", body),
+                         ("create", "--parent", "Tasks", "--pages-file", pages)):
+                with self.subTest(form=form, verb=verb[:3]):
+                    self.fake.calls.clear()
+                    code, out, err = self.run_cli(*verb)
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(stale, err)
+                    self.assertIn(f"Write file-upload://{one} in its place", err)
+                    self.assertIn("nothing was sent", err)
+                    self.assertEqual(self.writes(), [])
+        # the same command supplies the file, or the placeholder stands in code: it is written
+        for form, wanted in ((f"![a]({stale})\n\n![b](file-upload://{one})", {one: 2}), (f"`{stale}`\n\n```\n![a]({stale})\n```\n", {})):
+            with self.subTest(form=form):
+                body.write_text(form)
+                code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+                self.assertEqual(code, 0, err)
+                self.assert_all_placed(PAGE, wanted)
+        # the other file of the command is not its file
+        body.write_text(f"![a]({stale})\n\n![b](file-upload://{two})")
+        code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+        self.assertEqual(code, 2, err)
+
+    def test_a_file_is_placed_wherever_a_block_can_hold_it(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        image, tag = f"![a](file-upload://{one})", f'<file source="file-upload://{two}">b.txt</file>'
+        bodies = {  # name -> (body, the files it places)
+            "one file": (image, {one: 1}),
+            "two files": (f"{image}\n\n{tag}", {one: 1, two: 1}),
+            "the same file twice": (f"{image}\n\n{image}", {one: 2}),
+            "the same file as an image and as a file": (image + f'\n\n<file source="file-upload://{one}">x</file>', {one: 2}),
+            "in a toggle": (f"<toggle>\nMore\n\n{image}\n\n{tag}\n</toggle>", {one: 1, two: 1}),
+            "in a toggle in a toggle": (f"<toggle>\nMore\n\n<toggle>\nDeep\n\n{image}\n</toggle>\n</toggle>", {one: 1}),
+            "in columns": (f"<columns>\n<column>\n{image}\n</column>\n<column>\n{tag}\n</column>\n</columns>", {one: 1, two: 1}),
+            "in a callout": (f'<callout icon="⚡">\nTitle\n\n{image}\n</callout>', {one: 1}),
+            "in a quote": (f"> {image}", {one: 1}),
+            "beside code that shows one": (f"```\n{image}\n```\n\n{tag}", {two: 1}),
+            "an upper-case id": (f"![a](file-upload://{one.upper()})", {one: 1}),
+        }
+        pages, body = self.tmp / "pages.json", self.tmp / "body.md"
+        for name, (markdown, wanted) in bodies.items():
+            body.write_text(markdown)
+            pages.write_text(json.dumps([{"properties": {"Task name": "One"}, "content": markdown}]))
+            for verb, args in {"replace": ("update", PAGE, "--replace-file", body), "append": ("update", PAGE, "--append-file", body),
+                               "prepend": ("update", PAGE, "--prepend-file", body), "edit": ("update", PAGE, "--edit", "HERE", markdown),
+                               "create": ("create", "--parent", "Tasks", "--set", "title=x", "--body-file", body),
+                               "pages": ("create", "--parent", "Tasks", "--pages-file", pages)}.items():
+                with self.subTest(body=name, verb=verb):
+                    self.fake.calls.clear()
+                    self.fake.markdown[PAGE] = "Start\n\nHERE\n\nEnd\n"
+                    code, out, err = self.run_cli(*args)
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(err, "")
+                    page = PAGE if args[0] == "update" else list(self.fake.pages)[-1]
+                    self.assert_all_placed(page, wanted)
+                    self.assertIn(f"uploaded files placed: {sum(wanted.values())}", out)
+                    sent = self.fake.sent("PATCH", r"/v1/blocks/[^/]+")
+                    self.assertEqual(len(sent), sum(wanted.values()))
+                    again = self.fake.calls[self.fake.calls.index(sent[-1]) + 1:]  # one read of the body, and no second walk
+                    self.assertEqual([(c.method, c.path) for c in again], [("GET", f"/v1/pages/{page}/markdown")])
+                    for call in self.writes():
+                        self.assertFalse(re.search(r"!\[[^]]*\]\(file-upload|source=.file-upload", re.sub(r"```.*?```", "",
+                                                   json.dumps(call.json or {}), flags=re.S)), "an address the API does not know was sent")
+
+    def test_every_form_of_a_file_is_recognised_and_nothing_inside_code(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        u, held = f"file-upload://{one}", f"https://file-upload.invalid/{one}"
+        v, held_v = f"file-upload://{two}", f"https://file-upload.invalid/{two}"
+        recognised = [  # what is written -> what is sent
+            (f"![c]({u})", f"![c]({held})"), (f"![]({u})", f"![]({held})"), (f'![c]({u} "a title")', f'![c]({held} "a title")'),
+            (f"![c]({u} 'a title')", f"![c]({held} 'a title')"), (f"![c]({u} (a title))", f"![c]({held} (a title))"),
+            (f"![c]( {u} )", f"![c]( {held} )"), (f"![c](<{u}>)", f"![c](<{held}>)"), (f"![a [x] b]({u})", f"![a [x] b]({held})"),
+            (f"![a \\] b]({u})", f"![a \\] b]({held})"), (f"![a `x` b]({u})", f"![a `x` b]({held})"), (f"  ![c]({u})  ", f"  ![c]({held})  "),
+            (f"\t![c]({u})", f"\t![c]({held})"), (f"> ![c]({u})", f"> ![c]({held})"), (f"> > ![c]({u})", f"> > ![c]({held})"),
+            (f"![c]({u})\r", f"![c]({held})\r"), (f"![c](FILE-UPLOAD://{one})", f"![c]({held})"),
+            (f'<file source="{u}">c</file>', f'<file source="{held}">c</file>'), (f"<file source='{u}'>c</file>", f'<file source="{held}">c</file>'),
+            (f'<file source = "{u}" >c</file>', f'<file source = "{held}" >c</file>'), (f'<file source=" {u} ">c</file>', f'<file source="{held}">c</file>'),
+            (f'<file color="red" source="{u}">c</file>', f'<file color="red" source="{held}">c</file>'),
+            (f'<file source="{u}" color="red">c</file>', f'<file source="{held}" color="red">c</file>'),
+            (f'<file source="{u}" />', f'<file source="{held}" />'), (f'<file source="{u}">\nc\n</file>', f'<file source="{held}">\nc\n</file>'),
+            (f'<image src="{u}">c</image>', f'<image src="{held}">c</image>'), (f'<pdf source="{u}"></pdf>', f'<pdf source="{held}"></pdf>'),
+            (f'<audio source="{u}">c</audio>', f'<audio source="{held}">c</audio>'), (f'<video source="{u}">c</video>', f'<video source="{held}">c</video>'),
+            (f'- <file source="{u}">c</file>', f'- <file source="{held}">c</file>'), (f'- item\n\t<file source="{u}">c</file>', f'- item\n\t<file source="{held}">c</file>'),
+            (f'text\n<file source="{u}">c</file>\ntext', f'text\n<file source="{held}">c</file>\ntext'),
+        ]
+        for written, sent in recognised:
+            with self.subTest(recognised=written):
+                got, files = self.n.hold_files(written, "body.md")
+                self.assertEqual((got, [f.id for f in files]), (sent, [one]))
+        fenced = [  # code: text as it is; the file after it is a file
+            "```\n{}\n```", "````\n```\n{}\n```\n````", "~~~\n{}\n~~~", "~~~~\n~~~\n{}\n~~~~", "```js\n{}\n``` js\n{}\n```", "~~~ a`b\n{}\n~~~",
+            "~~~\na\n```\n{}\n~~~", "```\na\n    ```\n{}\n```", "```\n{}\n   ```", "```\n{}\n``````", "> ```\n> {}\n> ```", "> ~~~\n>{}\n> ~~~",
+            "> > ```\n> > {}\n> > ```", "- item\n\t```\n\t{}\n\t```", "- ```\n  {}\n  ```", "1. ```\n   {}\n   ```", "- a\n\t- b\n\t\t```\n\t\t{}\n\t\t```",
+            "text\n```\n{}\n```", "<toggle>\nT\n\n```\n{}\n```\n</toggle>", "$$\n{}\n$$", "$$\nx\n\n{}\n$$", "```\n\n{}\n\n```", "    ```\n    `{}`\n    ```",
+            "`{}`", "`` {} ``", "```{}```", "text `{}` text", "<code>{}</code>", "a `x` and `{}` b", "`a\n{} b`", "> ```\n> code\n",
+            "> ```\n> code", "- item\n\t```\n\tcode\n", "- ```\n", "```code``` text", "~~~not closed by ticks~~~ {}\n~~~", "text ```code``` text",
+            "```\na\n```\n\n``` js\n{}\n```", "# a\n\n`x`", "a ` b", "\\`", "~~", "``` a`b",
+        ]
+        for shape in fenced:
+            for example in (f"![c]({u})", f'<file source="{u}">c</file>'):
+                with self.subTest(code=shape, example=example):
+                    code = shape.replace("{}", example)
+                    if shape in ("text `{}` text", "a `x` and `{}` b", "`{}`", "`` {} ``", "```{}```", "<code>{}</code>", "`a\n{} b`"):
+                        code = shape.replace("{}", example + " ")
+                    got, files = self.n.hold_files(f"{code}\n\n![d]({v})", "body.md")
+                    self.assertEqual((got, [f.id for f in files]), (f"{code}\n\n![d]({held_v})", [two]))
+        refused = [  # (body, the line it names): outside code and not a block of its own, or code nothing closes
+            (f"Before ![c]({u}) after", 1), (f"Before ![c]({u})", 1), (f"![c]({u}) after", 1), (f"a\n\n- item ![c]({u})", 3), (f"- ![c]({u})", 1),
+            (f"## Heading ![c]({u})", 1), (f"## ![c]({u})", 1), (f"| a | b |\n| --- | --- |\n| ![c]({u}) | x |", 3),
+            (f"<table>\n<tr><td>![c]({u})</td></tr>\n</table>", 2), (f'<table>\n<tr>\n<td>\n<file source="{u}">c</file>\n</td>\n</tr>\n</table>', 4),
+            (f"<table>\n<tr>\n<td>\n![c]({u})\n</td>\n</tr>\n</table>", 4), (f"![a]({u}) ![b]({v})", 1), (f"[![c]({u})](https://example.com/)", 1),
+            (f"[c]({u})", 1), (f"see {u} there", 1), (f"<{u}>", 1), (f"![c][r]\n\n[r]: {u}", 3), (f"\\![c]({u})", 1), (f'\\<file source="{u}">c</file>', 1),
+            (f'Text <file source="{u}">c</file>', 1), (f'<file source="{u}">c</file> text', 1), (f'<file source="{u}">c</file> <file source="{v}">d</file>', 1),
+            (f'## <file source="{u}">c</file>', 1), (f'<embed source="{u}" />', 1), (f'<bookmark source="{u}" />', 1), (f"<file source={u}>c</file>", 1),
+            (f'<FILE SOURCE="{u}">c</FILE>', 1), (f"<!-- ![c]({u}) -->", 1), (f"\\`![c]({u})\\`", 1), (f"a $![c]({u})$ b", 1), (f"![a\nb]({u})", 2),
+            (f"![c `]({u})\n\n` d", 1), (f"a ` b\n\n![c]({u})\n\nc ` d", 3), (f"a ` b\n![c]({u})\nc ` d", 2), (f"```\ncode\n\n![c]({u})", 4),
+            (f"~~~\n![c]({u})\n```\n", 2), (f"![c]({u}) {{color=\"red\"}}", 1), ("![c](file-upload://not-an-id)", 1), ("<file source='file-upload://<id>'>c</file>", 1),
+            (f"![c]({u}?x=1)", 1),
+        ]
+        for markdown, line in refused:
+            with self.subTest(refused=markdown):
+                with self.assertRaises(self.n.Fail) as raised:
+                    self.n.hold_files(markdown, "body.md")
+                self.assertEqual(raised.exception.code, 2)
+                self.assertTrue(raised.exception.message.startswith(f"body.md, line {line}: "), raised.exception.message)
+                self.assertIn("nothing was sent", raised.exception.message)
+                body = self.tmp / "refused.md"
+                body.write_text(markdown)
+                for verb in (("update", PAGE, "--set", "Status=Rollout", "--append-file", body),
+                             ("create", "--parent", "Tasks", "--set", "title=x", "--body-file", body)):
+                    code, out, err = self.run_cli(*verb)
+                    self.assertEqual(code, 2, err)
+        self.assertEqual(self.writes(), [])
+        for markdown, line, why in [
+                (f"a\n\n\t```\n\t![c]({u})\n\t```\n", 4, "is in the fence that line 3 opens, indented by a tab or by four spaces or more"),
+                (f"a\n\n     ````\n     ![c]({u})\n     ````\n", 4, "is in the fence that line 3 opens, indented by a tab or by four spaces or more"),
+                (f"a ` b\n![c]({u})\nc ` d", 2, "is inside the inline code that a backtick on line 1 opens"),
+                (f"A sentence about <table>.\n\n![c]({u})", 1, "<table> is never closed, and Notion refuses the whole body for it"),
+                (f"![c]({u})\n\nA sentence about the <table tag.", 3, "<table> is never closed, and Notion refuses the whole body for it"),
+                (f"<table>\n<tr>\n<td>\n![c]({u})\n</td>\n</tr>\n</table>", 4, "stands in a table"),
+                (f"- <table>\n<tr>\n<td>\n![c]({u})\n</td>\n</tr>\n</table>", 4, "stands in a table")]:
+            with self.subTest(why=why, markdown=markdown):
+                with self.assertRaises(self.n.Fail) as raised:
+                    self.n.hold_files(markdown, "body.md")
+                self.assertTrue(raised.exception.message.startswith(f"body.md, line {line}: "), raised.exception.message)
+                self.assertIn(why, raised.exception.message)
+        for said in ("about <table></table> closed.", "about \\<table> escaped.", "about `<table>` as code.", "about a <tablet>."):  # Notion stores these
+            with self.subTest(accepted=said):
+                self.assertEqual(self.n.hold_files(f"A sentence {said}\n\n![c]({u})\n\nEnd", "body.md")[0],
+                                 f"A sentence {said}\n\n![c]({held})\n\nEnd")
+        closed = f"A sentence about <table>.\n\n![c]({u})\n\nand </table> later.\n\n<table>\n<tr><td>x</td></tr>\n</table>\n\n![d]({v})"
+        self.assertEqual([f.id for f in self.n.hold_files(closed, "body.md")[1]], [one, two])
+        documented = re.findall(r"`([!<][^`]*file-upload://<id>[^`]*)`", (SKILL_DIR / "references" / "notion-markdown.md").read_text(encoding="utf-8"))
+        self.assertGreater(len(documented), 5)
+        for form in documented:
+            with self.subTest(documented=form):
+                self.assertEqual([f.id for f in self.n.hold_files(form.replace("<id>", one), "body.md")[1]], [one])
+        for untouched in ("no file here", "", "a `file-upload://<id>` in words", "file-upload:// is the scheme", "![c](https://example.com/x.png)"):
+            self.assertEqual(self.n.hold_files(untouched, "body.md"), (untouched, []))
+
+    def test_the_walk_of_a_long_body_is_linear(self):
+        line = f"![c](file-upload://{uid(0xF11E)})"
+        for shape in ("`x` <table> </table>\n" * 7000, "<code>x</code> <table></table>\n" * 7000, f"`{line}` x\n" * 2000, "`", "``` ", "\\`", "> ", "- ", "\n", "$$\n", "```\n", "~~~\n", "[", "![", "![a](", "<file ", "<file source=", "<code>", "a ` b\n", "\t- x\n"):
+            with self.subTest(shape=shape[:40]):
+                body = line + "\n\n" + (shape * (60000 // len(shape) or 1)) + "\n"
+                began = time.process_time()
+                try:
+                    self.n.hold_files(body, "body.md")
+                except self.n.Fail:
+                    pass
+                self.assertLess(time.process_time() - began, 2)
+        space, upload = " " * 20000, f"file-upload://{uid(0xF11E)}"
+        for shape in ("<file {s}x", "<file {s}source{s}={s}x>", '<file {s}source{s}={s}"{u}"{s}>{s}x{s}x{s}', "![c]({u}{s}x", "![c]({s}{u}{s}", "source={s}x {u}",
+                      "source='{s}{u}", "- {s}<file {s}", '<file source="{u}"{s}' + "</file>{s}" * 20):
+            with self.subTest(line=shape):
+                began = time.process_time()
+                with contextlib.suppress(self.n.Fail):
+                    self.n.hold_files(shape.replace("{s}", space).replace("{u}", upload), "body.md")
+                self.assertLess(time.process_time() - began, 1)
+
+    def commands(self, err):
+        """The commands a message gives to place files, each as the client's arguments."""
+        return [shlex.split(found) for found in re.findall(r"`notion (update \S+ --edit '[^']+' '[^']+')`", err)]
+
+    def assert_all_placed(self, page, wanted):
+        """No placeholder is left on the page, in any block, and each upload is in as many blocks as wanted."""
+        wanted = {upload: count if isinstance(count, int) else 1 for upload, count in wanted.items()}
+        held = collections.Counter(url.rsplit("/", 1)[1] for _, url in self.placed(page) if url.startswith("https://files.example.com/"))
+        self.assertEqual(held, collections.Counter(wanted))
+
+        def every(identifier):
+            for block in self.fake.children.get(identifier, []):
+                yield block
+                yield from every(block["id"])
+
+        for block in every(page):
+            if block["type"] != "code" and not re.search("`|<code>", json.dumps(block[block["type"]])):
+                self.assertNotIn("file-upload.invalid", json.dumps(block))
 
     def test_download_saves_the_file_without_the_token(self):
         block = uid(0xF2)
@@ -2160,7 +4385,31 @@ class TokenTest(ClientTestCase):
         self.assertNotIn(TOKEN, joined)
         self.assertNotIn(TOKEN[4:20], joined)
 
+    def test_token_with_a_character_that_is_not_plain_ascii_exits_3(self):
+        for name, odd in (("zero-width space", chr(0x200B)), ("byte-order mark", chr(0xFEFF)), ("ellipsis", chr(0x2026)),
+                          ("accent", chr(0xE9)), ("no-break space", chr(0xA0)), ("a control character", chr(7))):
+            for source in ("env", "prompt"):
+                with self.subTest(odd=name, source=source):
+                    self.fake.calls.clear()
+                    os.environ.pop("NOTION_API_TOKEN", None)
+                    if source == "env":
+                        os.environ["NOTION_API_TOKEN"] = TOKEN[:20] + odd + TOKEN[20:]
+                        code, out, err = self.run_cli("fetch", PAGE)
+                    else:
+                        self.n.STDIN_IS_TTY = lambda: True
+                        self.n.GETPASS = lambda prompt, odd=odd: TOKEN[:20] + odd + TOKEN[20:]
+                        code, out, err = self.run_cli("auth", "login")
+                    self.assertEqual(code, 3, err)
+                    self.assertIn("malformed", err)
+                    self.assertNotIn(TOKEN[4:20], out + err)
+                    self.assertEqual(self.fake.calls, [])
+
     def test_token_with_a_line_break_inside_exits_3_and_is_never_printed(self):
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        self.n.API_HOST = "127.0.0.1:%d" % closed.getsockname()[1]
+        closed.close()  # the real transport is installed below: nothing it might send can reach the real host
+        self.n.API_ROOT = "http://" + self.n.API_HOST
         credentials = self.home / ".config" / "notion" / "credentials"
         credentials.parent.mkdir(parents=True)
         credentials.write_text(TOKEN + " " + TOKEN + "\n")
@@ -2270,6 +4519,17 @@ class DoctorTest(ClientTestCase):
         self.assertTrue(any("Tasks" in line and PREFIX in line for line in sources))
         self.assertTrue(any("Projects" in line and "PRJ" in line for line in sources))
 
+    def test_doctor_names_an_untitled_data_source(self):
+        self.fake.data_sources[DS_PROJECTS]["title"] = []
+        code, out, err = self.run_cli("doctor")
+        self.assertEqual(code, 0, out + err)
+        self.assertIn(f"data source: (untitled), prefix PRJ, {COLLECTION}{DS_PROJECTS}", out.splitlines())
+        code, out, err = self.run_cli("fetch", COLLECTION + DS_PROJECTS)
+        self.assertEqual(out.splitlines()[0], "data source: (untitled)")
+        code, out, err = self.run_cli("fetch", "no such title")
+        self.assertEqual(code, 2)
+        self.assertIn("connected data source (Tasks)", err)
+
     def test_doctor_missing_capability_exits_1(self):
         self.fake.on("GET", r"/v1/comments", lambda r: error(403, "restricted_resource", "Insufficient permissions."))
         self.fake.users_status = 403
@@ -2295,18 +4555,183 @@ class DoctorTest(ClientTestCase):
         for step in ("create", "property", "body", "comment", "trash"):
             self.assertRegex(out, rf"(?m)^write check {step}.*: ok")
         self.assertNotIn("FAILED", out)
+        self.assertIn("| Column | Value |", self.fake.page_markdown(test_page["id"])["markdown"])  # what a read gives back
+        self.assertIn(f"write check create: ok ({test_page['url']})", out.splitlines())
+
+    def test_doctor_write_check_trashes_its_card_after_a_create_in_doubt(self):
+        self.settings(test_marker="QA MARKER")
+        title = "QA MARKER doctor 2026-11-22 09:30:15"
+        older = self.fake.add_page(task_page(uid(0x4200), 160, title, created_by=ANA))  # never another author's card
+        where = f"data source Tasks ({COLLECTION}{DS_TASKS})"
+        query = rf"/v1/data_sources/{DS_TASKS}/query"
+
+        def checks(r):  # the lookups of the card; the read that samples a row for `read comments` is not one
+            return "filter" in (r.json or {})
+
+        def listed_late(r, state):
+            state["lookups"] += checks(r)
+            return (200, {"results": [], "has_more": False}) if checks(r) and state["lookups"] < 3 else None
+
+        for kind in ("500", "502", "503", "504", "529", *LOST, *UNREADABLE, *OTHER_SHAPE):
+            for landed, lookup in ((True, "found"), (True, "late"), (True, "403"), (True, "timeout"), (False, "found")):
+                with self.subTest(create=kind, landed=landed, lookup=lookup):
+                    self.fake.overrides.clear()
+                    self.fake.calls.clear()
+                    self.fake.pages = {PAGE: self.page, older["id"]: older}
+                    fails, state = ends_in(kind), {"lookups": 0}
+
+                    def create(r, landed=landed, fails=fails):
+                        if landed:
+                            self.fake.create_page(r.json)
+                        return fails(r)
+
+                    self.fake.on("POST", r"/v1/pages", create)
+                    if lookup == "late":
+                        self.fake.on("POST", query, lambda r, state=state: listed_late(r, state))
+                    elif lookup == "403":
+                        self.fake.on("POST", query, lambda r: error(403, "restricted_resource", "No.") if checks(r) else None)
+                    elif lookup == "timeout":
+                        self.fake.on("POST", query, lambda r: ends_in("timeout")(r) if checks(r) else None)
+                    code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                    self.assertEqual(code, 1, out + err)
+                    self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1, "the create is never sent again")
+                    self.assertRegex(out, r"(?m)^write check create: FAILED \(.*in doubt")
+                    self.assertFalse(older["in_trash"])
+                    made = [pg for pg in self.fake.pages.values() if pg["created_by"]["id"] == BOT and self.fake.title_of(pg) == title]
+                    self.assertEqual(len(made), int(landed))
+                    if landed and lookup in ("found", "late"):
+                        self.assertTrue(made[0]["in_trash"])
+                        self.assertIn(made[0]["url"], out)
+                        self.assertRegex(out, r"(?m)^write check trash: ok")
+                    else:
+                        self.assertRegex(out, r"(?m)^write check trash: FAILED")
+                        self.assertIn(f"look for a card titled {title!r} in {where} and trash it by hand", out)
+
+        # a clock ahead of Notion's, or behind it, never hides the card: its title is its own
+        for minutes in (-120, -2, 2, 120, 600):
+            with self.subTest(clock_ahead=minutes):
+                self.fake.overrides.clear()
+                self.fake.pages = {PAGE: self.page}
+                clock = datetime.datetime(2026, 11, 22, 9, 30, 15, tzinfo=datetime.timezone.utc) + datetime.timedelta(minutes=minutes)
+                with mock.patch.object(self.n, "NOW", lambda clock=clock: clock):
+                    self.fake.on("POST", r"/v1/pages", lambda r: (self.fake.create_page(r.json), ends_in("503")(r))[1])
+                    self.fake.on("POST", query, lambda r: (200, {"results": [pg for pg in self.fake.pages.values() if pg["created_time"] >= r.json[
+                        "filter"]["and"][1]["created_time"]["on_or_after"]], "has_more": False}) if checks(r) else None)
+                    code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out + err)
+                self.assertRegex(out, r"(?m)^write check trash: ok")
+                self.assertEqual([pg["in_trash"] for pg in self.fake.pages.values() if pg["id"] != PAGE], [True])
+        # what is said is the last lookup's result, and what waiting does not change is not asked again
+        for answers, asked, said in (([403], 1, "could not be looked for"), ([401], 1, "could not be looked for"), ([404], 1, "could not be looked for"),
+                                     ([503] * 3, 5, "no card with that title was found"), ([], 3, "no card with that title was found"),
+                                     ([503] * 9, 9, "could not be looked for")):
+            with self.subTest(lookups=answers):
+                self.fake.overrides.clear()
+                lookups = []
+
+                def look(r, answers=answers, lookups=lookups):
+                    if checks(r):
+                        lookups.append(r)
+                        if len(lookups) <= len(answers):
+                            return error(answers[len(lookups) - 1], "synthetic_failure", "Synthetic failure.")
+                        return 200, {"results": [], "has_more": False}
+
+                self.fake.on("POST", r"/v1/pages", ends_in("503"))
+                self.fake.on("POST", query, look)
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out + err)
+                self.assertRegex(out, rf"(?m)^write check trash: FAILED \(.*{said}")
+                self.assertEqual(len(lookups), asked)  # a read is tried three times on a 503
+                self.assertIn(f"look for a card titled {title!r}", out)
+
+        # the card was made and answered, and the request that trashes it is lost: the card is named
+        for kind in (*LOST, *UNREADABLE, *OTHER_SHAPE, "400", "503"):
+            with self.subTest(trash=kind):
+                self.fake.overrides.clear()
+                self.fake.pages = {PAGE: self.page}
+                fails = ends_in(kind)
+                self.fake.on("PATCH", r"/v1/pages/[^/]+", lambda r, fails=fails: fails(r) if "in_trash" in r.json else None)
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out + err)
+                made = [pg for pg in self.fake.pages.values() if self.fake.title_of(pg) == title][0]
+                self.assertIn(f"trash the card {title!r} by hand: {made['url']}", out)
+
+        # a create Notion refused, or that was never sent, made no card: nothing to look for
+        for kind in ("400", "unreachable"):
+            with self.subTest(create=kind):
+                self.fake.overrides.clear()
+                self.fake.pages = {PAGE: self.page}
+                self.fake.on("POST", r"/v1/pages", ends_in(kind))
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out + err)
+                self.assertNotIn("by hand", out)
+
+    def test_doctor_write_check_comment_carries_a_link_and_reads_back_with_it(self):
+        self.settings(test_marker="QA MARKER")
+        code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+        self.assertEqual(code, 0, out + err)
+        sent = self.fake.sent("POST", r"/v1/comments")[-1].json
+        self.assertIn("[a link](https://example.com/)", sent["markdown"])
+        self.assertRegex(out, r"(?m)^write check comment: ok")
+        # a comment that comes back without its address fails the check, and the card is still trashed
+        self.fake.calls.clear()
+        self.fake.on("POST", r"/v1/comments", lambda r: (200, dict(
+            self.fake.create_comment(dict(r.json, markdown=re.sub(r"\[(.*?)\]\(.*?\)", r"\1", r.json["markdown"])))[1])))
+        code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+        self.assertEqual(code, 1, out + err)
+        self.assertRegex(out, r"(?m)^write check comment: FAILED \(the comment did not read back with its link\)")
+        self.assertRegex(out, r"(?m)^write check trash: ok")
 
     def test_doctor_write_check_mismatch_exits_1_and_trashes(self):
+        # A construct stored as anything but its own block fails the check, even when the text is the same.
         self.settings(test_marker="QA MARKER")
-        self.fake.on("GET", r"/v1/pages/[^/]+/markdown",
-                     lambda r: (200, {"object": "page_markdown", "id": r.path.split("/")[3], "markdown": "something else",
-                                      "truncated": False, "unknown_block_ids": []}))
-        code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
-        self.assertEqual(code, 1)
-        self.assertIn("FAILED", out)
-        created = [pg for pg in self.fake.pages.values() if self.fake.title_of(pg).startswith("QA MARKER")]
-        self.assertEqual(len(created), 1)
-        self.assertTrue(created[0]["in_trash"])
+
+        def as_text(value):
+            return self.fake.block("paragraph", {"rich_text": text(value), "color": "default"})
+
+        def replaced(index, value):
+            return lambda blocks: blocks[:index] + [as_text(value)] + blocks[index + 1:]
+
+        def changed(index, change):
+            def apply(blocks):
+                change(blocks[index])
+                return blocks
+            return apply
+
+        def without_child(index, keep):
+            def change(block):
+                self.fake.children[block["id"]] = self.fake.children[block["id"]][:keep]
+            return changed(index, change)
+
+        cases = [
+            ("callout as text", replaced(0, "Write check callout"), "stored as paragraph, table, toggle"),
+            ("table as text", replaced(1, "| Column | Value |"), "stored as callout, paragraph, toggle"),
+            ("toggle as text", replaced(2, "Write check toggle"), "stored as callout, table, paragraph"),
+            ("everything as one text", lambda b: [as_text(self.n.WRITE_CHECK_BODY)], "stored as paragraph,"),
+            ("nothing", lambda b: [], "stored as nothing"),
+            ("an extra block", lambda b: b + [as_text("more")], "stored as callout, table, toggle, paragraph"),
+            ("callout with other text", changed(0, lambda b: b["callout"].update(rich_text=text("x"))), "the callout holds 'x'"),
+            ("no header row", changed(1, lambda b: b["table"].update(has_column_header=False)), "2 columns and no header row"),
+            ("three columns", changed(1, lambda b: b["table"].update(table_width=3)), "3 columns and a header row"),
+            ("one row", without_child(1, 1), "the table holds [['Column', 'Value']]"),
+            ("empty toggle", without_child(2, 0), "the toggle 'Write check toggle' holds []"),
+        ]
+        for name, spoil, said in cases:
+            with self.subTest(case=name):
+                self.fake.pages = {PAGE: self.page}
+                store = FakeNotion.store_blocks
+
+                def spoiled(identifier, markdown):
+                    store(self.fake, identifier, markdown)
+                    self.fake.children[identifier] = spoil(self.fake.children[identifier])
+                self.fake.store_blocks = spoiled
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out)
+                self.assertIn("write check body (callout, table, toggle): FAILED (", out)
+                self.assertIn(said, out)
+                created = [pg for pg in self.fake.pages.values() if self.fake.title_of(pg).startswith("QA MARKER")]
+                self.assertEqual(len(created), 1)
+                self.assertTrue(created[0]["in_trash"])
 
 
 class CacheTest(ClientTestCase):
@@ -2327,6 +4752,59 @@ class CacheTest(ClientTestCase):
         self.assertTrue(cache.is_dir())
 
 
+class SignedAddressTest(ClientTestCase):
+    def test_no_cache_file_holds_a_signed_address(self):
+        # Every way the cache gets written, with a signed storage address everywhere the API can put one.
+        def signed(what):
+            return (f"https://files.example.com/{what}?X-Amz-Algorithm=AWS4&X-Amz-Credential=SYNTHETIC&"
+                    "X-Amz-Security-Token=SYNTHETIC&X-Amz-Signature=0000&X-Amz-Expires=3600")
+
+        def hosted(what):
+            return {"type": "file", "file": {"url": signed(what), "expiry_time": "2026-11-22T10:30:00.000Z"}}
+
+        emoji = {"type": "mention", "plain_text": ":logo:", "href": None, "mention": {
+            "type": "custom_emoji", "custom_emoji": {"id": uid(0xE1), "name": "logo", "url": signed("emoji")}}}
+        for identifier, source in self.fake.data_sources.items():
+            source.update(icon=hosted("icon"), cover=hosted("cover"), description=[run("see", signed("described"))],
+                          title=[emoji] + source["title"])
+        self.page.update(icon=hosted("page-icon"), cover=hosted("page-cover"))
+        self.page["properties"]["Assignee"]["people"] = [dict(USERS[ANA], avatar_url=signed("avatar"))]
+        self.fake.users[BRUNO] = dict(USERS[BRUNO], avatar_url=signed("avatar-2"))
+        commands = {
+            "a bare id read from the API": ("fetch", DS_TASKS),
+            "a schema read by its collection form": ("fetch", COLLECTION + DS_TASKS),
+            "the list of data sources": ("fetch", key(120)),
+            "a schema read again": ("query", COLLECTION + DS_TASKS, "--where", "Sprint = 'x'"),
+            "a page's parent": ("fetch", PAGE),
+            "people from rows and from the user list": ("users", "find", "a"),
+            "rows": ("query", COLLECTION + DS_TASKS, "--json"),
+            "a search": ("search", "invoice"),
+        }
+        cache = self.home / ".cache" / "cdv-notion"
+        for name, command in commands.items():
+            for warm in (False, True):
+                with self.subTest(name, warm=warm):
+                    if not warm:
+                        shutil.rmtree(cache, ignore_errors=True)
+                    self.run_cli(*command)
+                    files = [path for path in cache.iterdir() if path.is_file()]
+                    self.assertTrue(files, "nothing was cached")
+                    for path in files:
+                        held = path.read_text(encoding="utf-8")
+                        self.assertNotIn("X-Amz", held, path.name)
+                        self.assertNotIn("files.example.com", held, path.name)
+        # what the client reads from the cache is still there, and --json still gives the object the API gave
+        code, out, err = self.run_cli("query", "Tasks")
+        self.assertEqual(code, 2, out + err)  # the title now starts with the emoji's name
+        code, out, err = self.run_cli("query", ":logo:Tasks")
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli("fetch", COLLECTION + DS_TASKS, "--json")
+        self.assertEqual(json.loads(out)["icon"], hosted("icon"))
+        code, out, err = self.run_cli("fetch", ":logo:Tasks")
+        self.assertIn("data source: :logo:Tasks", out)
+        self.assertIn(f"database: {DB_TASKS}", out)
+
+
 class PeopleCacheRaceTest(ClientTestCase):
     def test_two_sessions_that_loaded_the_cache_before_either_wrote_keep_both_people(self):
         first, second = self.n.Notion(), self.n.Notion()
@@ -2336,6 +4814,110 @@ class PeopleCacheRaceTest(ClientTestCase):
         saved = json.loads((self.home / ".cache" / "cdv-notion" / "people.json").read_text())
         self.assertEqual(sorted(saved), sorted([JOANA, BRUNO]))
         self.assertEqual(sorted(first.people()), sorted([JOANA, BRUNO]))
+
+    def saved(self, name):
+        return json.loads((self.home / ".cache" / "cdv-notion" / f"{name}.json").read_text())
+
+    def write_between_the_read_and_the_write(self, name, first, first_writes, second, second_writes):
+        """first_writes(first) runs, and right before it writes the cache file `name`, with everything it merges
+        already read, second_writes(second) runs on another thread: to its end, or until it waits for a lock."""
+        settled = threading.Event()  # the second session wrote, or is waiting for the first one
+        locks = self.n.fcntl
+
+        def flock(handle, how):
+            try:
+                locks.flock(handle, how | locks.LOCK_NB)
+            except BlockingIOError:
+                settled.set()
+                locks.flock(handle, how)
+
+        def second_session():
+            try:
+                second_writes(second)
+            finally:
+                settled.set()
+
+        thread = threading.Thread(target=second_session)
+        put = first.cache.put
+
+        def write(written, value):
+            if written == name and not thread.ident:
+                thread.start()
+                self.assertTrue(settled.wait(60), "the second session neither wrote nor waited")
+            put(written, value)
+
+        first.cache.put = write
+        self.n.fcntl = mock.Mock(flock=flock, LOCK_EX=locks.LOCK_EX)
+        try:
+            first_writes(first)
+        finally:
+            self.n.fcntl = locks
+        self.assertTrue(thread.ident, f"{name} was not written")
+        thread.join(60)
+        self.assertFalse(thread.is_alive())
+
+    def test_a_session_that_writes_between_the_read_and_the_write_of_another_loses_nothing(self):
+        # Every cache file that is read, merged and written: the people, the kind of each id, and the list of
+        # data sources a schema read again corrects.
+        def clean():
+            shutil.rmtree(self.home / ".cache", ignore_errors=True)
+
+        with self.subTest("two new people"):
+            clean()
+            self.write_between_the_read_and_the_write(
+                "people", self.n.Notion(), lambda s: s.remember(USERS[BRUNO]), self.n.Notion(), lambda s: s.remember(GUEST))
+            self.assertEqual(sorted(self.saved("people")), sorted([JOANA, BRUNO]))
+        with self.subTest("a person the other session updated since this one read the cache is not written back old"):
+            clean()
+            self.n.Notion().remember(person(BRUNO, "Bruno Old"))
+            first = self.n.Notion()
+            first.people()
+            self.n.Notion().remember(person(BRUNO, "Bruno Costa", "bruno@example.com"))
+            first.remember(GUEST)
+            self.assertEqual(self.saved("people")[BRUNO], {"name": "Bruno Costa", "type": "person",
+                                                           "email": "bruno@example.com"})
+            self.assertEqual(first.people()[BRUNO]["name"], "Bruno Costa")
+        with self.subTest("an e-mail the other session learned stays when this one sees the person without it"):
+            clean()
+            first = self.n.Notion()
+            first.people()
+            self.n.Notion().remember(person(ANA, "Ana Lima", "ana@example.com"))
+            first.remember(person(ANA, "Ana Lima Souza"))
+            self.assertEqual(self.saved("people")[ANA], {"name": "Ana Lima Souza", "type": "person",
+                                                         "email": "ana@example.com"})
+        with self.subTest("the kind of each id"):
+            clean()
+            self.write_between_the_read_and_the_write(
+                "kinds", self.n.Notion(), lambda s: s.resolve(PAGE), self.n.Notion(), lambda s: s.resolve(DS_TASKS))
+            self.assertEqual(self.saved("kinds"), {PAGE: "page", DS_TASKS: "data_source"})
+        with self.subTest("the list of data sources"):
+            clean()
+            self.n.Notion().data_sources()
+            renamed = {DS_TASKS: "Cards", DS_PROJECTS: "Initiatives"}
+
+            def reads_again(identifier):
+                self.fake.data_sources[identifier] = dict(self.fake.data_sources[identifier], title=text(renamed[identifier]))
+                return lambda session: session.data_source(identifier, refresh=True)
+
+            first_writes, second_writes = reads_again(DS_TASKS), reads_again(DS_PROJECTS)
+            self.write_between_the_read_and_the_write(
+                "data_sources", self.n.Notion(), first_writes, self.n.Notion(), second_writes)
+            self.assertEqual(sorted(entry["title"] for entry in self.saved("data_sources")), ["Cards", "Initiatives"])
+
+    def test_without_flock_or_a_lock_file_the_cache_is_written_as_before(self):
+        def refused(handle, how):
+            raise OSError("no locks here")
+
+        for name, locks in (("no fcntl", None), ("a file system with no locks", mock.Mock(flock=refused, LOCK_EX=2))):
+            with self.subTest(name):
+                shutil.rmtree(self.home / ".cache", ignore_errors=True)
+                self.n.fcntl = locks
+                first, second = self.n.Notion(), self.n.Notion()
+                self.assertEqual((first.people(), second.people()), ({}, {}))
+                second.remember(GUEST)
+                first.remember(USERS[BRUNO])
+                self.assertEqual(sorted(json.loads((self.home / ".cache" / "cdv-notion" / "people.json").read_text())),
+                                 sorted([JOANA, BRUNO]))
 
 
 class StaleCacheTest(ClientTestCase):
@@ -2359,6 +4941,287 @@ class StaleCacheTest(ClientTestCase):
 
     def list_reads(self):
         return [c for c in self.fake.sent("POST", r"/v1/search") if (c.json or {}).get("filter", {}).get("value") == "data_source"]
+
+    # -- the one rule, over every step built from a cached schema --------------------------
+
+    def cached_before(self, change):
+        """A new workspace, its data source list and schemas cached, then changed behind the client's back."""
+        shutil.rmtree(self.home / ".cache", ignore_errors=True)
+        self.fake = FakeNotion()
+        self.page = self.fake.add_page(task_page(PAGE, 120, "Export invoices", done_at="2026-11-22"), "## Context\n")
+        self.fake.add_page(task_page(uid(0x121), 121, "Close the month", notes="Check every invoice twice"))
+        self.fake.add_page(child_page(PROJECT, "Billing revamp", WIKI))
+        billing = child_page(uid(0x9005), "Billing", WIKI)
+        billing["parent"] = {"type": "data_source_id", "data_source_id": DS_PROJECTS}
+        billing["properties"] = {"Project name": {"id": "title", "type": "title", "title": text("Billing")},
+                                 "Project ID": {"id": "pid", "type": "unique_id", "unique_id": {"prefix": "PRJ", "number": 5}}}
+        self.fake.add_page(billing)
+        self.statuses = []
+
+        def transport(*call):
+            answer = self.fake(*call)
+            self.statuses.append(answer[0])
+            return answer
+
+        self.n.TRANSPORT = transport
+        code, out, err = self.run_cli("fetch", key(120))
+        self.assertEqual(code, 0, err)
+        change()
+        self.fake.calls.clear()
+        self.statuses.clear()
+
+    def rename(self, old, new, ds=DS_TASKS):
+        def change():
+            source = self.fake.data_sources[ds]
+            self.fake.data_sources[ds] = dict(source, properties={
+                (new if name == old else name): (dict(prop, name=new) if name == old else prop)
+                for name, prop in source["properties"].items()})
+            for page in self.fake.pages.values():
+                if page["parent"].get("data_source_id") == ds:
+                    page["properties"] = {(new if n == old else n): value for n, value in page["properties"].items()}
+        return change
+
+    def delete(self, name):
+        def change():
+            del self.fake.data_sources[DS_TASKS]["properties"][name]
+            for page in self.fake.pages.values():
+                page["properties"].pop(name, None)
+        return change
+
+    def add_priority(self):
+        self.fake.data_sources[DS_TASKS]["properties"]["Priority"] = {
+            "id": "pri", "name": "Priority", "type": "select", "select": {"options": [option("High", 1)]}}
+
+    def rename_option(self, old, new):
+        def change():
+            for entry in self.fake.data_sources[DS_TASKS]["properties"]["Status"]["status"]["options"]:
+                entry["name"] = new if entry["name"] == old else entry["name"]
+        return change
+
+    def made(self):
+        return [p for p in self.fake.pages.values() if p["id"].startswith("000050")]
+
+    def body_file(self, content, name="body.md"):
+        path = self.tmp / name
+        path.write_text(content)
+        return str(path)
+
+    def pages_file(self, *properties):
+        return self.body_file(json.dumps([{"properties": p} for p in properties]), "pages.json")
+
+    def test_a_step_built_from_a_renamed_or_deleted_property_is_built_again_from_the_schema_read_again(self):
+        # The user did not name the old property: every step answers as it would with no cache, reads the schema
+        # once, and leaves a cache the next command does not trip on.
+        coll = COLLECTION + DS_TASKS
+        sites = [
+            ("search, a text property renamed", self.rename("Notes", "Remarks"), ("search", "invoice"), "matched: Remarks"),
+            ("search, a text property deleted", self.delete("Notes"), ("search", "invoice"), "Export invoices | https"),
+            ("search --in, renamed", self.rename("Notes", "Remarks"), ("search", "invoice", "--in", coll), "matched: Remarks"),
+            ("fetch by key, the unique id renamed", self.rename("Task ID", "Ticket"), ("fetch", key(120)), "key: " + key(120)),
+            ("search by key, the unique id renamed", self.rename("Task ID", "Ticket"), ("search", key(121)), "matched: key"),
+            ("update, a relation by key", self.rename("Project ID", "Number", DS_PROJECTS),
+             ("update", PAGE, "--set", "Project=" + "PRJ" + "-5"), page_url(uid(0x9005))),
+            ("query --where id", self.rename("Task ID", "Ticket"), ("query", coll, "--where", "id = 120"), key(120)),
+            ("query, the default columns", self.rename("Task name", "Name"), ("query", coll),
+             "Task ID | Name | Status | url\n" + key(120) + " | Export invoices | Done"),
+            ("query --select title", self.rename("Task name", "Name"), ("query", coll, "--select", "title"),
+             "Name | url\nExport invoices |"),
+            ("query --group-by title", self.rename("Task name", "Name"), ("query", coll, "--group-by", "title"),
+             "Export invoices 1"),
+            ("query --where title", self.rename("Task name", "Name"), ("query", coll, "--where", "title contains 'x'"),
+             "Export invoices"),
+            ("query --order title", self.rename("Task name", "Name"), ("query", coll, "--order", "title desc"),
+             "Export invoices"),
+            ("update --set title", self.rename("Task name", "Name"), ("update", PAGE, "--set", "title=Export bills"),
+             '"Name": "Export bills"'),
+            ("create --set title", self.rename("Task name", "Name"), ("create", "--parent", coll, "--set", "title=A card"),
+             "created https://www.notion.so/A-card-"),
+        ]
+        for name, change, command, said in sites:
+            with self.subTest(name):
+                self.cached_before(change)
+                code, out, err = self.run_cli(*command)
+                self.assertEqual(code, 0, out + err)
+                self.assertIn(said, out)
+                self.assertEqual(err, "")
+                self.assertLessEqual(self.statuses.count(400), 1)
+                self.assertLessEqual(len(self.fake.sent("GET", r"/v1/data_sources/[^/]+")), 2)
+                if command[0] == "create":
+                    self.assertEqual(len(self.made()), 1)
+                    continue
+                self.fake.calls.clear()
+                self.statuses.clear()
+                code, again, err = self.run_cli(*command)  # the cache was brought up to date: nothing is refused
+                self.assertEqual(code, 0, again + err)
+                self.assertNotIn(400, self.statuses)
+
+    def test_a_property_or_option_still_unknown_after_the_fresh_read_is_refused_as_any_unknown_one(self):
+        # The user named what the schema no longer has: exit 2, the message an unknown name gets, nothing written.
+        coll = COLLECTION + DS_TASKS
+        renamed = self.rename("Notes", "Notes log")
+        asked = "unknown property 'Notes' in the condition; did you mean Notes log?"
+        written = "no property 'Notes' here; did you mean Notes log?"
+        lacks = ("query", coll, "--select", "Task name,Notes")
+        sites = [
+            ("query --where", renamed, ("query", coll, "--where", "Notes contains 'x'"), asked),
+            ("query --order", renamed, ("query", coll, "--order", "Notes desc"), asked),
+            ("query --select", renamed, lacks, asked),
+            ("query --select --json", renamed, lacks + ("--json",), asked),
+            ("query --group-by", renamed, ("query", coll, "--group-by", "Notes"), asked),
+            ("query --where and --select", renamed, ("query", coll, "--where", "Notes contains 'x'", "--select", "Tags"), asked),
+            ("update --set", renamed, ("update", PAGE, "--set", "Notes=x"), written),
+            ("update --set and a body", renamed, ("update", PAGE, "--set", "Notes=x", "--append-file", self.body_file("More")),
+             written),
+            ("update --set a date", self.rename("Done at", "Done on"), ("update", PAGE, "--set", "date:Done at:start=2026-11-23"),
+             "no property 'Done at' here; did you mean Done on"),
+            ("create under a collection", renamed, ("create", "--parent", coll, "--set", "title=A", "--set", "Notes=x"), written),
+            ("create under a title", renamed, ("create", "--parent", "Tasks", "--set", "title=A", "--set", "Notes=x"), written),
+            ("create --pages-file, its first page", renamed,
+             ("create", "--parent", coll, "--pages-file", self.pages_file({"title": "A", "Notes": "x"}, {"title": "B"})),
+             "page 1 of 2: " + written),
+            ("update --set an option that is gone", self.rename_option("Done", "Shipped"),
+             ("update", PAGE, "--set", "Status=Done"),
+             "unknown option 'Done' for the status property Status; options: Not started, In progress, Rollout, Shipped"),
+            ("create --set an option that is gone", self.rename_option("Done", "Shipped"),
+             ("create", "--parent", coll, "--set", "title=A", "--set", "Status=Done"),
+             "unknown option 'Done' for the status property Status"),
+        ]
+        for name, change, command, said in sites:
+            with self.subTest(name):
+                self.cached_before(change)
+                before = json.dumps(self.fake.pages)
+                code, out, err = self.run_cli(*command)
+                self.assertEqual((code, out), (2, ""), out + err)
+                self.assertIn(said, err)
+                self.assertNotIn("KeyError", err)
+                self.assertNotIn("In doubt", err)
+                self.assertEqual(json.dumps(self.fake.pages), before)  # nothing was written
+                self.assertLessEqual(len(self.writes()), 1)  # the one Notion refused, never sent again
+                self.assertEqual(len(self.schema_reads()), 1)
+        with self.subTest("create --pages-file, after a page landed"):
+            self.cached_before(renamed)
+            pages = self.pages_file({"title": "A"}, {"title": "B", "Notes": "x"}, {"title": "C"})
+            code, out, err = self.run_cli("create", "--parent", coll, "--pages-file", pages)
+            self.assertEqual(code, 4, out + err)
+            self.assertEqual(len(self.made()), 1)
+            for said in ("created 1 of 3", written, "Not created: 'B'", "Notion refused it", "not sent: 'C'"):
+                self.assertIn(said, err)
+
+    def test_a_property_or_option_added_after_the_cache_is_written_at_once(self):
+        coll = COLLECTION + DS_TASKS
+        parents = {"a title": "Tasks", "the collection form": coll, "a bare id": DS_TASKS, "a database id": DB_TASKS}
+        for name, parent in parents.items():
+            with self.subTest(create_under=name):
+                self.cached_before(self.add_priority)
+                code, out, err = self.run_cli("create", "--parent", parent, "--set", "title=A card", "--set", "Priority=High")
+                self.assertEqual(code, 0, out + err)
+                self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+                self.assertEqual(self.made()[0]["properties"]["Priority"]["select"]["name"], "High")
+                self.assertEqual(self.made()[0]["properties"]["Task name"]["title"][0]["plain_text"], "A card")
+        for place in (0, 1, 2):  # whichever page of the file first names it
+            with self.subTest("create --pages-file", page=place + 1):
+                self.cached_before(self.add_priority)
+                pages = [{"title": f"Card {i}"} for i in range(3)]
+                pages[place]["Priority"] = "High"
+                code, out, err = self.run_cli("create", "--parent", coll, "--pages-file", self.pages_file(*pages))
+                self.assertEqual(code, 0, out + err)
+                self.assertEqual([self.fake.title_of(p) for p in self.made()], ["Card 0", "Card 1", "Card 2"])
+        with self.subTest("update"):
+            self.cached_before(self.add_priority)
+            code, out, err = self.run_cli("update", PAGE, "--set", "Priority=High")
+            self.assertEqual(code, 0, out + err)
+            self.assertIn('"Priority": "High"', out)
+        with self.subTest("an added option"):
+            self.cached_before(self.rename_option("Done", "Shipped"))
+            code, out, err = self.run_cli("update", PAGE, "--set", "Status=Shipped")
+            self.assertEqual(code, 0, out + err)
+            self.assertEqual(len(self.schema_reads()), 1)
+
+    def test_a_later_page_of_a_file_is_built_again_after_the_schema_was_read_for_an_earlier_one(self):
+        # The title is renamed and a property added: page 2 makes the client read the schema, page 1 was built before.
+        def change():
+            self.rename("Task name", "Name")()
+            self.add_priority()
+
+        self.cached_before(change)
+        pages = self.pages_file({"title": "One"}, {"title": "Two", "Priority": "High"})
+        code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--pages-file", pages)
+        self.assertEqual(code, 0, out + err)
+        self.assertEqual([self.fake.title_of(p) for p in self.made()], ["One", "Two"])
+
+    def test_a_refusal_that_a_fresh_schema_does_not_explain_stands(self):
+        refusal = lambda r: error(400, "validation_error", "The body is too long.")
+        broken = lambda r: error(500, "internal_server_error", "Broken.")
+        sites = [
+            ("update", ("PATCH", r"/v1/pages/[^/]+"), ("update", PAGE, "--set", "Notes=x")),
+            ("create", ("POST", r"/v1/pages"), ("create", "--parent", COLLECTION + DS_TASKS, "--set", "title=A")),
+            ("query", ("POST", r"/v1/data_sources/[^/]+/query"), ("query", COLLECTION + DS_TASKS, "--where", "Notes = 'x'")),
+            ("search", ("POST", r"/v1/data_sources/[^/]+/query"), ("search", "invoice")),
+        ]
+        for name, endpoint, command in sites:
+            for reread in ("the schema reads the same", "the schema cannot be read again"):
+                with self.subTest(site=name, reread=reread):
+                    self.cached_before(lambda: None)
+                    self.fake.on(*endpoint, refusal)
+                    if reread == "the schema cannot be read again":
+                        self.fake.on("GET", r"/v1/data_sources/[^/]+", broken)
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual(code, 2, out + err)
+                    self.assertIn("The body is too long.", err)
+                    self.assertEqual(self.statuses.count(400), 1)
+
+    def test_only_the_write_is_sent_again_never_after_it_landed(self):
+        # The property lands, and the read that prints it back is answered 400 over a schema that now builds the
+        # write differently: the write is not sent a second time.
+        self.cached_before(self.rename("Project", "PROJECT"))  # --set resolves it in any case, to another payload
+        related = [uid(0x40000 + i) for i in range(26)]
+        self.page["properties"]["Project"] = {"id": "pj", "type": "relation", "relation": [], "has_more": False}
+
+        def lands(r):
+            return 200, dict(self.page, properties={"Project": {"id": "pj", "type": "relation", "has_more": True,
+                                                                "relation": [{"id": i} for i in related[:25]]}})
+
+        self.fake.on("PATCH", r"/v1/pages/[^/]+", lands)
+        self.fake.on("GET", r"/v1/pages/[^/]+/properties/pj", lambda r: error(400, "validation_error", "No such property."))
+        code, out, err = self.run_cli("update", PAGE, "--set", "Project=" + page_url(PROJECT))
+        self.assertEqual(len(self.fake.sent("PATCH", r"/v1/pages/[^/]+")), 1, out + err)
+        self.assertNotEqual(code, 0, out)
+
+    def test_a_check_that_fails_for_another_reason_leaves_the_refusal_as_it_was(self):
+        # A 403 or 404 is checked against the schema; when that read fails some other way, the refusal is what is said.
+        coll = COLLECTION + DS_TASKS
+        sites = {"query": ("query", coll), "search --in": ("search", "invoice", "--in", coll),
+                 "create": ("create", "--parent", coll, "--set", "title=A")}
+        for name, command in sites.items():
+            for broken in (500, 429):
+                with self.subTest(command=name, the_check_gets=broken):
+                    self.cached_before(lambda: None)
+                    refusal = lambda r: error(403, "restricted_resource", "Not shared with it.")
+                    self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", refusal)
+                    self.fake.on("POST", r"/v1/pages", refusal)
+                    self.fake.on("GET", rf"/v1/data_sources/{DS_TASKS}",
+                                 lambda r, broken=broken: error(broken, "unavailable", "Try later."))
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual(code, 1, out + err)
+                    self.assertIn("Notion answered 403 restricted_resource", err)
+                    self.assertIn("Not shared with it.", err)
+                    self.assertNotIn("Try later.", err)
+
+    def test_the_duplicate_search_and_the_write_check_read_a_renamed_title_again(self):
+        with self.subTest("the search after a create in doubt"):
+            self.cached_before(self.rename("Task name", "Name"))
+            self.fake.on("POST", r"/v1/pages", lambda r: error(503, "service_unavailable", "Down."))
+            code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--set", "Notes=x", "--set", "title=A")
+            self.assertEqual(code, 1, out + err)
+            self.assertIn("In doubt", err)
+            self.assertNotIn("could not be looked for", err)
+        with self.subTest("doctor --write-check"):
+            self.cached_before(self.rename("Task name", "Name"))
+            self.fake.on("POST", r"/v1/search", lambda r: (200, {"object": "list", "results": [], "has_more": False,
+                                                                 "next_cursor": None}))
+            code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS, "--marker", "TEST MARK")
+            self.assertIn("write check create: ok", out, err)
+            self.assertNotIn(400, self.statuses)
 
     def test_query_rereads_the_schema_once_for_a_name_the_cache_lacks(self):
         flags = {"--where": "Priority = 'High'", "--select": "Task name,Priority", "--order": "Priority desc",
@@ -2403,20 +5266,164 @@ class StaleCacheTest(ClientTestCase):
         self.assertIn("'Nowhere' is not a page id, a url, a key or the title of a connected data source", err)
         self.assertEqual(len(self.list_reads()), 1)
 
+    def refuses(self, status, method, pattern):
+        said = {403: ("restricted_resource", "Not shared with it."), 404: ("object_not_found", "Could not find data source.")}
+        self.fake.on(method, pattern, lambda r: error(status, *said[status]))
+        return said[status][1]
+
+    def reconnect(self):
+        self.fake.data_sources[DS_PROJECTS] = data_source(DS_PROJECTS, "Projects", projects_schema(), DB_PROJECTS)
+        self.fake.overrides.clear()
+        self.warm()
+
     def test_search_skips_a_data_source_no_longer_connected_after_one_list_refresh(self):
-        gone = {"404": lambda: self.fake.data_sources.pop(DS_PROJECTS),
-                "403": lambda: self.fake.on("POST", rf"/v1/data_sources/{DS_PROJECTS}/query",
-                                            lambda r: error(403, "restricted_resource", "Not shared."))}
-        for status, disconnect in gone.items():
+        for status in (403, 404):
             with self.subTest(status=status):
-                self.fake.data_sources[DS_PROJECTS] = data_source(DS_PROJECTS, "Projects", projects_schema(), DB_PROJECTS)
-                self.fake.overrides.clear()
-                self.warm()
-                disconnect()
+                self.reconnect()
+                del self.fake.data_sources[DS_PROJECTS]
+                self.refuses(status, "POST", rf"/v1/data_sources/{DS_PROJECTS}/query")
                 code, out, err = self.run_cli("search", "invoice")
                 self.assertEqual(code, 0, err)
                 self.assertIn(self.page["url"], out)
                 self.assertEqual(len(self.list_reads()), 1)
+                self.assertEqual(err.strip(), f"note: data source {DS_PROJECTS} is no longer connected (the list of data "
+                                              "sources, read again, does not hold it), so it was not searched")
+
+    def test_a_data_source_that_refuses_is_never_hidden_and_one_that_is_gone_is_said(self):
+        # Every place that asks a data source of the cached list, for both refusals: still listed, the command
+        # exits 1 with the API's message; gone from the list read again, it is skipped with a note.
+        query = ("POST", rf"/v1/data_sources/{DS_PROJECTS}/query")
+        schema = ("GET", rf"/v1/data_sources/{DS_PROJECTS}")
+        project = "PRJ" + "-5"
+
+        def forget_schema():
+            (self.home / ".cache" / "cdv-notion" / f"schema-{DS_PROJECTS}.json").unlink()
+
+        def forget_all():
+            shutil.rmtree(self.home / ".cache")
+
+        # call site: (the endpoint that refuses, what the cache lacks, the command, exit code and words once gone)
+        sites = {
+            "search, the rows": (query, None, ("search", "invoice"), 0, self.page["url"]),
+            "search, the schema": (schema, forget_schema, ("search", "invoice"), 0, self.page["url"]),
+            "search by key, the lookup": (query, None, ("search", project), 0, f"no hit for '{project}'"),
+            "fetch by key": (query, None, ("fetch", project), 2, "no connected data source has the key prefix PRJ"),
+            "update, a relation by key": (query, None, ("update", PAGE, "--set", f"Project={project}"), 2,
+                                          "no connected data source has the key prefix PRJ"),
+            "query --where, a relation by key": (query, None, ("query", "Tasks", "--where", f"Project has {project}"), 2,
+                                                 "no connected data source has the key prefix PRJ"),
+        }
+        for name, (endpoint, forget, command, code_gone, said_gone) in sites.items():
+            for status in (403, 404):
+                for listed in (True, False):
+                    with self.subTest(site=name, status=status, still_listed=listed):
+                        self.reconnect()
+                        self.run_cli("fetch", project)  # the list and both schemas are cached
+                        if forget:
+                            forget()
+                        self.fake.calls.clear()
+                        message = self.refuses(status, *endpoint)
+                        if not listed:
+                            del self.fake.data_sources[DS_PROJECTS]
+                        code, out, err = self.run_cli(*command)
+                        self.assertLessEqual(len(self.list_reads()), 1)
+                        if listed:
+                            self.assertEqual(code, 1, out + err)
+                            self.assertIn(f"Notion answered {status}", err)
+                            self.assertIn(message, err)
+                            self.assertNotIn("no hit", out)
+                            self.assertNotIn("not searched", err)
+                        else:
+                            self.assertEqual(code, code_gone, out + err)
+                            self.assertIn(said_gone, out + err)
+                            self.assertEqual(err.count(f"note: data source {DS_PROJECTS} is no longer connected"), 1, err)
+                        self.assertEqual(self.writes(), [])
+        for status in (403, 404):  # with no cache the list is read in the command itself, and still hides nothing
+            with self.subTest(site="search, nothing cached", status=status):
+                self.reconnect()
+                forget_all()
+                message = self.refuses(status, *query)
+                code, out, err = self.run_cli("search", "invoice")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(message, err)
+            with self.subTest(site="search --in", status=status):
+                self.reconnect()
+                self.run_cli("fetch", project)
+                message = self.refuses(status, *query)
+                code, out, err = self.run_cli("search", "invoice", "--in", COLLECTION + DS_PROJECTS)
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(message, err)
+
+    def test_a_cached_data_source_that_is_gone_keeps_the_advice_to_connect_it(self):
+        # Every command that is pointed at a data source, with its schema cached or not: the same answer, which
+        # says the integration is not connected and how to connect it.
+        body = self.tmp / "body.md"
+        body.write_text("More")
+        coll = COLLECTION + DS_TASKS
+        sites = {
+            "fetch, the collection form": ("fetch", coll),
+            "fetch, the title": ("fetch", "Tasks"),
+            "fetch, the bare id": ("fetch", DS_TASKS),
+            "query": ("query", coll),
+            "query by title": ("query", "Tasks"),
+            "query --where": ("query", coll, "--where", "Status = 'Done'"),
+            "query --where, a name the cache lacks": ("query", coll, "--where", "Sprint = 'x'"),
+            "query --select, a name the cache lacks": ("query", coll, "--select", "Sprint"),
+            "search --in": ("search", "invoice", "--in", coll),
+            "create": ("create", "--parent", coll, "--set", "title=A"),
+            "create, a name the cache lacks": ("create", "--parent", coll, "--set", "title=A", "--set", "Sprint=x"),
+            "update --set": ("update", PAGE, "--set", "Notes=x"),
+            "update --set, a name the cache lacks": ("update", PAGE, "--set", "Sprint=x", "--append-file", str(body)),
+            "update --set, an option the cache lacks": ("update", PAGE, "--set", "Status=Shipped"),
+        }
+        said = {403: ("restricted_resource", "Not shared with it."), 404: ("object_not_found", "Could not find data source.")}
+        for status, (code_said, words) in said.items():
+            advice = (f"Notion answered {status} {code_said} for {DS_TASKS}: the integration is not connected to that page "
+                      "or its parent, or it lacks the capability. Open the page in Notion, menu > Connections")
+
+            def refuse(r, status=status, answer=(code_said, words)):
+                return error(status, *answer)
+
+            for name, command in sites.items():
+                for cached in (True, False):
+                    if not cached and ("title" in name or name.startswith("update")):
+                        continue  # nothing cached: the title is unknown; an update meets the data source only as a schema
+                    with self.subTest(command=name, status=status, cached=cached):
+                        self.cached_before(lambda: None)
+                        if not cached:
+                            shutil.rmtree(self.home / ".cache")
+                        del self.fake.data_sources[DS_TASKS]
+                        self.fake.on("GET", rf"/v1/data_sources/{DS_TASKS}", refuse)
+                        self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", refuse)
+                        self.fake.on("POST", r"/v1/pages", refuse)
+                        if name.startswith("update") and "lacks" not in name:
+                            (self.home / ".cache" / "cdv-notion" / f"schema-{DS_TASKS}.json").unlink()
+                        code, out, err = self.run_cli(*command)
+                        self.assertEqual(code, 1, out + err)
+                        self.assertIn(advice, err)
+
+    def test_a_key_lookup_that_fails_is_never_taken_for_no_hit(self):
+        # search looks a key up first; only "no such key" lets it go on without that hit.
+        def lost(r):
+            raise TimeoutError("timed out")
+
+        failures = {"500": lambda r: error(500, "internal_server_error", "Broken."),
+                    "429": lambda r: error(429, "rate_limited", "Slow down."), "timeout": lost,
+                    "400": lambda r: error(400, "validation_error", "Bad filter.")}
+        for name, failure in failures.items():
+            with self.subTest(failure=name):
+                self.fake.overrides.clear()
+                self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query",
+                             lambda r, failure=failure: failure(r) if "unique_id" in json.dumps(r.json) else None)
+                code, out, err = self.run_cli("search", key(120))
+                self.assertEqual(code, 2 if name == "400" else 1, out + err)
+                self.assertNotIn("no hit", out)
+        self.fake.overrides.clear()
+        for words in (key(999999), "XYZ" + "-1"):  # no page has the key; no data source has the prefix
+            with self.subTest(words=words):
+                code, out, err = self.run_cli("search", words)
+                self.assertEqual((code, err), (0, ""))
+                self.assertIn(f"no hit for '{words}'", out)
 
 
 class ApiTest(ClientTestCase):
@@ -2427,6 +5434,16 @@ class ApiTest(ClientTestCase):
                 self.assertEqual(code, 2)
                 self.assertIn("/v1/", err)
         self.assertEqual(self.fake.calls, [])
+
+    def test_api_head_is_a_read(self):
+        for body in (b"", b"not json"):
+            self.fake.on("HEAD", rf"/v1/pages/{PAGE}", lambda r, body=body: (200, body))
+            code, out, err = self.run_cli("api", "HEAD", f"/v1/pages/{PAGE}")
+            self.assertEqual((code, err), (0, ""))
+        self.fake.on("HEAD", rf"/v1/pages/{PAGE}", lambda r: (503, b""))
+        code, out, err = self.run_cli("api", "HEAD", f"/v1/pages/{PAGE}")
+        self.assertEqual((code, self.sleeps), (1, [1, 2]), err)
+        self.assertNotIn("in doubt", err)
 
     def test_api_exit_codes(self):
         code, out, err = self.run_cli("api", "GET", f"/v1/pages/{PAGE}")
@@ -2484,6 +5501,12 @@ class SkillTextTest(unittest.TestCase):
             with self.subTest(topic=topic):
                 self.assertIn(topic, api_limits)
         self.assertIn("instead", api_limits)
+
+    def test_a_date_without_a_time_is_said_to_be_a_utc_day(self):
+        properties = (SKILL_DIR / "references" / "properties-and-filters.md").read_text(encoding="utf-8")
+        self.assertRegex(properties, r"A date with no time is the whole day \*\*in UTC\*\*")
+        self.assertRegex(properties, r"created >= 2026-11-03T00:00:00-03:00 AND created < 2026-11-04T00:00:00-03:00")
+        self.assertRegex(" ".join(load_client().__doc__.split()), r"date with no time in --where .* is the whole day in UTC")
 
     def test_changelog_and_catalog_list_cdv_notion(self):
         changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
