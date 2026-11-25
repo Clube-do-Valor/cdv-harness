@@ -88,7 +88,7 @@ Assignee has me
 ## Order, columns, counts
 
 - `--order 'Prop desc'` (several with commas; `created desc` sorts by creation time). Without an order Notion guarantees none.
-- `--select 'Status,Assignee'` prints only those columns, plus the url.
+- `--select 'Status,Assignee'` prints only those columns, plus the url. It takes the special names of `--where` too (`created`, `edited`, `id`, `title`, with the same spelling and the same rule that a property of that name wins); `created` and `edited` print the page's own created and last edited time, under the column name `created_time` and `last_edited_time`, in the plain output and in `--json`.
 - `--count` prints the number of matching rows; `--group-by Prop` prints one line per value with its count, largest first (a multi-select counts each option).
 - At most 50 rows are printed unless `--limit N`, with a line saying how many more matched; paging stops at 2,000 rows (`--max-rows N`). Anything the condition cannot express is computed from `--json` in the shell.
 - With `--json`, stdout is one JSON document and nothing else: the rows (a list), the number with `--count`, or an object of value to count with `--group-by`. The notes (more rows matched, paging stopped, no row matched) go to stderr.

@@ -2088,6 +2088,14 @@ def cell(value):
     return match.group(1) if match else text.replace('\n', ' ').replace('|', '\\|')
 
 
+def row_values(client, row, columns, facts):
+    """A row's values for the selected columns: its properties, and for a built-in column (`facts`) the page's own value."""
+    values = client.short_values(row, names=set(columns) if columns else None)
+    for name in facts:
+        values[name] = row.get(name)
+    return values
+
+
 def cmd_query(client, args):
     kind, schema = client.resolve(args.ref, want='data_source')
     if kind != 'data_source':
@@ -2097,10 +2105,15 @@ def cmd_query(client, args):
         body['filter'] = compile_where(client, args.where, schema)
     if args.order:
         body['sorts'] = parse_order(schema, args.order, client)
-    columns = None
+    columns, facts = None, set()
     if args.select:
-        columns = [where_property(schema, c.strip().strip('"`'), client)[0] for c in args.select.split(',') if c.strip()]
-    group = where_property(schema, args.group_by, client)[0] if args.group_by else None
+        columns = []
+        for wanted in (c.strip().strip('"`') for c in args.select.split(',') if c.strip()):
+            name, prop = where_property(schema, wanted, client)
+            columns.append(name)
+            if prop.get('type') == 'timestamp':  # a page's own fact (created, edited), when no property has the name
+                facts.add(name)
+    group =where_property(schema, args.group_by, client)[0] if args.group_by else None
     max_rows = args.max_rows or MAX_ROWS
     rows, more = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query", body, max_items=max_rows)
     stopped = f'stopped paging at {max_rows} rows; more rows match (--max-rows N raises the cap)' if more else ''
@@ -2133,7 +2146,7 @@ def cmd_query(client, args):
     shown = rows[:limit]
     if args.json:
         client.emit([{'id': r['id'], 'url': r.get('url'), 'key': client.key_of(r) or None,
-                      'properties': client.short_values(r, names=set(columns) if columns else None)} for r in shown])
+                      'properties': row_values(client, r, columns, facts)} for r in shown])
     else:
         if columns is None:
             props = schema['properties']
@@ -2142,7 +2155,7 @@ def cmd_query(client, args):
             columns += [n for n, p in props.items() if p.get('type') == 'status'][:1]
         client.say(' | '.join(columns + ['url']))
         for row in shown:
-            values = client.short_values(row, names=set(columns))
+            values = row_values(client, row, columns, facts)
             cells = []
             for name in columns:
                 if name in values:

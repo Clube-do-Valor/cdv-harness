@@ -1942,6 +1942,43 @@ class QueryTest(ClientTestCase):
         sent = self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query")[-1].json
         self.assertEqual(sent["sorts"], [{"timestamp": "created_time", "direction": "descending"}])
 
+    def test_select_takes_every_name_where_and_order_take(self):
+        # Every built-in name --where and --order accept is a --select column too and prints the page's own value.
+        self.page["last_edited_time"] = "2026-11-21T08:15:00.000Z"
+        made, edited = self.page["created_time"], self.page["last_edited_time"]
+        table = [("created", "created_time", made), ("Created", "created_time", made),
+                 ("created_time", "created_time", made), ("edited", "last_edited_time", edited),
+                 ("last_edited", "last_edited_time", edited), ("last_edited_time", "last_edited_time", edited),
+                 ("updated", "last_edited_time", edited), ("Updated", "last_edited_time", edited),
+                 ("id", "Task ID", key(120)), ("key", "Task ID", key(120)),
+                 ("title", "Task name", "Export invoices"), ("name", "Task name", "Export invoices")]
+        for wanted, label, value in table:
+            with self.subTest(select=wanted):
+                if label.endswith("_time"):  # --where and --order take it, so --select does
+                    code, out, err = self.run_cli("query", "Tasks", "--where", f"{wanted} >= 2026-01-01", "--order", f"{wanted} desc")
+                    self.assertEqual(code, 0, err)
+                code, out, err = self.run_cli("query", "Tasks", "--select", wanted)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out.splitlines()[:2], [f"{label} | url", f"{value} | {self.page['url']}"])
+                code, out, err = self.run_cli("query", "Tasks", "--select", wanted, "--json")
+                self.assertEqual(code, 0, err)
+                self.assertEqual(json.loads(out)[0]["properties"], {label: value})
+
+    def test_select_prefers_a_property_of_the_same_name_as_where_does(self):
+        self.page["last_edited_time"] = "2026-11-21T08:15:00.000Z"
+        self.fake.data_sources[DS_TASKS]["properties"]["Updated"] = {"id": "up", "name": "Updated", "type": "rich_text", "rich_text": {}}
+        self.page["properties"]["Updated"] = {"id": "up", "type": "rich_text", "rich_text": text("by hand")}
+        for wanted in ("updated", "Updated"):
+            with self.subTest(select=wanted):
+                code, out, err = self.run_cli("query", "Tasks", "--select", wanted)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(out.splitlines()[:2], ["Updated | url", f"by hand | {self.page['url']}"])
+                code, out, err = self.run_cli("query", "Tasks", "--where", f"{wanted} contains hand")
+                self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query")[-1].json["filter"],
+                                 {"property": "Updated", "rich_text": {"contains": "hand"}})
+        code, out, err = self.run_cli("query", "Tasks", "--select", "edited")  # no property of that name: the page's value
+        self.assertEqual(out.splitlines()[:2], ["last_edited_time | url", f"2026-11-21T08:15:00.000Z | {self.page['url']}"])
+
 
 class JsonOutputTest(ClientTestCase):
     def test_json_stdout_is_one_document_for_every_verb_that_takes_json(self):
