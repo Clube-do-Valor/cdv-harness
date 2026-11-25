@@ -852,8 +852,9 @@ class Notion:
             raise self.write_failed(path, status, parsed)
         raise ApiError(status, parsed.get('code', ''), parsed.get('message', ''), parsed, path)
 
-    def pages_of(self, method, path, body=None, query=None, max_items=None):
-        """Every item of a paged list, following next_cursor. Returns (items, more_left)."""
+    def pages_of(self, method, path, body=None, query=None, max_items=None, whole=False):
+        """Every item of a paged list, following next_cursor. Returns (items, more_left): more_left when there are
+        more than `max_items`. Paging stops once it has them; `whole` also returns what came past that number."""
         items, cursor = [], None
         while True:
             if method == 'GET':
@@ -869,7 +870,7 @@ class Notion:
             items += answer.get('results', [])
             more = bool(answer.get('has_more') and answer.get('next_cursor'))
             if max_items is not None and len(items) >= max_items:
-                return items[:max_items], more or len(items) > max_items
+                return items if whole else items[:max_items], more or len(items) > max_items
             if not more:
                 return items, False
             cursor = answer['next_cursor']
@@ -2662,7 +2663,9 @@ def cmd_search(client, args):
     if not words:
         raise Fail(USAGE, 'search for what? `notion search <words>`')
     limit = args.limit or 10
-    hits, capped = {}, False  # capped: a source had more rows than --limit, so the count of hits is a lower bound
+    # capped: a source had more rows than --limit, so the count of hits is a lower bound. Every row a source's
+    # answer held is a hit, those past --limit too: they are counted, and only the first --limit are printed.
+    hits, capped = {}, False
 
     def add(page, matched):
         if page['id'] not in hits and not page.get('in_trash'):
@@ -2689,7 +2692,7 @@ def cmd_search(client, args):
             queue = [scope['id']]
         else:
             found, more = client.pages_of('POST', '/v1/search', {'query': words, 'filter': {'property': 'object', 'value': 'page'}},
-                                          max_items=limit)
+                                          max_items=limit, whole=True)
             capped = capped or more
             for page in found:
                 if page.get('object') == 'page':  # the API also returns titles that only resemble the words
@@ -2709,7 +2712,7 @@ def cmd_search(client, args):
                     continue
                 rows, more = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query",
                                              {'filter': {'or': conditions} if len(conditions) > 1 else conditions[0]},
-                                             max_items=limit)
+                                             max_items=limit, whole=True)
                 capped = capped or more
             except ApiError as failure:
                 # only a data source of the cached list that is gone is skipped; the one named by --in never is
@@ -2726,7 +2729,6 @@ def cmd_search(client, args):
                     add(row, matched)
     if not hits:
         client.say(f'no hit for {words!r}')
-        return DONE
     for page, matched in list(hits.values())[:limit]:
         parent = page.get('parent', {})
         if parent.get('type') == 'data_source_id':
@@ -2738,6 +2740,8 @@ def cmd_search(client, args):
         client.say(' | '.join(filter(None, [key, title, page.get('url', ''), where, f'matched: {matched}'])))
     if len(hits) > limit:
         client.say(f"… {'at least ' if capped else ''}{len(hits) - limit} more hits (--limit N shows them)")
+    elif capped:  # the rows not read may be hits already counted, or none: only "at least 0" is sure
+        client.say('… at least 0 more hits: a source was cut short, so more may match (a higher --limit reads further)')
     return DONE
 
 

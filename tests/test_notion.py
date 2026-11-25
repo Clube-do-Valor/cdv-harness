@@ -2457,7 +2457,72 @@ class SearchTest(ClientTestCase):
                 cut()
                 code, out, err = self.run_cli("search", "invoice", "--limit", "2")
                 self.assertEqual(code, 0, err)
-                self.assertIn("… at least 1 more hits (--limit N shows them)", out.splitlines())
+                # four distinct pages were received: the page, the noted one, the glossary and the third
+                self.assertIn("… at least 2 more hits (--limit N shows them)", out.splitlines())
+
+    def test_a_search_that_cut_a_source_short_says_so_whatever_the_count_of_hits(self):
+        """Over every source (the title search, each data source, --in), with the merged hits above, at and below
+        --limit: a search that did not print or read everything says so, and one that did says nothing."""
+        within = ("search", "invoice", "--in", COLLECTION + DS_TASKS)
+        merged = ("search", "invoice")
+        silent = None
+        unsure = "… at least 0 more hits: a source was cut short, so more may match (a higher --limit reads further)"
+        invoices = [task_page(uid(0x30000 + i), 4000 + i, f"Invoice {i}") for i in range(130)]
+        trashed = [dict(row, in_trash=True) for row in invoices]
+
+        def of(rows, more=False):
+            return {"object": "list", "results": rows, "has_more": more, "next_cursor": "next" if more else None}
+
+        def sources(tasks=(), titles=(), tasks_more=False, titles_more=False):
+            def rows(r):
+                return 200, of(list(tasks), tasks_more) if r.path.split("/")[3] == DS_TASKS else of([])
+            self.fake.on("POST", r"/v1/data_sources/([^/]+)/query", rows)
+            self.fake.on("POST", r"/v1/search", lambda r: (200, of(list(titles), titles_more))
+                         if (r.json or {}).get("query") else None)
+
+        table = [
+            # what the sources hold, the command, hits printed, the line after them
+            ("--in, more rows than --limit", dict(tasks=invoices[:31]), within, 10,
+             "… at least 21 more hits (--limit N shows them)"),
+            ("one data source, more rows than --limit", dict(tasks=invoices[:31]), merged, 10,
+             "… at least 21 more hits (--limit N shows them)"),
+            ("title hits and row hits are the same pages", dict(tasks=invoices[:31], titles=invoices[:31]), merged, 10,
+             "… at least 21 more hits (--limit N shows them)"),
+            ("only the title search has more than --limit", dict(titles=invoices[:31]), merged, 10,
+             "… at least 21 more hits (--limit N shows them)"),
+            ("--in, a source with more pages and one page twice", dict(tasks=invoices[:2] * 2, tasks_more=True),
+             within + ("--limit", "3"), 2, unsure),
+            ("title and rows the same pages, both with more", dict(tasks=invoices[:2], titles=invoices[:2],
+             tasks_more=True, titles_more=True), merged + ("--limit", "3"), 2, unsure),
+            ("only the title search has more pages", dict(titles=invoices[:2], titles_more=True),
+             merged + ("--limit", "3"), 2, unsure),
+            ("a cut source of trashed pages leaves fewer than --limit", dict(tasks=invoices[:2] + trashed[2:12]), within, 2,
+             unsure),
+            ("a cut source of trashed pages leaves no hit", dict(tasks=trashed[:12]), within, 0, unsure),
+            ("as many rows as --limit, and no more", dict(tasks=invoices[:10]), within, 10, silent),
+            ("fewer rows than --limit", dict(tasks=invoices[:3], titles=invoices[:3]), merged, 3, silent),
+            ("nothing at all", dict(), merged, 0, silent),
+        ]
+        for name, held, command, printed, last in table:
+            with self.subTest(name):
+                self.fake.overrides.clear()
+                sources(**held)
+                code, out, err = self.run_cli(*command)
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(len(self.hits(out)), printed, out)
+                self.assertEqual([line for line in out.splitlines() if line.startswith("…")], [last] if last else [], out)
+                self.assertEqual("no hit for 'invoice'" in out, printed == 0, out)
+        self.fake.overrides.clear()
+        for page in invoices:  # the fake pages its rows as the API does: 130 of them, 100 to an answer
+            self.fake.add_page(page)
+        self.fake.on("POST", r"/v1/search", lambda r: (200, of([])) if (r.json or {}).get("query") else None)
+        # 132 rows match: the 130 above and the 2 of the setup
+        for limit, line in (("10", "… at least 90 more hits (--limit N shows them)"),
+                            ("120", "… at least 12 more hits (--limit N shows them)"), ("500", None)):
+            with self.subTest("a data source read page by page", limit=limit):
+                code, out, err = self.run_cli(*within, "--limit", limit)
+                self.assertEqual(code, 0, err)
+                self.assertEqual([found for found in out.splitlines() if found.startswith("…")], [line] if line else [])
 
     def test_search_key_first_and_page_url(self):
         code, out, err = self.run_cli("search", key(121))
