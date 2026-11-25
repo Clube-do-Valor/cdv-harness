@@ -64,6 +64,17 @@ def text(value):
     return [{"type": "text", "text": {"content": value}, "plain_text": value, "annotations": {}, "href": None}]
 
 
+def run(value, url=None, kind="text", **annotations):
+    """One rich text run as the API reads it back: the link in text.link and in href, its formatting beside it."""
+    marks = dict({"bold": False, "italic": False, "strikethrough": False, "underline": False, "code": False,
+                  "color": "default"}, **annotations)
+    if kind != "text":
+        return {"type": kind, kind: {"type": "page", "page": {"id": uid(0x9001)}}, "annotations": marks,
+                "plain_text": value, "href": url}
+    return {"type": "text", "text": {"content": value, "link": {"url": url} if url else None},
+            "annotations": marks, "plain_text": value, "href": url}
+
+
 def person(identifier, name, email=None):
     found = {"object": "user", "id": identifier, "type": "person", "name": name, "avatar_url": None}
     if email:
@@ -477,8 +488,7 @@ class FakeNotion:
     def stored(self, schema_type, written):
         """The read shape Notion answers with, for a write shape the client sent."""
         if schema_type in ("title", "rich_text"):
-            joined = "".join(part["text"]["content"] for part in written[schema_type])
-            return text(joined) if joined else []
+            return [run(part["text"]["content"], (part["text"].get("link") or {}).get("url")) for part in written[schema_type]]
         if schema_type in ("status", "select"):
             value = written[schema_type]
             return None if value is None else {"id": "x", "name": value["name"], "color": "default"}
@@ -923,6 +933,87 @@ class UpdateTest(ClientTestCase):
         self.assertEqual(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json, {"in_trash": True})
         self.assertIn("trashed", out)
         self.assertTrue(self.page["in_trash"])
+
+
+class TextLinksTest(ClientTestCase):
+    """Links inside a title or text property, as the short format reads and writes them."""
+
+    def test_a_linked_run_is_printed_as_markdown_and_everything_else_is_literal(self):
+        runs = [run("See "), run("the docs", "https://example.com/docs"), run(" and [draft] a_b *c* "),
+                run("a ", "https://example.com/x"), run("bold", "https://example.com/x", bold=True), run(" word"),
+                run(" mail "), run("ana@example.com", "mailto:ana@example.com"), run(" in "),
+                run("Glossary", "/p/" + hex32(WIKI)), run(" about "), run("Billing revamp", page_url(PROJECT), kind="mention"),
+                run(" by "), run("wiki", "https://example.com/A_(b) c"), run("plain bold", bold=True)]
+        shown = ("See [the docs](https://example.com/docs) and [draft] a_b *c* [a bold](https://example.com/x) word mail "
+                 "[ana@example.com](mailto:ana@example.com) in [Glossary](" + page_url(WIKI) + ") about Billing revamp by "
+                 "[wiki](https://example.com/A_%28b%29%20c)plain bold")
+        self.page["properties"]["Notes"]["rich_text"] = runs
+        self.page["properties"]["Task name"]["title"] = [run("Export ["), run("invoices", "https://example.com/i"), run("]")]
+        title = "Export [[invoices](https://example.com/i)]"
+        code, out, err = self.run_cli("fetch", PAGE)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.props_of(out)["Notes"], shown)
+        self.assertEqual(self.props_of(out)["Task name"], title)
+        self.assertEqual(out.splitlines()[0], "title: Export [invoices]")
+        code, out, err = self.run_cli("query", "Tasks", "--select", "Task name,Notes")
+        self.assertEqual(out.splitlines()[1], title + " | " + shown + " | " + self.page["url"])
+        code, out, err = self.run_cli("query", "Tasks", "--json")
+        row = json.loads(out)[0]["properties"]
+        self.assertEqual((row["Task name"], row["Notes"]), (title, shown))
+
+    def test_a_value_read_and_written_back_keeps_its_links(self):
+        runs = [run("See "), run("the [old] docs", "https://example.com/docs?a=1&b=(2)"), run(", "),
+                run("ana@example.com", "mailto:ana@example.com"), run(" [draft] (x) "), run("Glossary", "/p/" + hex32(WIKI))]
+        self.page["properties"]["Notes"]["rich_text"] = runs
+        code, out, err = self.run_cli("fetch", PAGE, "--props-only")
+        value = self.props_of(out)["Notes"]
+        code, out, err = self.run_cli("update", PAGE, "--set", "Notes=" + value)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.props_of(out)["Notes"], value)
+        stored = self.page["properties"]["Notes"]["rich_text"]
+        self.assertEqual([(r["plain_text"], r["href"]) for r in stored],
+                         [("See ", None), ("the [old] docs", "https://example.com/docs?a=1&b=(2)"), (", ", None),
+                          ("ana@example.com", "mailto:ana@example.com"), (" [draft] (x) ", None), ("Glossary", page_url(WIKI))])
+
+    def test_a_written_link_becomes_a_linked_run_in_update_create_and_a_pages_file(self):
+        link = {"text": {"content": "docs", "link": {"url": "https://example.com/docs"}}}
+        value = "A [docs](https://example.com/docs), [x] (y) [z](relative) **b**"
+        expected = [{"text": {"content": "A "}}, link, {"text": {"content": ", [x] (y) [z](relative) **b**"}}]
+        code, out, err = self.run_cli("update", PAGE, "--set", "Notes=" + value)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]["Notes"], {"rich_text": expected})
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=" + value)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.sent("POST", r"/v1/pages")[-1].json["properties"]["Task name"], {"title": expected})
+        pages = self.tmp / "pages.json"
+        pages.write_text(json.dumps([{"properties": {"Task name": "One", "Notes": value}}]))
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--pages-file", pages)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.sent("POST", r"/v1/pages")[-1].json["properties"]["Notes"], {"rich_text": expected})
+        long = "a" * 2500
+        code, out, err = self.run_cli("update", PAGE, "--set", f"Notes=[{long}](https://example.com/l)")
+        sent = self.fake.sent("PATCH", rf"/v1/pages/{PAGE}")[-1].json["properties"]["Notes"]["rich_text"]
+        self.assertEqual([(len(r["text"]["content"]), r["text"]["link"]["url"]) for r in sent],
+                         [(2000, "https://example.com/l"), (500, "https://example.com/l")])
+
+    def test_the_client_itself_uses_titles_as_plain_text(self):
+        self.fake.data_sources[DS_PROJECTS]["title"] = [run("Pro"), run("jects", "https://example.com/p")]
+        code, out, err = self.run_cli("fetch", "projects")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(out.splitlines()[0], "data source: Projects")
+
+        def lands_then_503(request):
+            self.fake.create_page(request.json)
+            return error(503, "service_unavailable", "Try later.")
+        self.fake.on("POST", r"/v1/pages", lands_then_503)
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Read [docs](https://example.com/docs)")
+        self.assertEqual(code, 0, err)
+        self.assertIn("found by its title", out)
+        looked = self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query")[-1].json["filter"]["and"][0]
+        self.assertEqual(looked, {"property": "Task name", "title": {"equals": "Read docs"}})
+        self.page["properties"]["Notes"]["rich_text"] = [run("split "), run("needle", "https://example.com/haystack"), run(" here")]
+        code, out, err = self.run_cli("search", "split needle here")
+        self.assertIn(f"{self.page['url']} | Tasks | matched: Notes", out)
 
 
 class CreateTest(ClientTestCase):

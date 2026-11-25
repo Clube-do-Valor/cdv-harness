@@ -8,7 +8,7 @@ The client reads and writes properties in the short format the Notion MCP used, 
 
 | Type | Printed as |
 |---|---|
-| title, text | the plain text |
+| title, text | the text, with each link as `[text](url)` and everything else literal (nothing escaped) |
 | number | the number |
 | select, status | the option name, or `null` |
 | multi-select | `["A", "B"]` |
@@ -27,7 +27,7 @@ A property named `id` or `url` (any case) is printed as `userDefined:<name>`, an
 
 | Type | Write | Example |
 |---|---|---|
-| title, text | the text (split in 2,000-character pieces) | `--set 'Task name=Export invoices'` |
+| title, text | the text (split in 2,000-character pieces); `[text](https://…)` becomes a link (`http`, `https` or `mailto`) | `--set 'Notes=See [the runbook](https://example.com/runbook)'` |
 | number | a number; empty clears | `--set 'Estimate=3'` |
 | select, status | an existing option, any case; empty clears | `--set 'Status=Done'` |
 | multi-select | `a,b` or a JSON array; existing options only | `--set 'Tags=Backend,Helpdesk'` |
@@ -40,6 +40,7 @@ A property named `id` or `url` (any case) is printed as `userDefined:<name>`, an
 | page title (page parent) | `title` | `--set 'title=Approved plan'` |
 
 - `title` (or `name`) also names a data source's title property, whatever it is called.
+- A text value that was read and written back keeps its links. Text that only looks like a link, `[text](https://…)` typed as it is, becomes one; a link whose text holds a lone `[` or `]` is printed but not read back as a link. Bold, italic, code and mentions inside a text property are read as plain text ([api-limits.md](api-limits.md)). The `title:` line of a fetch, and every condition, use the plain text.
 - An unknown property or option exits `2` and lists the nearest names; nothing is written. The schema is re-read once before refusing, so an option created a minute ago is found.
 - A person given by name or e-mail is looked up among the people the API lists and the people seen in rows read. Several matches exit `2` listing each one's name, e-mail and `user://` id, and nothing is sent: pass the id. An exact e-mail or a `user://` id is never ambiguous. The same holds for `has` in `--where`.
 - A list replaces the whole value: to add a tag, write the current tags and the new one.

@@ -356,8 +356,46 @@ def plain(rich):
     return ''.join(part.get('plain_text') or (part.get('text') or {}).get('content', '') for part in rich or [])
 
 
-def rich_text(value):
-    return [{'text': {'content': value[i:i + 2000]}} for i in range(0, len(value), 2000)]
+def rich_text(value, url=None):
+    pieces = [{'content': value[i:i + 2000]} for i in range(0, len(value), 2000)]
+    return [{'text': dict(piece, link={'url': url}) if url else piece} for piece in pieces]
+
+
+# [text](address) in a text value: the address is http, https or mailto, and the text and the address may hold
+# one level of balanced brackets.
+LINK_RE = re.compile(r'\[((?:[^\[\]]|\[[^\[\]]*\])+)\]\(((?:https?://|mailto:)(?:[^\s()]|\([^\s()]*\))+)\)')
+
+
+def linked(rich):
+    """The text of a title or text property with each linked run as [text](url) and everything else literal.
+    Runs of one link (a bold word inside it splits it) are one link; a mention is its plain text. An address
+    inside Notion comes as a path and is printed in full, so that a written value keeps it."""
+    out, last = '', None
+    for part in rich or []:
+        said = part.get('plain_text') or (part.get('text') or {}).get('content', '')
+        url = ((part.get('text') or {}).get('link') or {}).get('url') if part.get('type', 'text') == 'text' else None
+        if url and said:
+            url = urllib.parse.urljoin(PAGE_URL, url)
+            if not LINK_RE.fullmatch(f'[x]({url})'):
+                url = re.sub(r'[\s()]', lambda m: urllib.parse.quote(m.group(), safe=''), url)
+            if last == url:
+                out = out[:-len(f']({url})')] + f'{said}]({url})'
+            else:
+                out += f'[{said}]({url})'
+            last = url
+        else:
+            out += said
+            last = None if said else last
+    return out
+
+
+def linked_text(value):
+    """The reverse of linked(): a value as rich text, each [text](http…) a linked run."""
+    runs, at = [], 0
+    for match in LINK_RE.finditer(value):
+        runs += rich_text(value[at:match.start()]) + rich_text(match.group(1), match.group(2))
+        at = match.end()
+    return runs + rich_text(value[at:])
 
 
 def fold(value):
@@ -922,7 +960,7 @@ class Notion:
     # -- reading values -------------------------------------------------------------------
 
     def short_values(self, page, names=None):
-        """The page's properties in the short format, in the page's order."""
+        """The page's properties in the short format, in the page's order, links in text as [text](url)."""
         values = {}
         for name, prop in page.get('properties', {}).items():
             if names is not None and name not in names:
@@ -936,7 +974,7 @@ class Notion:
         value = prop.get(kind)
         label = f'userDefined:{name}' if name.lower() in ('id', 'url') else name
         if kind in ('title', 'rich_text'):
-            return [(label, plain(value))]
+            return [(label, linked(value))]
         if kind in ('select', 'status'):
             return [(label, value.get('name') if value else None)]
         if kind == 'multi_select':
@@ -1101,7 +1139,7 @@ class Notion:
         kind = prop.get('type')
         empty = value.strip() in ('', 'null', 'none')
         if kind in ('title', 'rich_text'):
-            return {kind: rich_text(value) if value else []}
+            return {kind: linked_text(value)}
         if kind == 'number':
             return {'number': None if empty else number_of(value.strip(), name)}
         if kind in ('select', 'status'):
@@ -2085,8 +2123,9 @@ def cmd_search(client, args):
                     queue = [s['id'] for s in fresh if s['id'] not in searched]
                 continue
             for row in rows:
-                values = client.short_values(row, names=set(searchable) | {n for n, p in props.items() if p.get('type') == 'unique_id'})
-                matched = next((n for n, v in values.items() if isinstance(v, str) and needle in fold(v)), None)
+                # plain text, as the filter matched it: a link's address is not a match and never splits one
+                values = {n: plain(v.get(v.get('type'))) for n, v in row.get('properties', {}).items() if n in searchable}
+                matched = next((n for n in searchable if needle in fold(values.get(n))), None)
                 if matched:
                     add(row, matched)
     if not hits:
