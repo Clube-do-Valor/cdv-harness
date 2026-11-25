@@ -59,9 +59,9 @@ A link in a title or text value (and in a comment, when it is printed) is `[text
 | backslashes right before that `[`, or right before a link | doubled | `C:\\[docs](https://example.com)` is the text `C:\` and a link |
 | the text of a link: a `[` or `]` that is not one balanced pair, and then every `\` too | `\[` `\]` `\\` | `[a \[ b](https://example.com)`, `[C:\\dir](https://example.com)`; `[the [old] docs](https://example.com)` needs nothing |
 | the address of a link: a space, a `\`, and a parenthesis that is not one balanced pair | a backslash before it | `[x](https://example.org/a\)b)`; `[x](https://example.org/wiki/Name_(thing))` needs nothing |
-| an address that does not start with `http://`, `https://`, `mailto:` or `tel:` | between `<` and `>` | `[open](<notion://example/page>)`, `[site](<example.com>)` |
+| an address Notion stores that does not start with `http://`, `https://`, `mailto:` or `tel:` (`scheme://…`, `//host`, a bare domain or e-mail) | between `<` and `>` | `[open](<notion://example/page>)`, `[site](<example.com>)` |
 
-- Any other text is literal: `[draft]`, `[x] (y)`, `[z](relative)`, `[w](ftp://example.com)`, `a \[b\]` and a backslash anywhere else stay as they are, read and written.
+- Any other text is literal: `[draft]`, `[x] (y)`, `[z](relative)`, `[w](ftp://example.com)`, `list[int](<int>)`, `[v](<https://example.com>)` (an `https://` address takes no `<` and `>`), `a \[b\]` and a backslash anywhere else stay as they are, read and written.
 - A link to a page inside Notion is stored as a path and printed in full, `[page](https://app.notion.com/<32 hex>)`; written back it is the path again. A path with a query (`/p/<32 hex>?pvs=…`) is returned by the API and refused when written, so it is written back as the full address of the same page.
 - Notion stores `http`, `https`, `mailto:`, `tel:`, a bare domain or e-mail (`example.com`, `ana@example.com`), `notion:`, and most other schemes when what follows `://` is a domain (`sftp://example.com/a`, `linear://example.com/a`). It refuses (400, nothing changed) `ftp:`, `file:`, `javascript:`, `data:`, `sms:`, an app link with no domain (`slack://channel?id=…`) and any other path or anchor. It rewrites some addresses on its own: a capital scheme or host in lower case, `https://example.com` with a final `/`, a space as `%20`, a backslash as `/`.
 

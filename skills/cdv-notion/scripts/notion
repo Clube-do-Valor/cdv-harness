@@ -481,7 +481,8 @@ def rich_text(value, url=None):
 
 
 # [text](address) in a text value is a link. The address is written as it is when it starts with http://, https://,
-# mailto: or tel:, and between < and > when it is anything else; a path inside Notion (/…) is written in full.
+# mailto: or tel:, and between < and > when it is another one Notion stores (scheme://…, //…, a bare domain or e-mail, the
+# full address of a page); a path inside Notion (/…) is written in full. An address Notion does not store is no link.
 # Inside a link: in the text, a bracket that is not one balanced pair and every backslash are written \[ \] \\ (a
 # backslash before anything else is a backslash); in the address, a parenthesis that is not one balanced pair, a
 # backslash and a space are written \( \) \\ and a backslash and the space. Outside a link: a backslash before the [ of
@@ -490,6 +491,9 @@ def rich_text(value, url=None):
 NOTION_HOST = 'https://app.notion.com'
 RAW_ADDRESS = re.compile(r'https?://|mailto:|tel:')
 INSIDE_NOTION = re.compile(r'/[0-9a-f]{32}(?:#[0-9a-f]{32})?')
+STORED_ADDRESS = re.compile(r'(?:[A-Za-z][A-Za-z0-9+.-]*:)?//\S[\s\S]*|(?:[\w.+%-]+@)?(?:[\w-]+\.)+[^\W\d_]{2,}(?:[:/?#][\s\S]*)?')
+_ESCAPED = re.compile(r'(?:[^\s()\\]|\([^\s()\\]*\)|\\[()\\\s])*')
+ADDRESS_LIMIT = 2000  # characters of an address, the API's limit
 _PLAIN_TEXT = re.compile(r'(?:[^\[\]\\]|\[[^\[\]\\]*\])+')
 _TEXT_ESCAPE = re.compile(r'\\([\\\[\]])')
 _ADDRESS_ESCAPE = re.compile(r'\\([\\()\s])')
@@ -536,8 +540,11 @@ class LinkScan:
     def is_address(self, end, at):
         size = at - end - 1
         head = ''.join(reversed(self.chars[max(end + 1, at - 8):at]))
-        if head[:1] == '<':
-            return size > 2 and self.chars[end + 1] == '>'
+        if head[:1] == '<':  # only what link_address() prints that way: code such as list[int](<int>) is text
+            if self.chars[end + 1] != '>' or size > 2 * ADDRESS_LIMIT + 2:
+                return False
+            written = ''.join(reversed(self.chars[end + 1:at]))
+            return bool(_ESCAPED.fullmatch(written)) and link_address(address_of(written)) == written
         raw = RAW_ADDRESS.match(head)
         return bool(raw) and size > raw.end()
 
@@ -557,7 +564,8 @@ def link_text(said):
 
 
 def link_address(url):
-    """The address of a link as it is written: one level of balanced parentheses as they are, the rest escaped."""
+    """The address of a link as it is written: one level of balanced parentheses as they are, the rest escaped; '' when
+    it is none that Notion stores."""
     path = url.startswith('/') and not url.startswith('//')
     if path:
         url = NOTION_HOST + url
@@ -567,7 +575,7 @@ def link_address(url):
     raw = RAW_ADDRESS.match(url)
     if raw and len(url) > raw.end() and not (url.startswith(NOTION_HOST) and INSIDE_NOTION.fullmatch(url[len(NOTION_HOST):])):
         return said
-    return f'<{said}>'
+    return f'<{said}>' if len(url) <= ADDRESS_LIMIT and STORED_ADDRESS.fullmatch(url) else ''
 
 
 def address_of(written):
@@ -590,10 +598,11 @@ def linked(rich):
         url = ((part.get('text') or {}).get('link') or {}).get('url') if part.get('type', 'text') == 'text' else None
         if not said:
             continue
-        if runs and runs[-1][0] == (url or None):
+        url = url if url and link_address(url) else None
+        if runs and runs[-1][0] == url:
             runs[-1][1] += said
         else:
-            runs.append([url or None, said])
+            runs.append([url, said])
     if len(runs) == 1 and not runs[0][0] and '](' not in runs[0][1]:
         return runs[0][1]
     scan, out, before_link = LinkScan(), [], False
