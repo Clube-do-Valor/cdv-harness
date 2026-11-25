@@ -2113,6 +2113,27 @@ class SearchTest(ClientTestCase):
         self.assertTrue(by_url[self.wiki["url"]].endswith("matched: title"))
         self.assertTrue(by_url[self.noted["url"]].endswith("matched: similar title"))
 
+    def test_search_says_at_least_when_a_source_was_cut_short(self):
+        def tasks_answer(rows, more=False):
+            def answer(r):
+                tasks = r.path.split("/")[3] == DS_TASKS
+                return 200, {"object": "list", "results": rows if tasks else [],
+                             "has_more": more and tasks, "next_cursor": "next" if more and tasks else None}
+            self.fake.on("POST", r"/v1/data_sources/([^/]+)/query", answer)
+
+        code, out, err = self.run_cli("search", "invoice", "--limit", "2")  # every source gave all it has: the count is exact
+        self.assertEqual(code, 0, err)
+        self.assertIn("… 1 more hits (--limit N shows them)", out.splitlines())
+        third = self.fake.add_page(task_page(uid(0x122), 122, "Invoice backlog"))
+        cuts = {"a source answered more rows than --limit": (lambda: tasks_answer([self.page, self.noted, third])),
+                "a source has more pages": (lambda: tasks_answer([self.page, self.noted], more=True))}
+        for name, cut in cuts.items():
+            with self.subTest(name):
+                cut()
+                code, out, err = self.run_cli("search", "invoice", "--limit", "2")
+                self.assertEqual(code, 0, err)
+                self.assertIn("… at least 1 more hits (--limit N shows them)", out.splitlines())
+
     def test_search_key_first_and_page_url(self):
         code, out, err = self.run_cli("search", key(121))
         self.assertEqual(code, 0, err)
