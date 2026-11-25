@@ -4046,6 +4046,59 @@ class CacheTest(ClientTestCase):
         self.assertTrue(cache.is_dir())
 
 
+class SignedAddressTest(ClientTestCase):
+    def test_no_cache_file_holds_a_signed_address(self):
+        """Every way the cache gets written, with a signed storage address everywhere the API can put one."""
+        def signed(what):
+            return (f"https://files.example.com/{what}?X-Amz-Algorithm=AWS4&X-Amz-Credential=SYNTHETIC&"
+                    "X-Amz-Security-Token=SYNTHETIC&X-Amz-Signature=0000&X-Amz-Expires=3600")
+
+        def hosted(what):
+            return {"type": "file", "file": {"url": signed(what), "expiry_time": "2026-11-22T10:30:00.000Z"}}
+
+        emoji = {"type": "mention", "plain_text": ":logo:", "href": None, "mention": {
+            "type": "custom_emoji", "custom_emoji": {"id": uid(0xE1), "name": "logo", "url": signed("emoji")}}}
+        for identifier, source in self.fake.data_sources.items():
+            source.update(icon=hosted("icon"), cover=hosted("cover"), description=[run("see", signed("described"))],
+                          title=[emoji] + source["title"])
+        self.page.update(icon=hosted("page-icon"), cover=hosted("page-cover"))
+        self.page["properties"]["Assignee"]["people"] = [dict(USERS[ANA], avatar_url=signed("avatar"))]
+        self.fake.users[BRUNO] = dict(USERS[BRUNO], avatar_url=signed("avatar-2"))
+        commands = {
+            "a bare id read from the API": ("fetch", DS_TASKS),
+            "a schema read by its collection form": ("fetch", COLLECTION + DS_TASKS),
+            "the list of data sources": ("fetch", key(120)),
+            "a schema read again": ("query", COLLECTION + DS_TASKS, "--where", "Sprint = 'x'"),
+            "a page's parent": ("fetch", PAGE),
+            "people from rows and from the user list": ("users", "find", "a"),
+            "rows": ("query", COLLECTION + DS_TASKS, "--json"),
+            "a search": ("search", "invoice"),
+        }
+        cache = self.home / ".cache" / "cdv-notion"
+        for name, command in commands.items():
+            for warm in (False, True):
+                with self.subTest(name, warm=warm):
+                    if not warm:
+                        shutil.rmtree(cache, ignore_errors=True)
+                    self.run_cli(*command)
+                    files = [path for path in cache.iterdir() if path.is_file()]
+                    self.assertTrue(files, "nothing was cached")
+                    for path in files:
+                        held = path.read_text(encoding="utf-8")
+                        self.assertNotIn("X-Amz", held, path.name)
+                        self.assertNotIn("files.example.com", held, path.name)
+        # what the client reads from the cache is still there, and --json still gives the object the API gave
+        code, out, err = self.run_cli("query", "Tasks")
+        self.assertEqual(code, 2, out + err)  # the title now starts with the emoji's name
+        code, out, err = self.run_cli("query", ":logo:Tasks")
+        self.assertEqual(code, 0, err)
+        code, out, err = self.run_cli("fetch", COLLECTION + DS_TASKS, "--json")
+        self.assertEqual(json.loads(out)["icon"], hosted("icon"))
+        code, out, err = self.run_cli("fetch", ":logo:Tasks")
+        self.assertIn("data source: :logo:Tasks", out)
+        self.assertIn(f"database: {DB_TASKS}", out)
+
+
 class PeopleCacheRaceTest(ClientTestCase):
     def test_two_sessions_that_loaded_the_cache_before_either_wrote_keep_both_people(self):
         first, second = self.n.Notion(), self.n.Notion()

@@ -1062,7 +1062,7 @@ class Notion:
         whose title and key property come from it."""
         self._schemas[identifier] = schema
         self._fresh.add(identifier)
-        self.cache.put(f'schema-{identifier}', schema)
+        self.cache.put(f'schema-{identifier}', cacheable_schema(schema))
         known = listed_entry(identifier, schema)
 
         def correct(listed):
@@ -1633,6 +1633,16 @@ def value_named(values, name):
     """The value of the property `name` among short_values(), whatever key the short format gives it; a date's
     is its start."""
     return next((values[key] for key in (short_label(name), f'date:{name}:start') if key in values), None)
+
+
+def cacheable_schema(schema):
+    """What the cache keeps of a data source: only what the client reads from it, the title as plain text. Its icon
+    and cover can be uploaded files, whose address is signed with temporary credentials, and a custom emoji in the
+    title has an address too: none of that is kept."""
+    kept = {key: schema[key] for key in ('object', 'id', 'parent', 'properties') if key in schema}
+    title = plain(schema.get('title'))
+    kept['title'] = [{'type': 'text', 'text': {'content': title}, 'plain_text': title}] if title else []
+    return kept
 
 
 def listed_entry(identifier, schema):
