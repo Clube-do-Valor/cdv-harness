@@ -28,6 +28,7 @@ import tempfile
 import threading
 import time
 import unittest
+import warnings
 from pathlib import Path
 from unittest import mock
 from urllib.parse import parse_qs, urlsplit
@@ -1916,19 +1917,21 @@ class WriteOutcomeTest(ClientTestCase):
             try:
                 while True:
                     conn, _ = listener.accept()
-                    conn.settimeout(10)
-                    read.append(conn.recv(65536))  # the request left and arrived
-                    if reset:
-                        conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
-                    if answer:
-                        conn.sendall(answer)
-                    conn.close()
+                    with conn, contextlib.suppress(OSError):  # a client that goes away ends its own connection only
+                        conn.settimeout(10)
+                        read.append(conn.recv(65536))  # the request left and arrived
+                        if reset:
+                            conn.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+                        if answer:
+                            conn.sendall(answer)
             except OSError:
                 pass
         threading.Thread(target=serve, daemon=True).start()
         return listener.getsockname()[1], read
 
     def test_the_real_transport_tells_a_lost_connection_from_one_never_made(self):
+        self.enterContext(warnings.catch_warnings())  # urllib leaves the answer of a redirect it cannot read open
+        warnings.simplefilter("ignore", ResourceWarning)
         closed = socket.socket()
         closed.bind(("127.0.0.1", 0))
         refused_port = closed.getsockname()[1]
@@ -1963,7 +1966,9 @@ class WriteOutcomeTest(ClientTestCase):
             ("a TLS error while the body is read", ok("{}"), False, raising(reading, eof), "http", "in doubt"),
             ("a reset while the body is read", ok("{}"), False, raising(reading, LOST["reset"]), "http", "in doubt"),
             ("a timeout while the body is read", ok("{}"), False, raising(reading, LOST["timeout"]), "http", "in doubt"),
-            ("a TLS error while sending", ok("{}"), False, raising((http.client.HTTPConnection, "send"), eof), "http", "in doubt"),
+            ("a TLS error while sending", ok("{}"), False, raising((socket.socket, "sendall"), eof), "http", "in doubt"),
+            ("a redirect to an address nothing can read", b"HTTP/1.1 302 Found\r\nLocation: http://[x/\r\nContent-Length: 0\r\n\r\n",
+             False, None, "http", "in doubt"),
             ("a TLS handshake that fails", b"plain text, no TLS here", False, None, "https", "not sent"),
             ("the name does not resolve", None, False, raising((socket, "create_connection"), socket.gaierror(-2, "Name unknown")),
              "http", "not sent"),
@@ -1996,6 +2001,139 @@ class WriteOutcomeTest(ClientTestCase):
                         self.assertRegex(err, r"could not reach|did not answer|not JSON|Notion answered (302|400|503)")
                         self.assertEqual(len(err.splitlines()), 1, err)
 
+    def test_what_fails_before_a_connection_is_established_is_not_sent(self):
+        bypass = mock.patch.dict(os.environ, {"no_proxy": "", "NO_PROXY": ""})
+        bypass.start()
+        self.addCleanup(bypass.stop)
+        tunnels = {"refuses": b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n", "garbage": b"not http\r\n\r\n",
+                   "nothing": b"", "a line too long": b"HTTP/1.1 " + b"2" * 70000 + b"\r\n\r\n", "half a status": b"HTTP/1.1 2"}
+        for name, answer in tunnels.items():
+            for method in ("POST", "GET"):
+                with self.subTest(proxy=name, method=method):
+                    port, read = self.serve_once(answer)
+                    with mock.patch.dict(os.environ, {"https_proxy": f"http://127.0.0.1:{port}", "HTTPS_PROXY": f"http://127.0.0.1:{port}"}):
+                        proxied = load_client()  # the opener takes the proxies of the environment when it is built
+                    with self.assertRaises(proxied.Unsent):
+                        proxied.urllib_transport(method, "https://host.invalid/v1/comments", {}, b"{}" if method == "POST" else None, 5)
+                    self.assertTrue(read[0].startswith(b"CONNECT "))
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        local = f"http://127.0.0.1:{closed.getsockname()[1]}"
+        closed.close()
+        for path in ("/v1/comments/a b", "/v1/p\u00e1ges", "/v1/a\nb", "/v1/a\x7fb"):
+            with self.subTest(path=path):
+                with self.assertRaises(self.n.Unsent):  # raised by http.client before it connects
+                    self.n.urllib_transport("POST", local + path, {}, b"{}", 5)
+                for method in ("POST", "PATCH", "GET"):
+                    self.fake.calls.clear()
+                    code, out, err = self.run_cli("api", method, path, "--data", "{}")
+                    self.assertEqual(code, 2, err)
+                    self.assertIn("the request never left this machine, so nothing changed", err)
+                    self.assertNotRegex(err, r"(?i)in doubt|may have")
+                    self.assertEqual(self.fake.calls, [])
+        self.n.TRANSPORT = lambda method, url, headers, body=None, timeout=None: self.n.urllib_transport(
+            method, url.replace(API, local).replace("/v1/comments", "/v1/com ments"), headers, body, 5)
+        code, out, err = self.run_cli("api", "POST", "/v1/comments", "--data", "{}")
+        self.assertEqual(code, 1, err)
+        self.assert_case("not sent", err)
+        for url in ("nonsense", "http://[x/"):  # not even a request
+            with self.assertRaises(self.n.Unsent):
+                self.n.urllib_transport("POST", url, {}, b"{}", 5)
+
+    def test_a_read_that_never_connected_is_tried_three_times_and_a_write_once(self):
+        for failing in (TimeoutError("timed out"), ConnectionRefusedError(111, "Connection refused"), socket.gaierror(-3, "Try again")):
+            for method, tries, waits in (("GET", 3, [1, 2]), ("POST", 1, [])):
+                with self.subTest(failing=type(failing).__name__, method=method):
+                    self.sleeps.clear()
+                    self.n.TRANSPORT = self.n.urllib_transport
+                    bypass = {"no_proxy": "*", "NO_PROXY": "*"}
+                    with mock.patch.dict(os.environ, bypass), mock.patch.object(socket, "create_connection", side_effect=failing) as dialled:
+                        code, out, err = self.run_cli("api", method, "/v1/comments", "--data", "{}")
+                    self.assertEqual((code, dialled.call_count, self.sleeps), (1, tries, waits), err)
+                    if method == "POST":
+                        self.assert_case("not sent", err)
+                    else:
+                        self.assertIn("could not reach api.notion.com", err)
+                    self.n.TRANSPORT = self.fake
+        # a create in doubt whose lookup cannot connect at first is still found
+        tries = []
+
+        def lookup(r):
+            tries.append(r)
+            if len(tries) < 3:
+                raise self.n.Unsent("TimeoutError: timed out")
+
+        def lost(r):
+            self.fake.create_page(r.json)
+            raise ConnectionResetError(104, "reset")
+
+        self.fake.on("POST", r"/v1/pages", lost)
+        self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", lookup)
+        code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--set", "title=Looked for")
+        self.assertEqual(code, 0, err)
+        self.assertIn("found by its title", out)
+
+    def test_a_read_that_fails_after_a_landed_write_never_hides_the_write(self):
+        failures = {"an address nothing can read": ValueError("Invalid IPv6 URL"), "any other": KeyError("id"), "lost": LOST["reset"],
+                    "not an object": b'{"results": ["x"], "has_more": false}'}
+
+        def failing(kind):
+            def handler(r):
+                if isinstance(failures[kind], bytes):
+                    return 200, failures[kind]
+                raise failures[kind]
+            return handler
+
+        upload, body = uid(0xF11E), self.tmp / "body.md"
+        body.write_text(f"![a](file-upload://{upload})")
+        relation = self.page["properties"]["Project"]
+        relation["has_more"] = True
+        for kind in failures:
+            with self.subTest(update=kind):  # the body landed and the page cannot be read to place the file
+                self.fake.overrides.clear()
+                self.fake.on("GET", r"/v1/blocks/[^/]+/children", failing(kind))
+                code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+                self.assertEqual(code, 4, err)
+                self.assertIn("written: body added at the end", err)
+                self.assertIn(f"file 'a' ({upload})", err)
+                self.assertIn(f"https://file-upload.invalid/{upload}", err)
+            with self.subTest(properties=kind):  # the properties landed and a stored one cannot be read to be printed
+                self.fake.overrides.clear()
+                self.fake.on("GET", rf"/v1/pages/{PAGE}/properties/.*", failing(kind))
+                with mock.patch.object(self.fake, "patch_page", lambda identifier, body: (200, self.page)):
+                    code, out, err = self.run_cli("update", PAGE, "--set", f"Project={page_url(WIKI)}", "--append-file", self.note())
+                self.assertEqual(code, 4, err)
+                self.assertIn(f"updated {self.page['url']}", out)
+                self.assertIn("written: properties Project; body added at the end. Not confirmed: the stored value of Project", err)
+                self.assertNotRegex(err, "(?i)in doubt|not sent|not written")
+                self.assertIn("Shipped.", self.fake.markdown[PAGE])
+            for lookup, pattern in (("GET", r"/v1/users/me"), ("POST", rf"/v1/data_sources/{DS_TASKS}/query")):
+                with self.subTest(create=kind, lookup=pattern):  # the create is in doubt and the page cannot be looked for
+                    self.fake.overrides.clear()
+                    self.fake.on(lookup, pattern, failing(kind))
+                    self.fake.on("POST", r"/v1/pages", ends_in("503"))
+                    code, out, err = self.run_cli("create", "--parent", COLLECTION + DS_TASKS, "--set", "title=Doubtful")
+                    self.assertEqual(code, 1, err)
+                    self.assertIn("In doubt: 'Doubtful'", err)
+                    self.assertIn("before creating it again", err)
+            with self.subTest(write_check=kind):  # the check's card was made: it is trashed, or named
+                self.fake.overrides.clear()
+                self.fake.on("GET", r"/v1/blocks/[^/]+/children", failing(kind))
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS, "--marker", "QA MARKER")
+                self.assertEqual(code, 1, out + err)
+                self.assertRegex(out, r"(?m)^write check stopped: .*\n(.*\n)?write check trash: ok")
+                self.fake.on("GET", r"/v1/pages/[^/]+", lambda r, kind=kind: failing(kind)(r) if len(
+                    self.fake.sent("PATCH", r.path)) > 1 else None)
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS, "--marker", "QA MARKER")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn("trash the card 'QA MARKER doctor", out)
+                self.assertIn("by hand", out)
+
+    def note(self):
+        path = self.tmp / "note.md"
+        path.write_text("Shipped.\n")
+        return path
+
     def test_the_transport_raises_only_its_own_failures(self):
         # download and send read them: Unsent, a timeout or a ConnectionError, whatever the standard library raised.
         bypass = mock.patch.dict(os.environ, {"no_proxy": "*", "NO_PROXY": "*"})
@@ -2003,8 +2141,6 @@ class WriteOutcomeTest(ClientTestCase):
         self.addCleanup(bypass.stop)
         port, _ = self.serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
         for kind, error_ in LOST.items():
-            if kind == "any other":
-                continue
             for target in ("begin", "read"):
                 with self.subTest(kind=kind, target=target), mock.patch.object(http.client.HTTPResponse, target, side_effect=error_):
                     with self.assertRaises(TimeoutError if kind == "timeout" else ConnectionError) as raised:
@@ -2056,8 +2192,6 @@ class WriteOutcomeTest(ClientTestCase):
             with self.subTest(read=kind):
                 self.fake.overrides.clear()
                 self.fake.on("GET", rf"/v1/pages/{PAGE}", ends_in(kind))
-                if kind == "any other":
-                    continue  # not a failure of the connection: the last-resort handler names it
                 code, out, err = self.run_cli("fetch", PAGE)
                 self.assertEqual(code, 1, err)
                 self.assertRegex(err, r"could not reach api\.notion\.com|did not answer|with a body that is not JSON")

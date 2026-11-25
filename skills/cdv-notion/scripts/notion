@@ -172,13 +172,13 @@ class NoSuchKey(Fail):
 
 
 class Unsent(ConnectionError):
-    """The connection to the API could not be established: the request never left this machine."""
+    """No connection to the API was established: the request never left this machine."""
 
 
 def write_outcome(status=None, error=None):
     """What a write that did not come back with a success did, decided here and nowhere else.
 
-    NOT_SENT: the connection could not be established (Unsent, a refused connection); nothing reached Notion.
+    NOT_SENT: no connection was established (Unsent, a refused connection); nothing reached Notion.
     REFUSED_WRITE: Notion answered 4xx (a 429 once its retries are used up); nothing changed. IN_DOUBT: the
     request left and no answer says what happened - any 5xx, a redirect, a success whose body is not what that
     write answers (answers_write), a timeout, a connection lost after it was established (a TLS error while the answer is read included), or
@@ -194,6 +194,11 @@ def said_by(error):
     """An exception in one line: its name, unless it is one of the transport's own, and what it says."""
     said = ' '.join(str(error).split())
     return said if said and type(error) in (ConnectionError, Unsent) else f'{type(error).__name__}: {said}'.rstrip(': ')
+
+
+def as_fail(error):
+    """An exception as a Fail: what follows a write that landed catches every one, so that none hides what landed."""
+    return error if isinstance(error, Fail) else Fail(REFUSED, said_by(error))
 
 
 def is_write(method, path):
@@ -257,14 +262,14 @@ class SameHostRedirects(urllib.request.HTTPRedirectHandler):
 
 
 class Dialled:
-    """A connection whose connect() says Unsent when it fails - the name, the route, the refusal, the TLS
-    handshake, a timeout - because only there is it certain that no byte of the request left."""
+    """A connection that knows whether it was ever established (the TLS handshake and a proxy's tunnel included):
+    until then it is certain that no byte of the request left."""
+
+    established = False
 
     def connect(self):
-        try:
-            super().connect()
-        except OSError as error:
-            raise Unsent(said_by(error))
+        super().connect()
+        self.established = True
 
 
 class DialledHTTP(Dialled, http.client.HTTPConnection):
@@ -275,14 +280,21 @@ class DialledHTTPS(Dialled, http.client.HTTPSConnection):
     pass
 
 
-class DialHTTP(urllib.request.HTTPHandler):
+class Dial:
     def do_open(self, http_class, req, **options):
-        return super().do_open(DialledHTTP, req, **options)
+        def dial(*args, **kept):
+            req.dialled = self.connection(*args, **kept)
+            return req.dialled
+
+        return super().do_open(dial, req, **options)
 
 
-class DialHTTPS(urllib.request.HTTPSHandler):
-    def do_open(self, http_class, req, **options):
-        return super().do_open(DialledHTTPS, req, **options)
+class DialHTTP(Dial, urllib.request.HTTPHandler):
+    connection = DialledHTTP
+
+
+class DialHTTPS(Dial, urllib.request.HTTPSHandler):
+    connection = DialledHTTPS
 
 
 _OPENER = urllib.request.build_opener(SameHostRedirects(), DialHTTP(), DialHTTPS())
@@ -297,22 +309,23 @@ def answer_body(error):
 
 
 def urllib_transport(method, url, headers, body=None, timeout=60):
-    """(status, headers, body), or Unsent when the connection could not be established, TimeoutError when no
-    answer came in time, and ConnectionError for any other failure: once connected, the request may have left."""
-    request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
+    """(status, headers, body), or Unsent when no connection was established, whatever failed (a path that cannot
+    be sent, the name, the route, a proxy's tunnel, the TLS handshake, a timeout), TimeoutError when no answer came
+    in time, and ConnectionError for any other failure: once connected, the request may have left."""
+    request = None
     try:
+        request = urllib.request.Request(url, data=body, method=method, headers=headers or {})
         with _OPENER.open(request, timeout=timeout) as response:
             return response.status, dict(response.headers.items()), response.read()
     except urllib.error.HTTPError as error:
         return error.code, dict((error.headers or {}).items()), answer_body(error)
-    except (OSError, http.client.HTTPException) as error:
+    except Exception as error:
         # urllib wraps what connecting and sending raise in a URLError, and lets the rest (reading) through raw
         reason = error.reason if isinstance(error, urllib.error.URLError) else error
-        if isinstance(reason, Unsent):
-            raise reason
-        if isinstance(reason, TimeoutError):
-            raise TimeoutError(str(reason))
-        raise ConnectionError(said_by(reason) if isinstance(reason, Exception) else str(reason))
+        said = said_by(reason) if isinstance(reason, Exception) else str(reason)
+        if not getattr(getattr(request, 'dialled', None), 'established', False):
+            raise Unsent(said)
+        raise TimeoutError(str(reason)) if isinstance(reason, TimeoutError) else ConnectionError(said)
 
 
 TRANSPORT = urllib_transport
@@ -788,7 +801,7 @@ class Notion:
         never sent, refused (an ApiError for a 4xx) or in doubt (WriteInDoubt)."""
         outcome = write_outcome(status, error)
         if outcome == NOT_SENT:
-            cause = f'could not connect to api.notion.com ({error})'
+            cause = f'could not connect to api.notion.com ({said_by(error)})'
             return Fail(REFUSED, with_words(cause, outcome), outcome, cause)
         if error is not None:
             what = ('api.notion.com did not answer in time' if isinstance(error, TimeoutError)
@@ -827,22 +840,16 @@ class Notion:
         while True:
             try:
                 status, answer_headers, payload = TRANSPORT(method, url, headers, data, 60)
-            except TimeoutError as error:
+            except Exception as error:  # whatever it is, it does not say that a write never left unless it is Unsent
                 if write:
                     raise self.write_failed(path, error=error)
-                if server < 2:
+                if isinstance(error, (TimeoutError, Unsent, ConnectionRefusedError)) and server < 2:
                     server += 1
                     SLEEP(server)
                     continue
-                raise Fail(REFUSED, f'api.notion.com did not answer {method} {path} in time')
-            except (OSError, http.client.HTTPException) as error:
-                if write:
-                    raise self.write_failed(path, error=error)
+                if isinstance(error, TimeoutError):
+                    raise Fail(REFUSED, f'api.notion.com did not answer {method} {path} in time')
                 raise Fail(REFUSED, f'could not reach api.notion.com: {said_by(error)}')
-            except Exception as error:
-                if write:  # whatever else the transport raised does not say that the request never left
-                    raise self.write_failed(path, error=error)
-                raise
             parsed = self.parse(payload)
             if status == 529 and write:  # "overloaded" is a 5xx: the write may have been applied, so never resend it
                 raise self.write_failed(path, status, parsed)
@@ -2055,7 +2062,8 @@ def place_files(client, page_id, files, landed, where, rest=(), then='', misses=
 
     try:
         found, _, _ = placeholders(client, page_id, every)
-    except Fail as failure:
+    except Exception as error:
+        failure = as_fail(error)
         report(', '.join(names[u] for u in every), Fail(failure.code, outcome=NOT_SENT, cause='the page could not be read to place '
                f'them: {failure.cause}'), [], every)
     for number, (block, kind, upload) in enumerate(found):
@@ -2069,7 +2077,8 @@ def place_files(client, page_id, files, landed, where, rest=(), then='', misses=
         landed.append(f'{names[upload]} placed in block {block}')
     try:
         left, stuck, foreign = placeholders(client, page_id, every)
-    except Fail as failure:
+    except Exception as error:
+        failure = as_fail(error)
         raise Fail(PARTIAL, f"done in part on {where}: written: {'; '.join(landed)}. Not confirmed: the page could not be read again to "
                             f'check that no placeholder is left ({failure.cause}). Fetch it: if {PLACEHOLDER} is in its body, run '
                             f"{', '.join(place_command(where, u) for u in every)}"
@@ -2150,7 +2159,7 @@ def cmd_update(client, args):
     # Everything above only read. From here each request writes; a write that fails, the first one included,
     # is reported by report_writes with what landed, its own case and what was never sent (exit 4 once one
     # has landed), so a rerun repeats nothing.
-    steps, landed, misses = [], [], []
+    steps, landed, misses, unread = [], [], [], []
     if properties or args.icon:
         what = []
         if properties:
@@ -2164,7 +2173,7 @@ def cmd_update(client, args):
             # only the write is inside the rule that may send it again; what reads its answer comes after
             built, stored = (client.on_current_schema(schema, build, send, built=properties) if properties
                              else send(properties))
-            say_written(client, page, stored, built, args.icon)
+            unread.extend(say_written(client, page, stored, built, args.icon))
 
         steps.append((' and '.join(what), write_them, []))
     if args.edit:
@@ -2183,7 +2192,8 @@ def cmd_update(client, args):
         then = f"Then run only what was not sent: {'; '.join(later)}" if later else ''
         try:
             write()
-        except Fail as failure:
+        except Exception as error:
+            failure = as_fail(error)
             if isinstance(failure, Unbuildable) and not landed:
                 raise  # said as any unknown property is: nothing was written
             pending = list(dict.fromkeys(file_label(file.name, file.id) for file in placed))
@@ -2199,6 +2209,9 @@ def cmd_update(client, args):
             place_files(client, page['id'], placed, landed, where, later, then, misses)
             if not label and len(steps) == 1:
                 client.say(f'updated {where}')
+    if unread:
+        raise Fail(PARTIAL, f"done on {where}: written: {'; '.join(landed)}. Not confirmed: {unread[0]}; fetch the page to see it"
+                            + (f". Not applied: {'; '.join(misses)}" if misses else ''))
     if misses:
         raise Fail(PARTIAL, 'done in part; not applied: ' + '; '.join(misses))
     return DONE
@@ -2252,12 +2265,18 @@ def send_properties(client, page, properties, icon_text):
 
 
 def say_written(client, page, stored, properties, icon_text):
-    changed = client.short_values(stored, names=set(properties))
+    """Print what a write stored; [] or, when reading it fails, what could not be read: the write landed all the same."""
     client.say(f"updated {stored.get('url') or page.get('url')}")
+    changed, unread = {}, []
+    try:
+        changed = client.short_values(stored, names=set(properties))
+    except Exception as error:
+        unread = [f"the stored value of {', '.join(properties)} could not be read ({as_fail(error).cause})"]
     if changed:
         client.say(json.dumps(changed, ensure_ascii=False, indent=2))
     if icon_text:
         client.say(f'icon: {icon_text}')
+    return unread
 
 
 def write_edits(client, page, plan, matched, allow_deleting, misses):
@@ -2385,7 +2404,8 @@ def cmd_create(client, args):
         try:
             page = client.on_current_schema(
                 page_schema, lambda: client.build_properties(assignments, page_schema), create, built=payload['properties'])
-        except Fail as failure:
+        except Exception as error:
+            failure = as_fail(error)
             if isinstance(failure, Unbuildable) and not created:  # said as any unknown property is: nothing was made
                 if len(payloads) > 1:
                     raise Fail(USAGE, f'page {number + 1} of {len(payloads)}: {failure.message}; nothing was made')
@@ -2416,8 +2436,8 @@ def create_one(client, kind, parent, payload, title, started, seen=(), where='')
     except WriteInDoubt as doubt:
         try:
             page = find_created(client, kind, parent, title, started, doubt, seen)
-        except Fail as lookup:  # any failure to look - an answer, a timeout, a lost connection, 429 - leaves it in doubt
-            raise CreateInDoubt(doubt, title, where, lookup)
+        except Exception as lookup:  # any failure to look - an answer, a timeout, a lost connection, 429 - leaves it in doubt
+            raise CreateInDoubt(doubt, title, where, as_fail(lookup))
         if page is None:
             raise CreateInDoubt(doubt, title, where)
         note = (f' ({doubt.what}; not sent again: found by its title among the pages this '
@@ -3420,8 +3440,8 @@ def trash_check_card(client, page, title, step):
         client.call('PATCH', f"/v1/pages/{page['id']}", {'in_trash': True})
         trashed = client.call('GET', f"/v1/pages/{page['id']}").get('in_trash')
         step('trash', bool(trashed), f'the page is not in the trash; {by_hand}')
-    except Fail as failure:
-        step('trash', False, f'{failure.message}; {by_hand}')
+    except Exception as error:
+        step('trash', False, f'{as_fail(error).message}; {by_hand}')
 
 
 def trash_lost_check_card(client, schema, title, started, doubt, step):
@@ -3433,8 +3453,8 @@ def trash_lost_check_card(client, schema, title, started, doubt, step):
             SLEEP(wait)
         try:
             found = find_created(client, 'data_source', schema, title, started, doubt)
-        except Fail as failure:
-            why = f'it could not be looked for ({failure.cause})'
+        except Exception as error:
+            why = f'it could not be looked for ({as_fail(error).cause})'
         if found is not None and client.title_of(found) == title:
             client.say(f"write check create: the card was made and was found by its title, {url_of(found)}")
             return trash_check_card(client, found, title, step)
@@ -3496,8 +3516,8 @@ def write_check(client, args):
         threads = client.discussions(page['id'])
         step('comment', any(linked(c.get('rich_text')) == said for cs in threads.values() for c in cs),
              'the comment did not read back with its link')
-    except Fail as failure:
-        client.say(f'write check stopped: {client.redact(failure.message)}')
+    except Exception as error:
+        client.say(f'write check stopped: {as_fail(error).message}')
     finally:
         trash_check_card(client, page, title, step)
     return results
@@ -3515,6 +3535,9 @@ def cmd_api(client, args):
     bare = path.split('?', 1)[0]
     if not bare.startswith('/v1/') or '/../' in bare + '/' or '/./' in bare:
         raise Fail(USAGE, f'`notion api` takes a path under /v1/, not {args.path}')
+    if not re.fullmatch(r'[\x21-\x7e]+', bare):
+        raise Fail(USAGE, f'{bare!r} cannot be sent: a path holds no space, control character or character that is not plain ASCII '
+                          f'(percent-encode it); {OUTCOME_WORDS[NOT_SENT]}')
     query = None
     if '?' in path:
         path, raw_query = path.split('?', 1)
