@@ -39,7 +39,7 @@ Run `notion auth status`. Exit `0` names the integration and where the token cam
 | Create a card | `notion create --parent <data source> --set 'Task name=…' --set 'Status=…' --body-file <file.md>`; several at once with `--pages-file pages.json` |
 | Create a child page | `notion create --parent <page> --set 'title=…' --body-file <file.md>` |
 | Comment | `notion comments add <ref> --body '…'`; answer a thread with `notion comments reply <discussion> --body '…'`; read them with `notion comments list <ref>` |
-| Attach an image or a file | `notion upload <file>` prints the markdown line; put it in the body with `--append-file` or `--edit`, within the hour |
+| Attach an image or a file | `notion upload <file>` prints the markdown line; within the hour, put it in a body (`--append-file`, `--edit`, `--replace-file`, or the `--body-file` of a create) and the client places the file |
 | Download an attachment | `notion download <file block or signed url> -o <dir>` |
 | Find a person | `notion users find <name or e-mail>` → `user://<uuid>`; `notion whoami` for the person this machine acts for |
 | Trash a page | `notion trash <ref> --confirm` (only on an explicit request) |

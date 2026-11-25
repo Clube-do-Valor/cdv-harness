@@ -1348,6 +1348,62 @@ def cmd_fetch(client, args):
 # update, trash
 # ---------------------------------------------------------------------------------------------
 
+# An uploaded file as `notion upload` writes it in a body: ![name](file-upload://<id>) or source="file-upload://<id>".
+# The markdown endpoints do not know that address: they store an empty block. So it is sent as an address of the
+# placeholder host, which Notion stores as it is, and each block that holds one is then given the uploaded file.
+UPLOAD_REF = re.compile(r'((?:\bsource="|\]\())file-upload://(' + UUID_RE.pattern + r')(?=["\)])')
+PLACEHOLDER = 'https://file-upload.invalid/'
+MEDIA = ('image', 'file', 'pdf', 'audio', 'video')
+
+
+def hold_uploads(markdown):
+    """(the markdown with each uploaded file's address as a placeholder, the upload ids in it). Fenced code is text."""
+    ids, lines, fence = [], [], ''
+
+    def hold(match):
+        ids.append(hyphenate(match.group(2)))
+        return match.group(1) + PLACEHOLDER + ids[-1]
+
+    for line in markdown.split('\n'):
+        ticks = re.match(r'\s*(`{3,})', line)
+        if fence:
+            fence = '' if ticks and len(ticks.group(1)) >= len(fence) and not line.strip().strip('`') else fence
+        elif ticks:
+            fence = ticks.group(1)
+        else:
+            line = UPLOAD_REF.sub(hold, line)
+        lines.append(line)
+    return '\n'.join(lines), ids
+
+
+def place_uploads(client, page_id, ids):
+    """Give each block that holds a placeholder its uploaded file."""
+    waiting, found, queue = list(ids), [], [page_id]
+    try:
+        while queue and waiting:
+            for block in children_of(client, queue.pop(0)):
+                kind = block.get('type')
+                url = ((block.get(kind) or {}).get('external') or {}).get('url') or ''
+                if kind in MEDIA and url.startswith(PLACEHOLDER) and hyphenate(url) in waiting:
+                    waiting.remove(hyphenate(url))
+                    found.append((block['id'], kind, hyphenate(url)))
+                elif block.get('has_children') and kind not in ('child_page', 'child_database'):
+                    queue.append(block['id'])
+    except Fail as failure:
+        raise Fail(failure.code, outcome=NOT_SENT, cause=f'the page could not be read to place them: {failure.cause}')
+    for number, (block, kind, upload) in enumerate(found):
+        try:
+            client.call('PATCH', f'/v1/blocks/{block}', {kind: {'file_upload': {'id': upload}}})
+        except Fail as failure:
+            left = '; '.join(f"`notion api PATCH /v1/blocks/{b} --data '" + json.dumps({k: {'file_upload': {'id': u}}}) + "'`"
+                             for b, k, u in found[number:])
+            failure.cause = f'{failure.cause}; {number} of {len(ids)} placed, place the rest with {left}'
+            raise failure
+    if waiting:
+        raise Fail(REFUSED, outcome=NOT_SENT, cause=f"no image, file, pdf, audio or video block holds {', '.join(waiting)}")
+    client.say(f'uploaded files placed: {len(found)}')
+
+
 CHILD_TAG = re.compile(r'<(page|database)\s+url="([^"]+)"[^>]*>(.*?)</\1>', re.S)
 
 
@@ -1361,6 +1417,10 @@ def cmd_update(client, args):
     files = {flag: read_file(path) for flag, path in (('replace', args.replace_file), ('append', args.append_file),
                                                      ('prepend', args.prepend_file)) if path}
     properties = client.build_properties(args.set or [], client.schema_for(page), page) if args.set else {}
+    uploads = []
+    for flag in files:
+        files[flag], held = hold_uploads(files[flag])
+        uploads += held
     current = None
     if args.edit or 'replace' in files:
         current = client.markdown(page['id']).get('markdown', '')
@@ -1394,13 +1454,20 @@ def cmd_update(client, args):
             what.append('icon')
         steps.append((' and '.join(what), lambda: write_properties(client, page, properties, args.icon)))
     if args.edit:
-        matched = [(number, old, new) for number, old, new, state in plan if state == 'matched']
+        matched = []
+        for number, old, new, state in plan:
+            if state == 'matched':
+                new, held = hold_uploads(new)
+                uploads += held
+                matched.append((number, old, new))
         steps.append(('body edits ' + ', '.join(str(n) for n, *_ in matched),
                       lambda: write_edits(client, page, plan, matched, args.allow_deleting_content, misses)))
     for kind in ('replace', 'prepend', 'append'):
         if kind in files:
             label = {'replace': 'body replaced', 'prepend': 'body added at the start', 'append': 'body added at the end'}[kind]
             steps.append((label, lambda kind=kind: write_body(client, page, kind, files[kind], args.allow_deleting_content)))
+    if uploads:
+        steps.append(('uploaded files in the body', lambda: place_uploads(client, page['id'], uploads)))
     for number, (label, write) in enumerate(steps):
         try:
             write()
@@ -1557,8 +1624,9 @@ def cmd_create(client, args):
             if len(drafts) > 1 and failure.code == USAGE:
                 raise Fail(USAGE, f'page {number} of {len(drafts)}: {failure.message}; nothing was sent')
             raise
-        payload = {'parent': target, 'properties': built}
+        payload, uploads = {'parent': target, 'properties': built}, []
         if content:
+            content, uploads = hold_uploads(content)
             payload['markdown'] = content
             payload['markdown_version'] = MARKDOWN_VERSION
         if icon:
@@ -1567,17 +1635,23 @@ def cmd_create(client, args):
         for name, value in payload['properties'].items():
             if page_schema['properties'][name].get('type') == 'title':
                 title = ''.join(part['text']['content'] for part in value['title'])
-        payloads.append((payload, title))
+        payloads.append((payload, title, uploads))
     created, seen = [], set()  # urls reported, and the ids of the pages this run created or found
-    for number, (payload, title) in enumerate(payloads):
+    for number, (payload, title, uploads) in enumerate(payloads):
+        rest = [repr(t or '(untitled)') for _, t, _ in payloads[number + 1:]]
         try:
             page = create_one(client, kind, parent, payload, title, started, seen, where)
         except Fail as failure:
-            rest = [repr(t or '(untitled)') for _, t in payloads[number + 1:]]
             raise report_writes('create', created, repr(title or '(untitled)'), failure, rest, total=len(payloads),
                                 where=where)
         seen.add(page.get('id'))
         created.append(page.get('url') or page.get('id', ''))
+        if uploads:
+            try:
+                place_uploads(client, page['id'], uploads)
+            except Fail as failure:
+                raise report_writes('update', ['created ' + ', '.join(created)], 'uploaded files in the body', failure,
+                                    [f'the create of {t}' for t in rest], where=created[-1])
     return DONE
 
 
@@ -2249,7 +2323,8 @@ def cmd_upload(client, args):
             error.code = REFUSED  # the plan's Surface: a file the API refuses exits 1
         raise
     reference = f"file-upload://{created['id']}"
-    client.say(f"uploaded {path.name} ({sent.get('status', 'sent')}): attach it within one hour")
+    client.say(f"uploaded {path.name} ({sent.get('status', 'sent')}): within one hour, put this line in a body "
+               '(`notion create` or `notion update`, which place the file)')
     if mime.startswith('image/'):
         client.say(f'![{path.name}]({reference})')
     else:

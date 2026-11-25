@@ -356,6 +356,8 @@ class FakeNotion:
             return 200, {"object": "list", "results": self.children.get(match.group(1), []), "next_cursor": None,
                          "has_more": False, "type": "block", "block": {}}
         match = re.fullmatch(r"/v1/blocks/([^/]+)", p)
+        if match and m == "PATCH":
+            return self.patch_block(match.group(1), r.json or {})
         if match and m == "GET":
             found = self.blocks.get(match.group(1))
             return (200, found) if found else error(404, "object_not_found", "Could not find block.")
@@ -420,8 +422,30 @@ class FakeNotion:
         self.children[made["id"]] = list(children)
         return made
 
+    def patch_block(self, identifier, body):
+        """A media block given an uploaded file: it becomes a hosted file with a signed url."""
+        block = self.blocks[identifier]
+        upload = body[block["type"]]["file_upload"]["id"]
+        block[block["type"]] = {"caption": block[block["type"]]["caption"], "type": "file",
+                                "file": {"url": f"https://files.example.com/{upload}?X-Amz-Expires=3600",
+                                         "expiry_time": "2026-11-22T10:30:00.000Z"}}
+        return 200, block
+
     def store_blocks(self, identifier, markdown):
-        """The blocks Notion stores for the constructs the tests write: callout, table, toggle, text."""
+        """The blocks Notion stores for the constructs the tests write: callout, table, toggle, media, text.
+        A media address that is not http(s) is stored empty, as the real API does with file-upload://."""
+        def media(kind, url, caption):
+            return self.block(kind, {"caption": text(caption), "type": "external",
+                                     "external": {"url": url if url.startswith("http") else ""}})
+
+        def line_of(value):
+            found = (re.fullmatch(r"!\[()(.*?)\]\((.*?)\)", value)
+                     or re.fullmatch(r'<(image|file|pdf|audio|video) source="([^"]*)"(?: />|>(.*?)</\1>)', value))
+            if not found:
+                return paragraph(value)
+            kind, a, b = found.groups()
+            return media(kind, a, b or "") if kind else media("image", b, a)
+
         def paragraph(value):
             return self.block("paragraph", {"rich_text": text(value), "color": "default"})
         stored = []
@@ -438,9 +462,9 @@ class FakeNotion:
                 stored.append(self.block("table", {"table_width": len(cells[0]), "has_column_header": 'header-row="true"' in flags,
                                                    "has_row_header": False}, made))
             elif toggle is not None:
-                stored.append(self.block("toggle", {"rich_text": text(toggle), "color": "default"}, [paragraph(hidden)]))
+                stored.append(self.block("toggle", {"rich_text": text(toggle), "color": "default"}, [line_of(hidden)]))
             else:
-                stored.append(paragraph(line))
+                stored.append(line_of(line))
         self.children[identifier] = stored
 
     def patch_markdown(self, identifier, body):
@@ -545,6 +569,8 @@ class FakeNotion:
         if body.get("icon"):
             page["icon"] = body["icon"]
         self.add_page(page, body.get("markdown", ""))
+        if body.get("markdown"):
+            self.store_blocks(identifier, body["markdown"])
         return 200, page
 
     def create_comment(self, body):
@@ -2033,6 +2059,84 @@ class FilesTest(ClientTestCase):
         self.assertIn(b"fake image", sent.raw)
         self.assertIn(b'name="file"; filename="screen.png"', sent.raw)
         self.assertIn(f"![screen.png](file-upload://{upload_id})", out)
+
+    def placed(self, page_id):
+        """(type, uploaded or external address) of each media block of a page, in its toggles too."""
+        found = []
+        for block in self.fake.children.get(page_id, []):
+            content = block[block["type"]]
+            if block["type"] in self.n.MEDIA:
+                found.append((block["type"], content[content["type"]]["url"].split("?")[0]))
+            found += self.placed(block["id"])
+        return found
+
+    def test_the_line_upload_prints_places_the_file_in_a_body(self):
+        """The markdown endpoints store file-upload:// as an empty block: the client gives the block its file."""
+        image, note = self.tmp / "screen.png", self.tmp / "note.txt"
+        image.write_bytes(b"png")
+        note.write_bytes(b"text")
+        lines = {}
+        for path in (image, note):
+            code, out, err = self.run_cli("upload", path)
+            lines[path.name] = next(line for line in out.splitlines() if line.startswith(("!", "<")))
+        ids = {name: re.search(r"file-upload://([0-9a-f-]+)", line).group(1) for name, line in lines.items()}
+        hosted = {name: "https://files.example.com/" + i for name, i in ids.items()}
+        body = self.tmp / "body.md"
+        body.write_text("Shot:\n\n" + lines["screen.png"] + "\n\n<toggle>\nMore\n\n" + lines["note.txt"] + "\n</toggle>\n\n"
+                        "```\n" + lines["screen.png"] + "\n```\n\n![out](https://example.com/out.png)\n")
+        expected = [("image", hosted["screen.png"]), ("file", hosted["note.txt"]), ("image", "https://example.com/out.png")]
+        for verb in (("update", PAGE, "--replace-file", body), ("create", "--parent", "Tasks", "--set", "title=With files",
+                                                                  "--body-file", body)):
+            with self.subTest(verb=verb[0]):
+                self.fake.calls.clear()
+                code, out, err = self.run_cli(*verb)
+                self.assertEqual(code, 0, err)
+                self.assertIn("uploaded files placed: 2", out)
+                page = PAGE if verb[0] == "update" else list(self.fake.pages)[-1]
+                placed = self.placed(page)
+                self.assertEqual(sorted(p for p in placed if p != ("image", "")), sorted(expected))
+                sent = [c.json for c in self.fake.sent("PATCH", r"/v1/blocks/[^/]+")]
+                self.assertEqual(sent, [{"image": {"file_upload": {"id": ids["screen.png"]}}},
+                                        {"file": {"file_upload": {"id": ids["note.txt"]}}}])
+        (self.tmp / "plain.md").write_text("One line")
+        self.run_cli("update", PAGE, "--replace-file", self.tmp / "plain.md")
+        code, out, err = self.run_cli("update", PAGE, "--edit", "One line", lines["screen.png"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.placed(PAGE), [("image", hosted["screen.png"])])
+        self.fake.calls.clear()
+        code, out, err = self.run_cli("update", PAGE, "--replace-file", self.tmp / "plain.md")
+        self.assertEqual(self.fake.sent("GET", r"/v1/blocks/.*"), [])  # no upload, no extra read
+
+    def test_an_upload_that_cannot_be_placed_exits_4_saying_what_landed(self):
+        upload = uid(0xF11E)
+        body = self.tmp / "body.md"
+        body.write_text(f"![a](file-upload://{upload})")
+        self.fake.on("PATCH", r"/v1/blocks/[^/]+", lambda r: error(400, "validation_error", "File upload expired."))
+        code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+        self.assertEqual(code, 4)
+        self.assertIn("written: body replaced", err)
+        self.assertIn("Not written: uploaded files in the body (Notion answered 400 validation_error", err)
+        block = self.fake.children[PAGE][0]["id"]
+        self.assertIn(f"notion api PATCH /v1/blocks/{block} --data '" + json.dumps({"image": {"file_upload": {"id": upload}}}) + "'", err)
+        pages = self.tmp / "pages.json"
+        pages.write_text(json.dumps([{"properties": {"Task name": "First"}, "content": body.read_text()},
+                                     {"properties": {"Task name": "Second"}}]))
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--pages-file", pages)
+        self.assertEqual(code, 4)
+        url = re.search(r"created (\S+)", out).group(1)
+        self.assertIn(f"written: created {url}", err)
+        self.assertIn("not sent: the create of 'Second'", err)
+        self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+        self.fake.overrides.clear()
+        self.fake.on("GET", r"/v1/blocks/[^/]+/children", lambda r: error(403, "restricted_resource", "No."))
+        code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+        self.assertEqual(code, 4)
+        self.assertIn("Not sent: uploaded files in the body (the page could not be read to place them", err)
+        self.fake.overrides.clear()
+        body.write_text(f'<bookmark source="file-upload://{upload}" />')
+        code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+        self.assertEqual(code, 4)
+        self.assertIn(f"no image, file, pdf, audio or video block holds {upload}", err)
 
     def test_download_saves_the_file_without_the_token(self):
         block = uid(0xF2)

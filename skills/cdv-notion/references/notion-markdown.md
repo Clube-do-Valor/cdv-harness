@@ -61,8 +61,9 @@ A plain table is a pipe table (`| a | b |`, `| --- | --- |`, a `|` inside a cell
 
 ## Media, files and child pages
 
-- Image: `![caption](url)` on its own line; a file uploaded with `notion upload` is placed with the line it prints.
-- File, PDF, audio, video, bookmark, embed: `<file source="url">caption</file>`, `<pdf source="url">…</pdf>`, `<bookmark source="url" />`, `<embed source="url" />`.
+- Image: `![caption](url)` on its own line. File, PDF, audio, video, bookmark, embed: `<file source="url">caption</file>`, `<pdf source="url">…</pdf>`, `<bookmark source="url" />`, `<embed source="url" />`.
+- Uploaded file: the line `notion upload` prints, `![name](file-upload://<id>)` or `<file source="file-upload://<id>">name</file>` (also `<pdf>`, `<audio>`, `<video>`), on its own line. The API's markdown does not know that address and would store an empty block, so the client writes the body and then gives each block its file; a body written another way (`notion api`) needs that second step: `notion api PATCH /v1/blocks/<block> --data '{"image": {"file_upload": {"id": "<id>"}}}'`.
+- A hosted file reads back as `<image source="https://…signed…#notion_record=block.<id>…">caption</image>` (or `<file …>`). Keep that address as it is in a rewrite: Notion recognises it and keeps the file. `notion download '<that url>'` (quoted) or the block id saves it.
 - Child page: `<page url="https://app.notion.com/p/<id>">Title</page>`. Child database: `<database url="…">Title</database>`. Keep these tags when rewriting a body: a rewrite without one deletes the child, and the client refuses it unless `--allow-deleting-content` is passed.
 - `<unknown url="…" alt="…" />` marks a block the API could not render (truncated page, block not shared, unsupported type): leave it as it is.
 
