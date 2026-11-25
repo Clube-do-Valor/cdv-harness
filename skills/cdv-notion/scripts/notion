@@ -41,6 +41,8 @@ settings in ~/.config/cdv-notion/config.json ({"me": "<your e-mail>", "stamp_com
 "test_marker": "<title prefix of write-check cards>"}).
 """
 import argparse
+import bisect
+import collections
 import datetime
 import difflib
 import getpass
@@ -1539,60 +1541,302 @@ def cmd_fetch(client, args):
 # update, trash
 # ---------------------------------------------------------------------------------------------
 
-# An uploaded file as `notion upload` writes it in a body: ![name](file-upload://<id>) or source="file-upload://<id>".
-# The markdown endpoints do not know that address: they store an empty block. So it is sent as an address of the
-# placeholder host, which Notion stores as it is, and each block that holds one is then given the uploaded file.
-UPLOAD_REF = re.compile(r'((?:\bsource="|\]\())file-upload://(' + UUID_RE.pattern + r')(?=["\)])')
 PLACEHOLDER = 'https://file-upload.invalid/'
 MEDIA = ('image', 'file', 'pdf', 'audio', 'video')
+_LINE_MARK = re.compile(r' *(>|(?:[-*+]|\d{1,9}[.)])(?= |$))')
+_FENCE = re.compile(r'(`{3,})[^`]*$|(~{3,})')
 
 
-def hold_uploads(markdown):
-    """(the markdown with each uploaded file's address as a placeholder, the upload ids in it). Fenced code is text."""
-    ids, lines, fence = [], [], ''
-
-    def hold(match):
-        ids.append(hyphenate(match.group(2)))
-        return match.group(1) + PLACEHOLDER + ids[-1]
-
-    for line in markdown.split('\n'):
-        ticks = re.match(r'\s*(`{3,})', line)
+def body_lines(markdown):
+    """[line, fence] for each line of a body: fence is None for a line of text, and one dict for every line of a
+    block of code (fenced by ``` or ~~~) or of a display equation ($$), its own marks included. A fence ends at its
+    closing mark, where the quote or the list item it stands in ends, or at the end of the body (`closed` False)."""
+    lines, fence, items = markdown.split('\n'), None, []  # items: the column of the text of each list item it is in
+    out = []
+    for number, line in enumerate(lines):
+        text = line.rstrip('\r').expandtabs(4)
         if fence:
-            fence = '' if ticks and len(ticks.group(1)) >= len(fence) and not line.strip().strip('`') else fence
-        elif ticks:
-            fence = ticks.group(1)
-        else:
-            line = UPLOAD_REF.sub(hold, line)
-        lines.append(line)
-    return '\n'.join(lines), ids
+            state = within_fence(fence, text)
+            fence['closed'] = state != 'code'
+            if state != 'out':
+                out.append([line, fence])
+                fence = None if state == 'end' else fence
+                continue
+            fence = None
+        at, quotes, marks, first, mark = 0, 0, [], None, _LINE_MARK.match(text)
+        while mark:
+            first = mark.start(1) if first is None else first
+            if mark.group(1) == '>':
+                quotes += 1
+            else:
+                marks.append(mark.end() + 1)
+            at = mark.end()
+            mark = _LINE_MARK.match(text, at)
+        rest = text[at:].lstrip(' ')
+        column = len(text) - len(rest)
+        if text.strip():
+            edge = column if first is None else first
+            items = [item for item in items if item <= edge] + marks
+        item = max((c for c in items if c <= column), default=0)
+        opens = _FENCE.match(rest) if column - max(item, at) < 4 else None
+        if opens:
+            run = opens.group(1) or opens.group(2)
+            fence = {'mark': run[0], 'size': len(run), 'column': column, 'quotes': quotes, 'item': item}
+        elif rest.strip() == '$$' and any(later.strip(' \t\r>') == '$$' for later in lines[number + 1:]):
+            fence = {'mark': '$', 'size': 2, 'column': column, 'quotes': quotes, 'item': item}
+        if fence:
+            fence.update(closed=False, line=number + 1)
+        out.append([line, fence])
+    return out
 
 
-def place_uploads(client, page_id, ids):
-    """Give each block that holds a placeholder its uploaded file."""
-    waiting, found, queue = list(ids), [], [page_id]
+def within_fence(fence, text):
+    """What a line is to the fence that is open: 'code', its 'end', or 'out' of the quote or item it stood in."""
+    at = 0
+    for _ in range(fence['quotes']):
+        mark = re.compile(' *>').match(text, at)
+        if not mark:
+            return 'out'
+        at = mark.end()
+    said = text[at:].strip()
+    column = len(text) - len(text[at:].lstrip(' '))
+    if not said:
+        return 'code'
+    if column < fence['item']:
+        return 'out'
+    if set(said) == {fence['mark']} and len(said) >= fence['size'] and (fence['mark'] != '$' or said == '$$'):
+        return 'end' if column <= fence['column'] + 3 else 'code'
+    return 'code'
+
+
+def code_spans(text):
+    """(start, end) of each piece of inline code: between two runs of as many backticks, over lines too, as Notion
+    reads them, and between <code> and </code>."""
+    runs, by_size = [(m.start(), m.end()) for m in re.finditer('`+', text)], {}
+    for start, end in runs:
+        by_size.setdefault(end - start, []).append(start)
+    spans, at = [], 0
+    for start, end in runs:
+        if start < at:
+            continue
+        slashes = 0
+        while start - slashes > at and text[start - slashes - 1] == '\\':
+            slashes += 1
+        start += slashes % 2  # an escaped backtick is text
+        size = end - start
+        closing = by_size.get(size, [])
+        place = bisect.bisect_left(closing, end)
+        if size and place < len(closing):
+            at = closing[place] + size
+            spans.append((start, at))
+    at = text.find('<code>')
+    while at >= 0:
+        end, line = text.find('</code>', at), text.find('\n', at)
+        if end < 0:
+            break
+        if line < 0 or end < line:
+            spans.append((at, end))
+        at = text.find('<code>', end if line < 0 or end < line else line)
+    return spans
+
+
+# An uploaded file in a body, as `notion upload` prints it: ![name](file-upload://<id>) or <file source="file-upload://<id>">
+# name</file>. The markdown endpoints do not know that address: they store an empty block. So it is sent as an address of
+# the placeholder host that carries the upload's id, which Notion stores as it is, and each block that holds one is then
+# given the uploaded file. Only a block of its own can hold a file, so a reference anywhere else is refused before
+# anything is sent; code is text.
+BodyFile = collections.namedtuple('BodyFile', 'id name stale line')  # stale: written as a placeholder, not as file-upload://
+_FILE_ADDRESS = r'(?:(?i:file-upload://)|https://file-upload\.invalid/)' + UUID_RE.pattern
+FILE_ADDRESS = re.compile(_FILE_ADDRESS)
+_MARKS = r'(?:[ \t>]|[-*+][ \t]|\d{1,9}[.)][ \t])*'
+IMAGE_LINE = re.compile(r'[ \t>]*!\[(?P<name>(?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*\])*)\]\(\s*<?(?P<address>' + _FILE_ADDRESS
+                        + r')>?(?:\s+(?:"[^"]*"|\'[^\']*\'|\([^()]*\)))?\s*\)\s*')
+TAG_LINE = re.compile(_MARKS + r'<(?P<tag>image|img|file|pdf|audio|video)\s(?:[^<>]*?\s)?(?:source|src)\s*=\s*'
+                      r'(?P<address>"\s*' + _FILE_ADDRESS + r'\s*"|\'\s*' + _FILE_ADDRESS + r'\s*\')(?P<after>[^<>]*)>(?P<rest>.*?)\s*')
+BAD_FILE_ADDRESS = re.compile(r'(?:\]\(\s*<?|\b(?:source|src)\s*=\s*["\']?\s*)(?P<address>(?i:file-upload)://)(?!' + UUID_RE.pattern + ')')
+PLACE_EDIT = (re.compile(r'\s*' + re.escape('https://file-upload.invalid/') + UUID_RE.pattern + r'\s*'),
+              re.compile(r'\s*(?i:file-upload://)' + UUID_RE.pattern + r'\s*'))
+
+
+def file_line(line):
+    """The match of a line that is one uploaded file and nothing else, in a form Notion makes a block of; else None."""
+    found = IMAGE_LINE.fullmatch(line)
+    if found:
+        return found
+    found = TAG_LINE.fullmatch(line)
+    if not found:
+        return None
+    closing, rest = f"</{found.group('tag')}>", found.group('rest')
+    if found.group('after').rstrip().endswith('/'):
+        return found if not rest else None
+    return found if closing not in rest or rest.index(closing) == len(rest) - len(closing) else None
+
+
+def hold_files(markdown, where):
+    """(the markdown with each uploaded file's address as its placeholder, the files in it). A reference that Notion
+    would not make a block of, or one inside code that nothing closes, is refused: Fail(USAGE), nothing sent."""
+    if 'file-upload' not in markdown.lower():
+        return markdown, []
+
+    def refuse(number, said, why):
+        raise Fail(USAGE, f'{where}, line {number}: {said} {why}; nothing was sent')
+
+    rows, files, table = body_lines(markdown), [], False
+    for number, (line, fence) in enumerate(rows, 1):
+        if fence and not fence['closed'] and FILE_ADDRESS.search(line):
+            refuse(number, FILE_ADDRESS.search(line).group(), f"stands in the code that line {fence['line']} opens and nothing closes")
+    first = 0
+    while first < len(rows):
+        last = first
+        while last < len(rows) and rows[last][1] is None:
+            last += 1
+        text, base = '\n'.join(line for line, _ in rows[first:last]), 0
+        spans = code_spans(text)
+
+        def code_at(place):
+            return next((span for span in spans if span[0] <= place < span[1]), None)
+
+        for index in range(first, last):
+            line, number, own = rows[index][0], index + 1, None
+            found = file_line(line)
+            if found:
+                own = FILE_ADDRESS.search(line, found.start('address'))
+                span = code_at(base + own.start())
+                if span:
+                    opened = first + 1 + text.count('\n', 0, span[0])
+                    refuse(number, own.group(), f'is inside the inline code that a backtick on line {opened} opens, so Notion would '
+                                                'keep it as text: close or escape (\\`) that backtick')
+                if table:
+                    refuse(number, own.group(), 'stands in a table: a cell holds only text, so Notion cannot show a file there')
+            for other in FILE_ADDRESS.finditer(line):
+                if (own is None or other.start() != own.start()) and not code_at(base + other.start()):
+                    refuse(number, other.group(), 'is not on a line of its own. Notion makes a file only of a block: write '
+                           '![name](file-upload://<id>) or <file source="file-upload://<id>">name</file> alone on its line, with a '
+                           'blank line before and after (it refuses an image inside a sentence, a heading, a list item or a table cell, '
+                           'and keeps a tag there as text), or write it as code, `file-upload://…`, when it is only text')
+            for bad in BAD_FILE_ADDRESS.finditer(line):
+                if not code_at(base + bad.start('address')):
+                    refuse(number, line[bad.start('address'):][:60].split()[0], 'is not the address of an upload: it is file-upload:// and the '
+                           'id `notion upload` printed')
+            for tag in re.finditer(r'(?<!\\)<(/?)table\b', line):
+                if not code_at(base + tag.start()):
+                    table = not tag.group(1)
+            base += len(line) + 1
+            if found:
+                upload = hyphenate(own.group())
+                name = (found.groupdict().get('name') or (found.groupdict().get('rest') or '').split('</')[0]).strip()
+                files.append(BodyFile(upload, name, own.group().startswith(PLACEHOLDER), number))
+                quote = '"' if 'tag' in found.groupdict() else ''
+                rows[index][0] = line[:found.start('address')] + quote + PLACEHOLDER + upload + quote + line[found.end('address'):]
+        first = last + 1
+    return '\n'.join(line for line, _ in rows), files
+
+
+def refuse_placeholders(held):
+    """Refuse a body that holds the placeholder of a file this command does not supply: it was read back after a
+    file could not be placed, and written as it is it would stay an address that shows nothing."""
+    given = {file.id for _, files in held for file in files if not file.stale}
+    for where, files in held:
+        for file in files:
+            if file.stale and file.id not in given:
+                raise Fail(USAGE, f'{where}, line {file.line}: {PLACEHOLDER}{file.id} is the address this client leaves where an '
+                                  f'uploaded file was not placed, and nothing is there. Write file-upload://{file.id} in its place (upload '
+                                  'the file again when that was over an hour ago, and write its new id), or take the line out; '
+                                  'nothing was sent')
+
+
+def placeholders(client, page_id, ids):
+    """(the media blocks of a page that hold the placeholder of one of `ids`, the other blocks that hold one, the
+    media blocks that hold another upload's), each as (block id, type, upload id)."""
+    found, stuck, foreign, queue, seen = [], [], [], [page_id], set()
+    while queue:
+        for block in children_of(client, queue.pop(0)):
+            kind = block.get('type')
+            if block.get('id') in seen:
+                continue  # a synced block shows the same blocks twice
+            seen.add(block.get('id'))
+            content = block.get(kind) or {}
+            url = (content.get('external') or {}).get('url') or ''
+            if kind in MEDIA and url.startswith(PLACEHOLDER) and hyphenate(url):
+                (found if hyphenate(url) in ids else foreign).append((block['id'], kind, hyphenate(url)))
+            elif PLACEHOLDER in json.dumps(content):
+                held = {hyphenate(m.group()) for m in re.finditer(re.escape(PLACEHOLDER) + UUID_RE.pattern, json.dumps(content))}
+                stuck += [(block['id'], kind, upload) for upload in ids if upload in held]
+            if block.get('has_children') and kind not in ('child_page', 'child_database'):
+                queue.append(block['id'])
+    return found, stuck, foreign
+
+
+def place_command(where, upload):
+    return f"`notion update {where} --edit '{PLACEHOLDER}{upload}' 'file-upload://{upload}'`"
+
+
+def files_left(where, files, uploads, sure=True):
+    """The sentence that says which files are not on the page (`sure`), or may not be, and the command that places each."""
+    names = {file.id: file.name for file in files}
+    uploads = list(dict.fromkeys(uploads))
+    return (f"The page {'still holds' if sure else 'may still hold'} the placeholder of "
+            f"{', '.join(file_label(names.get(u, ''), u) for u in uploads)} and not the file; place it with "
+            f"{', '.join(place_command(where, u) for u in uploads)} (it says that no edit matched when the file is already there; "
+            'when the upload was over an hour ago, upload the file again and put its new id in the second part)')
+
+
+def file_label(name, upload):
+    return f'file {name!r} ({upload})' if name else f'file {upload}'
+
+
+def place_files(client, page_id, files, landed, where, rest=(), then='', misses=()):
+    """Give each block that holds a placeholder of these files its file, then read the page again: none may be left.
+    Each block is one write; `landed` grows with each, and a failure is report_writes' (rest: the writes of the
+    command still to come, then: what to do about them once the files are there)."""
+    names = {file.id: file_label(file.name, file.id) for file in reversed(files)}
+    every = list(dict.fromkeys(file.id for file in files))
+
+    def report(label, failure, pending, uploads, more=()):
+        advice = [files_left(where, files, uploads, sure=failure.outcome in (NOT_SENT, REFUSED_WRITE))] if uploads else []
+        raise report_writes('update', landed, label, failure, [*pending, *rest], where=where, misses=misses,
+                            finish='. '.join(advice + list(more) + ([then] if then else [])))
+
     try:
-        while queue and waiting:
-            for block in children_of(client, queue.pop(0)):
-                kind = block.get('type')
-                url = ((block.get(kind) or {}).get('external') or {}).get('url') or ''
-                if kind in MEDIA and url.startswith(PLACEHOLDER) and hyphenate(url) in waiting:
-                    waiting.remove(hyphenate(url))
-                    found.append((block['id'], kind, hyphenate(url)))
-                elif block.get('has_children') and kind not in ('child_page', 'child_database'):
-                    queue.append(block['id'])
+        found, _, _ = placeholders(client, page_id, every)
     except Fail as failure:
-        raise Fail(failure.code, outcome=NOT_SENT, cause=f'the page could not be read to place them: {failure.cause}')
+        report(', '.join(names[u] for u in every), Fail(failure.code, outcome=NOT_SENT, cause='the page could not be read to place '
+               f'them: {failure.cause}'), [], every)
     for number, (block, kind, upload) in enumerate(found):
         try:
             client.call('PATCH', f'/v1/blocks/{block}', {kind: {'file_upload': {'id': upload}}})
         except Fail as failure:
-            left = '; '.join(f"`notion api PATCH /v1/blocks/{b} --data '" + json.dumps({k: {'file_upload': {'id': u}}}) + "'`"
-                             for b, k, u in found[number:])
-            failure.cause = f'{failure.cause}; {number} of {len(ids)} placed, place the rest with {left}'
-            raise failure
-    if waiting:
-        raise Fail(REFUSED, outcome=NOT_SENT, cause=f"no image, file, pdf, audio or video block holds {', '.join(waiting)}")
+            later = [f'{names[u]} in block {b}' for b, _, u in found[number + 1:]]
+            lost = [u for u in every if u not in {u for _, _, u in found}]
+            report(f'{names[upload]} in block {block}', failure, later + [names[u] for u in lost],
+                   [upload, *(u for _, _, u in found[number + 1:]), *lost])
+        landed.append(f'{names[upload]} placed in block {block}')
+    try:
+        left, stuck, foreign = placeholders(client, page_id, every)
+    except Fail as failure:
+        raise Fail(PARTIAL, f"done in part on {where}: written: {'; '.join(landed)}. Not confirmed: the page could not be read again to "
+                            f'check that no placeholder is left ({failure.cause}). Fetch it: if {PLACEHOLDER} is in its body, run '
+                            f"{', '.join(place_command(where, u) for u in every)}"
+                            + (f"; not sent: {'; '.join(rest)}" if rest else '')
+                            + (f"; edits that did not apply: {'; '.join(misses)}" if misses else '') + (f'. {then}' if then else ''))
+    counts = {u: sum(1 for file in files if file.id == u) for u in every}
+    missing = [u for u in every if sum(1 for _, _, f in [*found, *stuck] if f == u) < counts[u]]
+    unplaced = list(dict.fromkeys([u for _, _, u in stuck] + missing))
+    why = '; '.join([f'{names[u]} stands in a {kind} block ({block}), which cannot hold a file' for block, kind, u in stuck]
+                    + [f'the body holds {names[u]} {counts[u]} times and fewer blocks of the page do' if counts[u] > 1
+                       else f'no block of the page holds {names[u]}' for u in missing])
+    add = [f'Add it on a line of its own: put `![{file.name}](file-upload://{file.id})` in a file F and run `notion update {where} '
+           '--append-file F`, and take the placeholder out of the block above' for file in {f.id: f for f in files if f.id in unplaced}.values()]
+    if left:
+        report(', '.join(f'{names[u]} in block {b}' for b, _, u in left), Fail(REFUSED, outcome=IN_DOUBT, cause='Notion answered that '
+               'the block took it, and the block read again still holds the placeholder'), [names[u] for u in unplaced],
+               [u for _, _, u in left], add)
+    if unplaced:
+        report(', '.join(names[u] for u in unplaced), Fail(REFUSED, outcome=NOT_SENT, cause=why), [], [], add)
     client.say(f'uploaded files placed: {len(found)}')
+    for block, _, upload in foreign:
+        client.warn(f'warning: block {block} of {where} holds the placeholder of another upload ({upload}), which an earlier command did '
+                    f"not place: upload that file again and run `notion update {where} --edit '{PLACEHOLDER}{upload}' 'file-upload://<new id>'`")
 
 
 CHILD_TAG = re.compile(r'<(page|database)\s+url="([^"]+)"[^>]*>(.*?)</\1>', re.S)
@@ -1608,18 +1852,27 @@ def cmd_update(client, args):
     files = {flag: read_file(path) for flag, path in (('replace', args.replace_file), ('append', args.append_file),
                                                      ('prepend', args.prepend_file)) if path}
     properties = client.build_properties(args.set or [], client.schema_for(page), page) if args.set else {}
-    uploads = []
+    held = {}  # the uploaded files of each part of the body
     for flag in files:
-        files[flag], held = hold_uploads(files[flag])
-        uploads += held
+        files[flag], held[flag] = hold_files(files[flag], f"--{flag}-file {getattr(args, flag + '_file')}")
+    edits = []
+    for number, (old, new) in enumerate(args.edit or [], 1):
+        if PLACE_EDIT[0].fullmatch(old) and PLACE_EDIT[1].fullmatch(new):  # the placeholder for a file: it is placed
+            old, new = old.strip(), PLACEHOLDER + hyphenate(new)
+            held[number] = [BodyFile(hyphenate(new), '', False, 1)]
+        else:
+            new, held[number] = hold_files(new, f'--edit {number}')
+        edits.append((number, old, new))
+    refuse_placeholders([(f'--{part}-file' if part in files else f'--edit {part}', found) for part, found in held.items()])
     current = None
     if args.edit or 'replace' in files:
         current = client.markdown(page['id']).get('markdown', '')
     plan = []
     if args.edit:
-        for number, (old, new) in enumerate(args.edit, 1):
+        for number, old, new in edits:
             count = current.count(old)
-            plan.append((number, old, new, 'matched' if count == 1 else ('no match' if count == 0 else f'matches {count} places')))
+            one = count == 1 or (count and old == new and held[number])  # a file goes to every block that waits for it
+            plan.append((number, old, new, 'matched' if one else ('no match' if count == 0 else f'matches {count} places')))
         if not any(state == 'matched' for *_, state in plan):
             for number, old, _, state in plan:
                 client.say(f'edit {number}: {state}')
@@ -1643,50 +1896,58 @@ def cmd_update(client, args):
             what.append('properties ' + ', '.join(properties))
         if args.icon:
             what.append('icon')
-        steps.append((' and '.join(what), lambda: write_properties(client, page, properties, args.icon)))
+        steps.append((' and '.join(what), lambda: write_properties(client, page, properties, args.icon), []))
     if args.edit:
-        matched = []
-        for number, old, new, state in plan:
-            if state == 'matched':
-                new, held = hold_uploads(new)
-                uploads += held
-                matched.append((number, old, new))
-        steps.append(('body edits ' + ', '.join(str(n) for n, *_ in matched),
-                      lambda: write_edits(client, page, plan, matched, args.allow_deleting_content, misses)))
+        matched = [(number, old, new) for number, old, new, state in plan if state == 'matched']
+        sent = [edit for edit in matched if edit[1] != edit[2]]  # an edit that only places a file writes no text
+        steps.append(('body edits ' + ', '.join(str(n) for n, *_ in sent) if sent else '',
+                      lambda: write_edits(client, page, plan, sent, args.allow_deleting_content, misses),
+                      [file for number, *_ in matched for file in held[number]]))
     for kind in ('replace', 'prepend', 'append'):
         if kind in files:
             label = {'replace': 'body replaced', 'prepend': 'body added at the start', 'append': 'body added at the end'}[kind]
-            steps.append((label, lambda kind=kind: write_body(client, page, kind, files[kind], args.allow_deleting_content)))
-    if uploads:
-        steps.append(('uploaded files in the body', lambda: place_uploads(client, page['id'], uploads)))
-    for number, (label, write) in enumerate(steps):
+            steps.append((label, lambda kind=kind: write_body(client, page, kind, files[kind], args.allow_deleting_content), held[kind]))
+    where = page.get('url')
+    for number, (label, write, placed) in enumerate(steps):
+        later = [name for name, _, _ in steps[number + 1:]]
+        then = f"Then run only what was not sent: {'; '.join(later)}" if later else ''
         try:
             write()
         except Fail as failure:
-            rest = [name for name, _ in steps[number + 1:]]
-            raise report_writes('update', landed, label, failure, rest, where=page.get('url'), misses=misses)
-        if not landed and not (properties or args.icon):
-            client.say(f"updated {page.get('url')}")  # only once a write has landed (write_properties says it itself)
-        landed.append(label)
+            pending = list(dict.fromkeys(file_label(file.name, file.id) for file in placed))
+            finish = None
+            if placed and (failure.outcome or IN_DOUBT) == IN_DOUBT:
+                finish = 'If it was applied: ' + files_left(where, placed, [file.id for file in placed]) + (f'. {then}' if then else '')
+            raise report_writes('update', landed, label, failure, pending + later, where=where, misses=misses, finish=finish)
+        if label and not landed and not (properties or args.icon):
+            client.say(f'updated {where}')  # only once a write has landed (write_properties says it itself)
+        if label:
+            landed.append(label)
+        if placed:
+            place_files(client, page['id'], placed, landed, where, later, then, misses)
+            if not label and len(steps) == 1:
+                client.say(f'updated {where}')
     if misses:
         raise Fail(PARTIAL, 'done in part; not applied: ' + '; '.join(misses))
     return DONE
 
 
-def report_writes(kind, done, label, failure, rest, total=None, where='', misses=()):
-    """The one report of a command with several writes - the steps of `update`, the pages of `create`: what
-    was written or created, the write that stopped the command in the case write_outcome gave it (refused,
-    never sent, or in doubt), and what was never sent. Exit 4 once something was written, else the code of
-    the failure itself."""
+def report_writes(kind, done, label, failure, rest, total=None, where='', misses=(), finish=None):
+    """The one report of a command with several writes - the steps of `update` and each file they place, the pages
+    of `create`: what was written or created, the write that stopped the command in the case write_outcome gave it
+    (refused, never sent, or in doubt), and what was never sent. Exit 4 once something was written, else the code of
+    the failure itself. Once something landed, no line says that nothing changed. `finish` says how to go on in place
+    of what to run again."""
     create = kind == 'create'
     outcome = failure.outcome or IN_DOUBT  # a failure that does not say what became of the write
     nothing = 'nothing was made' if create else 'nothing changed'
     if outcome == REFUSED_WRITE:
-        failed = f"Not {'created' if create else 'written'}: {label} ({failure.cause}): Notion refused it and {nothing}"
+        failed = (f"Not {'created' if create else 'written'}: {label} ({failure.cause}): Notion refused it"
+                  + ('' if done else f' and {nothing}'))
         again = ('Rerun with only the pages that were not created' if create
                  else 'Rerun only what was not written') + (' or not sent' if rest else '')
     elif outcome == NOT_SENT:
-        failed = f'Not sent: {label} ({failure.cause}): the request never left this machine, so {nothing}'
+        failed = f'Not sent: {label} ({failure.cause})' + ('' if done else f': the request never left this machine, so {nothing}')
         again = 'Rerun with only the pages not sent' if create else 'Rerun only what was not sent'
     else:
         advice = (f'it may have been created and may still appear, so look for a page titled {label} in {where} '
@@ -1700,6 +1961,8 @@ def report_writes(kind, done, label, failure, rest, total=None, where='', misses
                 else f"done in part on {where}: written: {'; '.join(done)}. ")
     elif not rest:
         again = ''
+    if finish is not None:
+        again = finish
     message = (head + failed + (f"; not sent: {(', ' if create else '; ').join(rest)}" if rest else '')
                + (f"; edits that did not apply: {'; '.join(misses)}" if misses else '')
                + (f'. {again}' if again else ''))
@@ -1727,7 +1990,7 @@ def write_edits(client, page, plan, matched, allow_deleting, misses):
     if allow_deleting:
         command['allow_deleting_content'] = True
     answer = client.call('PATCH', f"/v1/pages/{page['id']}/markdown",
-                         {'markdown_version': MARKDOWN_VERSION, 'type': 'update_content', 'update_content': command})
+                         {'markdown_version': MARKDOWN_VERSION, 'type': 'update_content', 'update_content': command}) if matched else {}
     notion_misses = [w for w in answer.get('warnings', []) if w.get('code') in ('no_match', 'indentation_mismatch')]
     for number, old, _, state in plan:
         client.say(f'edit {number}: {state}' + ('' if state == 'matched' else f': {old[:80]!r}'))
@@ -1807,7 +2070,7 @@ def cmd_create(client, args):
     else:
         target, page_schema = {'page_id': parent['id']}, client.schema_for({'parent': {}})
         where = f"page {page_link(parent['id'])}"
-    payloads = []
+    payloads, held = [], []
     for number, (assignments, content, icon) in enumerate(drafts, 1):
         try:
             built = client.build_properties(assignments, page_schema)
@@ -1815,9 +2078,11 @@ def cmd_create(client, args):
             if len(drafts) > 1 and failure.code == USAGE:
                 raise Fail(USAGE, f'page {number} of {len(drafts)}: {failure.message}; nothing was sent')
             raise
-        payload, uploads = {'parent': target, 'properties': built}, []
+        payload, files = {'parent': target, 'properties': built}, []
         if content:
-            content, uploads = hold_uploads(content)
+            source = (f'--body-file {args.body_file}' if not args.pages_file else f'{args.pages_file}, page {number}')
+            content, files = hold_files(content, source)
+            held.append((source, files))
             payload['markdown'] = content
             payload['markdown_version'] = MARKDOWN_VERSION
         if icon:
@@ -1826,15 +2091,21 @@ def cmd_create(client, args):
         for name, value in payload['properties'].items():
             if page_schema['properties'][name].get('type') == 'title':
                 title = ''.join(part['text']['content'] for part in value['title'])
-        payloads.append((payload, title, uploads))
+        payloads.append((payload, title, files))
+    refuse_placeholders(held)
     created, seen = [], set()  # urls reported, and the ids of the pages this run created or found
-    for number, (payload, title, uploads) in enumerate(payloads):
+    for number, (payload, title, files) in enumerate(payloads):
         rest = [repr(t or '(untitled)') for _, t, _ in payloads[number + 1:]]
+        then = 'Then create only the pages not sent' if rest else ''
         try:
             page = create_one(client, kind, parent, payload, title, started, seen, where)
         except Fail as failure:
+            finish = None
+            if files and (failure.outcome or IN_DOUBT) == IN_DOUBT:
+                finish = ('If it was created: ' + files_left('<its url>', files, [file.id for file in files])
+                          + (f'. {then}' if then else ''))
             raise report_writes('create', created, repr(title or '(untitled)'), failure, rest, total=len(payloads),
-                                where=where)
+                                where=where, finish=finish)
         seen.add(page.get('id'))
         created.append(page.get('url') or page.get('id', ''))
         heading = dropped_heading(payload.get('markdown')) if title else ''
@@ -1842,12 +2113,9 @@ def cmd_create(client, args):
             client.warn(f'warning: Notion takes the only `#` heading of a body for a title when it is the first line, so '
                         f'{heading!r} was left out of {created[-1]}: start a body at `##`, or add the heading with '
                         '`notion update <page> --prepend-file F`')
-        if uploads:
-            try:
-                place_uploads(client, page['id'], uploads)
-            except Fail as failure:
-                raise report_writes('update', ['created ' + ', '.join(created)], 'uploaded files in the body', failure,
-                                    [f'the create of {t}' for t in rest], where=created[-1])
+        if files:
+            place_files(client, page['id'], files, ['created ' + ', '.join(created)], created[-1],
+                        [f'the create of {t}' for t in rest], then)
     return DONE
 
 
@@ -1871,18 +2139,9 @@ def create_one(client, kind, parent, payload, title, started, seen=(), where='')
 def dropped_heading(markdown):
     """The heading a create leaves out, '' when none: the API takes a body's `#` heading for a title, and drops
     it, when it is the only one and the first line, even if the title was given."""
-    fence, lines = '', []
-    for line in (markdown or '').split('\n'):
-        ticks = re.match(r'\s*(`{3,})', line)
-        if fence:
-            fence = '' if ticks and len(ticks.group(1)) >= len(fence) else fence
-        elif ticks:
-            fence = ticks.group(1)
-            lines.append(line)
-        elif line.strip():
-            lines.append(line)
-    headings = [line for line in lines if re.match(r' {0,3}#\s+\S', line)]
-    return headings[0].strip() if len(headings) == 1 and lines[0] == headings[0] else ''
+    rows = [(line, fence) for line, fence in body_lines(markdown or '') if line.strip()]
+    headings = [row for row in rows if row[1] is None and re.match(r' {0,3}#\s+\S', row[0])]
+    return headings[0][0].strip() if len(headings) == 1 and rows[0] is headings[0] else ''
 
 
 def find_created(client, kind, parent, title, started, doubt, seen=()):
@@ -2558,10 +2817,11 @@ def cmd_upload(client, args):
     reference = f"file-upload://{created['id']}"
     client.say(f"uploaded {path.name} ({sent.get('status', 'sent')}): within one hour, put this line in a body "
                '(`notion create` or `notion update`, which place the file)')
+    name = re.sub(r'([\\\[\]`<>])', r'\\\1', path.name)  # a name is text, whatever it holds
     if mime.startswith('image/'):
-        client.say(f'![{path.name}]({reference})')
+        client.say(f'![{name}]({reference})')
     else:
-        client.say(f'<file source="{reference}">{path.name}</file>')
+        client.say(f'<file source="{reference}">{name}</file>')
     client.say(f"or as a files property: --set 'Files={reference}'")
     return DONE
 

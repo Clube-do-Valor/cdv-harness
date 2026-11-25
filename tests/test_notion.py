@@ -5,6 +5,7 @@ from synthetic objects written from the shapes of the official API reference. No
 copied from a real workspace: ids are made up, people are "Ana Lima" and "Bruno Costa", and ticket
 keys and data source references are built at runtime so the public scan never sees one."""
 
+import collections
 import contextlib
 import datetime
 import http.client
@@ -16,6 +17,7 @@ import json
 import os
 import random
 import re
+import shlex
 import shutil
 import socket
 import ssl
@@ -248,6 +250,7 @@ class FakeNotion:
         self.property_items = {}
         self.blocks = {}
         self.children = {}  # page or block id -> the blocks under it, as the block endpoints give them
+        self.page_of = {}  # block id -> the page it was stored on
         self.files = {}
         self.next_number = 200
         self.next_id = 0x5000
@@ -439,48 +442,116 @@ class FakeNotion:
         return made
 
     def patch_block(self, identifier, body):
-        """A media block given an uploaded file: it becomes a hosted file with a signed url."""
+        """A media block given an uploaded file: it becomes a hosted file with a signed url, in the body too."""
         block = self.blocks[identifier]
         upload = body[block["type"]]["file_upload"]["id"]
+        hosted = f"https://files.example.com/{upload}?X-Amz-Expires=3600"
+        before = block[block["type"]].get("external", {}).get("url")
         block[block["type"]] = {"caption": block[block["type"]]["caption"], "type": "file",
-                                "file": {"url": f"https://files.example.com/{upload}?X-Amz-Expires=3600",
-                                         "expiry_time": "2026-11-22T10:30:00.000Z"}}
+                                "file": {"url": hosted, "expiry_time": "2026-11-22T10:30:00.000Z"}}
+        page = self.page_of.get(identifier)
+        if before and page:
+            self.markdown[page] = self.markdown[page].replace(before, hosted, 1)
         return 200, block
 
+    class Refused(Exception):
+        """A body the markdown endpoints answer 400 to, as seen on the real API."""
+
     def store_blocks(self, identifier, markdown):
-        """The blocks Notion stores for the constructs the tests write: callout, table, toggle, media, text.
-        A media address that is not http(s) is stored empty, as the real API does with file-upload://."""
-        def media(kind, url, caption):
-            return self.block(kind, {"caption": text(caption), "type": "external",
-                                     "external": {"url": url if url.startswith("http") else ""}})
-
-        def line_of(value):
-            found = (re.fullmatch(r"!\[()(.*?)\]\((.*?)\)", value)
-                     or re.fullmatch(r'<(image|file|pdf|audio|video) source="([^"]*)"(?: />|>(.*?)</\1>)', value))
-            if not found:
-                return paragraph(value)
-            kind, a, b = found.groups()
-            return media(kind, a, b or "") if kind else media("image", b, a)
-
+        """The blocks Notion stores for the constructs the tests write: callout, table, toggle, columns, quote, code,
+        media, text. As the real API: a media address that is not http(s) is stored empty; an image that is not
+        alone on its line and an attribute in single quotes are refused; a media tag in a sentence or a cell is text."""
         def paragraph(value):
             return self.block("paragraph", {"rich_text": text(value), "color": "default"})
-        stored = []
-        pattern = (r'<callout icon="([^"]+)"[^>]*>\n(.*?)\n</callout>|<table([^>]*)>\n(.*?)</table>|'
-                   r"<toggle>\n(.*?)\n\n(.*?)\n</toggle>|([^\n]+)")
-        for m in re.finditer(pattern, markdown, re.S):
-            icon, callout, flags, rows, toggle, hidden, line = m.groups()
-            if callout is not None:
-                stored.append(self.block("callout", {"rich_text": text(callout), "icon": {"type": "emoji", "emoji": icon},
-                                                     "color": "gray_background"}))
-            elif rows is not None:
-                cells = [re.findall(r"<td>(.*?)</td>", row) for row in re.findall(r"<tr>(.*?)</tr>", rows, re.S)]
-                made = [self.block("table_row", {"cells": [text(c) for c in row]}) for row in cells]
-                stored.append(self.block("table", {"table_width": len(cells[0]), "has_column_header": 'header-row="true"' in flags,
-                                                   "has_row_header": False}, made))
-            elif toggle is not None:
-                stored.append(self.block("toggle", {"rich_text": text(toggle), "color": "default"}, [line_of(hidden)]))
-            else:
-                stored.append(line_of(line))
+
+        def plain_line(value):
+            shown = re.sub(r"`[^`]*`", "", value)
+            if re.search(r"(?<!\\)!\[[^\]]*\]\(", shown):
+                raise self.Refused("Images must be standalone blocks and cannot be mixed with paragraph text or other images.")
+            if re.search(r"^<\w+ [^>]*=\s*'", shown):
+                raise self.Refused("Malformed attribute. Attribute values must use double quotes.")
+            return value
+
+        def line_of(value):
+            value = value.strip()
+            found = re.fullmatch(r"!\[((?:[^\[\]\\]|\\.|\[[^\]]*\])*)\]\(\s*<?([^\s<>]*)>?(?:\s+(?:\"[^\"]*\"|'[^']*'|\([^()]*\)))?\s*\)", value)
+            kind, caption, url = ("image", found.group(1), found.group(2)) if found else (None, "", "")
+            tag = re.fullmatch(r'<(image|file|pdf|audio|video|bookmark|embed)\s(?:[^<>]*?\s)?(?:source|src)\s*=\s*"([^"]*)"[^<>]*?'
+                               r"(?:/>|>([^<]*)</\1>)", value)
+            if tag:
+                kind, url, caption = tag.groups()
+            if kind in ("bookmark", "embed"):
+                return self.block(kind, {"caption": [], "url": url})
+            if not kind:
+                return paragraph(plain_line(value))
+            if url.startswith("https://files.example.com/"):
+                return self.block(kind, {"caption": text(caption or ""), "type": "file", "file": {"url": url}})
+            return self.block(kind, {"caption": text(caption or ""), "type": "external",
+                                     "external": {"url": url if url.startswith("http") else ""}})
+
+        def inside(lines, at, tag):
+            """(the lines between an opening tag's line and its closing one, the place after it)."""
+            depth, inner = 1, []
+            for place in range(at + 1, len(lines)):
+                depth += bool(re.match(rf"\s*<{tag}[ >]", lines[place])) - lines[place].count(f"</{tag}>")
+                if depth == 0:
+                    return inner, place + 1
+                inner.append(lines[place])
+            raise self.Refused(f"Trailing unclosed tags were auto-closed: <{tag}>.")
+
+        def blocks_of(lines):
+            made, at = [], 0
+            while at < len(lines):
+                line = lines[at].strip()
+                fence = re.match(r"(`{3,})[^`]*$|(~{3,})", line)
+                if not line:
+                    at += 1
+                elif fence:
+                    mark, code = fence.group(1) or fence.group(2), []
+                    at += 1
+                    while at < len(lines) and not (set(lines[at].strip()) == {mark[0]} and len(lines[at].strip()) >= len(mark)):
+                        code.append(lines[at])
+                        at += 1
+                    at += 1
+                    made.append(self.block("code", {"rich_text": text("\n".join(code)), "language": "plain text"}))
+                elif line.startswith(">"):
+                    quoted = []
+                    while at < len(lines) and lines[at].strip().startswith(">"):
+                        quoted.append(re.sub(r"^\s*> ?", "", lines[at]))
+                        at += 1
+                    made.append(self.block("quote", {"rich_text": [], "color": "default"}, blocks_of(quoted)))
+                elif line.startswith("<table"):
+                    inner, after = inside(lines, at, "table")
+                    cells = [re.findall(r"<td>(.*?)</td>", row, re.S) for row in re.findall(r"<tr>(.*?)</tr>", "\n".join(inner), re.S)]
+                    if any(re.search(r"!\[[^\]]*\]\(", cell) for row in cells for cell in row):
+                        raise self.Refused("Inline image Markdown is not supported in rich text.")
+                    rows = [self.block("table_row", {"cells": [text(c) for c in row]}) for row in cells]
+                    made.append(self.block("table", {"table_width": len(cells[0]), "has_column_header": 'header-row="true"' in line,
+                                                     "has_row_header": False}, rows))
+                    at = after
+                elif re.match(r"<(callout|toggle|columns|column)\b", line):
+                    kind = re.match(r"<(\w+)", line).group(1)
+                    inner, after = inside(lines, at, kind)
+                    if kind in ("callout", "toggle"):
+                        content = {"rich_text": text(inner[0] if inner else ""), "color": "default"}
+                        if kind == "callout":
+                            content.update(icon={"type": "emoji", "emoji": re.search(r'icon="([^"]+)"', line).group(1)}, color="gray_background")
+                        made.append(self.block(kind, content, blocks_of(inner[1:])))
+                    else:
+                        made.append(self.block({"columns": "column_list"}.get(kind, kind), {}, blocks_of(inner)))
+                    at = after
+                else:
+                    made.append(line_of(lines[at]))
+                    at += 1
+            return made
+
+        def placed_on(blocks):
+            for block in blocks:
+                self.page_of[block["id"]] = identifier
+                placed_on(self.children[block["id"]])
+
+        stored = blocks_of(markdown.split("\n"))
+        placed_on(stored)
         self.children[identifier] = stored
 
     def patch_markdown(self, identifier, body):
@@ -505,8 +576,11 @@ class FakeNotion:
             content = body["insert_content"]["content"]
             position = (body["insert_content"].get("position") or {}).get("type", "end")
             current = content + "\n\n" + current if position == "start" else current + "\n\n" + content
+        try:
+            self.store_blocks(identifier, current)
+        except self.Refused as refused:
+            return error(400, "validation_error", f"Markdown errors blocked parsing:\n{refused}")
         self.markdown[identifier] = current
-        self.store_blocks(identifier, current)
         answer = self.page_markdown(identifier)
         if warnings:
             answer["warnings"] = warnings
@@ -584,9 +658,12 @@ class FakeNotion:
             page["created_time"] = self.now
         if body.get("icon"):
             page["icon"] = body["icon"]
-        self.add_page(page, body.get("markdown", ""))
         if body.get("markdown"):
-            self.store_blocks(identifier, body["markdown"])
+            try:
+                self.store_blocks(identifier, body["markdown"])
+            except self.Refused as refused:
+                return error(400, "validation_error", f"Markdown errors blocked parsing:\n{refused}")
+        self.add_page(page, body.get("markdown", ""))
         return 200, page
 
     def create_comment(self, body):
@@ -1246,7 +1323,11 @@ class CreateTest(ClientTestCase):
         # The API drops a body's only level-1 heading when it is the first line, title given or not.
         cases = [("# Only\n\nText.\n", "'# Only'"), ("\n# Only\n## Sub\n\n```\n# code\n```\n", "'# Only'"),
                  ("# One\n\nText.\n\n# Two\n", None), ("Intro.\n\n# Mid\n", None), ("## Sub\n\nText.\n", None),
-                 ("```\n# code\n```\n", None), ("#tag text\n", None), ("", None)]
+                 ("```\n# code\n```\n", None), ("#tag text\n", None), ("", None),
+                 ("# Only\n\n```\na\n```js\n# in code\n```\n", "'# Only'"), ("# Only\n\n~~~\n# in code\n~~~\n", "'# Only'"),
+                 ("# Only\n\n> ```\n> # in code\n> ```\n\ntext\n", "'# Only'"), ("# Only\n\n~~~\na\n```\n# in code\n~~~\n", "'# Only'"),
+                 ("~~~\n# code\n~~~\n", None), ("```code``` text\n\n# Mid\n", None), ("# One\n\n```code``` text\n\n# Two\n", None),
+                 ("Title\n=====\n\nText.\n", None), ("> # quoted\n\nText.\n", None)]
         body = self.tmp / "body.md"
         for markdown, heading in cases:
             with self.subTest(markdown=markdown):
@@ -1367,7 +1448,8 @@ class CreateTest(ClientTestCase):
         self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", lambda r: error(400, "validation_error", "Bad markdown."))
         code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--append-file", note)
         self.assertEqual(code, 4, err)
-        self.assertRegex(err, r"Not written: body added at the end \(.*400.*\): Notion refused it and nothing changed")
+        self.assertRegex(err, r"Not written: body added at the end \(.*400.*\): Notion refused it\. ")
+        self.assertNotIn("nothing changed", err)  # the properties were written
         self.assertIn("Rerun only what was not written", err)
         self.assertNotIn("In doubt", err)
 
@@ -1562,12 +1644,14 @@ def ends_in(outcome):
 class WriteOutcomeTest(ClientTestCase):
     """One rule for every write that does not come back with a success: refused, not sent or in doubt."""
 
-    def assert_case(self, case, err):
+    def assert_case(self, case, err, landed=False):
+        if landed:  # once a write of the command landed, no line says that nothing changed
+            self.assertNotRegex(err, r"(?i)nothing changed|nothing was made|never left this machine")
         if case == "refused":
-            self.assertRegex(err, r"Notion refused it and nothing (changed|was made)")
+            self.assertRegex(err, r"Notion refused it" + ("" if landed else r" and nothing (changed|was made)"))
             self.assertNotRegex(err, r"(?i)in doubt|may have been|never left")
         elif case == "not sent":
-            self.assertRegex(err, r"the request never left this machine, so nothing (changed|was made)")
+            self.assertRegex(err, r"Not sent: " if landed else r"the request never left this machine, so nothing (changed|was made)")
             self.assertNotRegex(err, r"(?i)in doubt|may have been|refused it")
         else:
             self.assertRegex(err, r"(?i)\bin doubt\b")
@@ -1616,7 +1700,7 @@ class WriteOutcomeTest(ClientTestCase):
                     code, out, err = self.run_cli(*args)
                     expected = 4 if name == "create --pages-file" else (on_400 if outcome == "400" else 1)
                     self.assertEqual(code, expected, err)
-                    self.assert_case(case, err)
+                    self.assert_case(case, err, landed=name == "create --pages-file")
                     first = 1 if name == "create --pages-file" else 0
                     self.assertEqual(len(sends), first + (6 if outcome == "429" else 1), "a write is never resent blindly")
         for doc in ("SKILL.md", "references/api-limits.md"):
@@ -2501,6 +2585,13 @@ class FilesTest(ClientTestCase):
         self.assertIn(b"fake image", sent.raw)
         self.assertIn(b'name="file"; filename="screen.png"', sent.raw)
         self.assertIn(f"![screen.png](file-upload://{upload_id})", out)
+        for odd in ("a]b[c.png", "a`b.png", "a`b].txt", "x<y>.txt", "[[.png", "a (1) é.png"):  # the printed line is always a file
+            with self.subTest(name=odd):
+                (self.tmp / odd).write_bytes(b"x")
+                code, out, err = self.run_cli("upload", self.tmp / odd)
+                line = next(line for line in out.splitlines() if line.startswith(("!", "<")))
+                got, files = self.n.hold_files("a ` b\n\n```\ncode\n```\n\n" + line, "body.md")
+                self.assertEqual(len(files), 1, line)
 
     def placed(self, page_id):
         """(type, uploaded or external address) of each media block of a page, in its toggles too."""
@@ -2550,35 +2641,409 @@ class FilesTest(ClientTestCase):
         self.assertEqual(self.fake.sent("GET", r"/v1/blocks/.*"), [])  # no upload, no extra read
 
     def test_an_upload_that_cannot_be_placed_exits_4_saying_what_landed(self):
-        upload = uid(0xF11E)
-        body = self.tmp / "body.md"
+        # Three files; the request that places the 1st, the 2nd or the 3rd ends in each way a write can end. Whatever
+        # lands is named as written, the failing one is in its own case, the later ones were not sent, and the
+        # commands of the message finish the job.
+        names = {uid(0xA001): "one.png", uid(0xA002): "two.txt", uid(0xA003): "three.png"}
+        text_ = ("\n\n".join(f"![{name}](file-upload://{i})" if name.endswith("png") else f'<file source="file-upload://{i}">{name}</file>'
+                             for i, name in names.items()))
+        body, pages = self.tmp / "body.md", self.tmp / "pages.json"
+        body.write_text(text_)
+        pages.write_text(json.dumps([{"properties": {"Task name": "First"}, "content": text_}, {"properties": {"Task name": "Second"}}]))
+        verbs = {  # name -> arguments, what was written before the files
+            "replace": (("update", PAGE, "--set", "Status=Rollout", "--replace-file", body), "written: properties Status; body replaced"),
+            "append": (("update", PAGE, "--append-file", body), "written: body added at the end"),
+            "prepend": (("update", PAGE, "--prepend-file", body), "written: body added at the start"),
+            "edit": (("update", PAGE, "--edit", "by hand", "by hand.\n\n" + text_ + "\n\n"), "written: body edits 1"),
+            "create": (("create", "--parent", "Tasks", "--set", "title=With files", "--body-file", body), "written: created "),
+            "pages": (("create", "--parent", "Tasks", "--pages-file", pages), "written: created "),
+        }
+        for verb, (args, before) in verbs.items():
+            for failing in (1, 2, 3):
+                for outcome, case in dict(WRITE_OUTCOMES, **{"401": "refused"}).items():
+                    with self.subTest(verb=verb, failing=failing, outcome=outcome):
+                        self.fake.overrides.clear()
+                        self.fake.calls.clear()
+                        self.fake.markdown[PAGE] = "## Context\n\nThe finance team exports invoices by hand.\n"
+                        state, fails = {"sent": 0}, ends_in(outcome)
+
+                        def place(r, state=state, fails=fails, failing=failing):
+                            state["sent"] += 1
+                            return fails(r) if state["sent"] >= failing else None
+
+                        self.fake.on("PATCH", r"/v1/blocks/[^/]+", place)
+                        code, out, err = self.run_cli(*args)
+                        self.assertEqual(code, 4, err)
+                        self.assertIn(before, err)
+                        self.assertNotRegex(err, r"nothing changed|never left this machine|nothing was made")
+                        page = PAGE if verb not in ("create", "pages") else list(self.fake.pages)[-1]
+                        blocks = {b["id"]: b for b in self.fake.children[page]}
+                        label = {"refused": "Not written", "not sent": "Not sent", "in doubt": "In doubt"}[case]
+                        for place_, (upload, name) in enumerate(names.items(), 1):
+                            said = f"file '{name}' ({upload})"
+                            if place_ < failing:
+                                self.assertRegex(err, rf"written: .*{re.escape(said)} placed in block .*\. {label}: ")
+                            elif place_ == failing:
+                                self.assertRegex(err, rf"{label}: {re.escape(said)} in block ")
+                                self.assertNotIn(f"{said} placed", err)
+                            else:
+                                self.assertRegex(err, rf"not sent: .*{re.escape(said)} in block ")
+                                self.assertNotIn(f"{said} placed", err)
+                        self.assertTrue(blocks)
+                        if verb == "pages":
+                            self.assertIn("the create of 'Second'", err)
+                            self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+                        commands = self.commands(err)
+                        self.assertEqual([c[-1] for c in commands], [f"file-upload://{u}" for u in list(names)[failing - 1:]])
+                        self.fake.overrides.clear()
+                        for command in commands:
+                            code, out, err = self.run_cli(*command)
+                            self.assertEqual(code, 0, err)
+                            self.assertIn("uploaded files placed: 1", out)
+                        self.assert_all_placed(page, names)
+                        for command in commands:  # safe to run again: there is nothing left to place
+                            code, out, err = self.run_cli(*command)
+                            self.assertEqual(code, 1, err)
+                            self.assertIn("no edit matched the body, so nothing was changed", err)
+
+    def test_files_that_cannot_be_read_back_are_named_with_the_command_that_places_them(self):
+        upload, body = uid(0xF11E), self.tmp / "body.md"
         body.write_text(f"![a](file-upload://{upload})")
-        self.fake.on("PATCH", r"/v1/blocks/[^/]+", lambda r: error(400, "validation_error", "File upload expired."))
+        for status in (403, 404, "timeout", "tls eof"):
+            for when in ("to place", "to confirm"):
+                with self.subTest(status=status, when=when):
+                    self.fake.overrides.clear()
+                    self.fake.calls.clear()
+                    reads, fails = [], (ends_in(status) if isinstance(status, str) else lambda r, s=status: error(s, "restricted_resource", "No."))
+
+                    def read(r, reads=reads, fails=fails, when=when):
+                        reads.append(r)
+                        return fails(r) if when == "to place" or len(reads) > 1 else None
+
+                    self.fake.on("GET", rf"/v1/blocks/{PAGE}/children", read)
+                    code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--replace-file", body)
+                    self.assertEqual(code, 4, err)
+                    self.assertNotRegex(err, r"nothing changed|never left this machine")
+                    placed = self.fake.sent("PATCH", r"/v1/blocks/[^/]+")
+                    if when == "to place":
+                        self.assertEqual(placed, [])
+                        self.assertIn(f"Not sent: file 'a' ({upload}) (the page could not be read to place them", err)
+                        self.assertIn("The page still holds the placeholder", err)
+                        self.assertEqual(self.commands(err), [["update", self.page["url"], "--edit",
+                                                               f"https://file-upload.invalid/{upload}", f"file-upload://{upload}"]])
+                    else:
+                        self.assertEqual(len(placed), 1)
+                        self.assertIn(f"file 'a' ({upload}) placed in block", err)
+                        self.assertIn("Not confirmed: the page could not be read again", err)
+                    self.assertNotIn("uploaded files placed", out)
+
+    def test_a_placeholder_left_after_placing_exits_4_naming_the_file_and_the_command(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        body = self.tmp / "body.md"
+        # a block that took its file and still holds the placeholder
+        body.write_text(f"![a](file-upload://{one})\n\n![b](file-upload://{two})\n")
+        self.fake.on("PATCH", r"/v1/blocks/[^/]+", lambda r: (200, {}) if two in json.dumps(r.json) else None)
         code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
-        self.assertEqual(code, 4)
-        self.assertIn("written: body replaced", err)
-        self.assertIn("Not written: uploaded files in the body (Notion answered 400 validation_error", err)
-        block = self.fake.children[PAGE][0]["id"]
-        self.assertIn(f"notion api PATCH /v1/blocks/{block} --data '" + json.dumps({"image": {"file_upload": {"id": upload}}}) + "'", err)
-        pages = self.tmp / "pages.json"
-        pages.write_text(json.dumps([{"properties": {"Task name": "First"}, "content": body.read_text()},
-                                     {"properties": {"Task name": "Second"}}]))
-        code, out, err = self.run_cli("create", "--parent", "Tasks", "--pages-file", pages)
-        self.assertEqual(code, 4)
-        url = re.search(r"created (\S+)", out).group(1)
-        self.assertIn(f"written: created {url}", err)
-        self.assertIn("not sent: the create of 'Second'", err)
-        self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1)
+        self.assertEqual(code, 4, err)
+        self.assertIn(f"file 'a' ({one}) placed in block", err)
+        self.assertRegex(err, rf"In doubt: file 'b' \({two}\) in block .*still holds the placeholder")
+        self.assertEqual([c[-1] for c in self.commands(err)], [f"file-upload://{two}"])
         self.fake.overrides.clear()
-        self.fake.on("GET", r"/v1/blocks/[^/]+/children", lambda r: error(403, "restricted_resource", "No."))
+        # a reference that lands where no block is made of it: the new text of an edit, inside a fence of the page
+        self.fake.markdown[PAGE] = "Intro\n\n```\nHERE\n```\n"
+        for first in (True, False):  # with a file that can be placed, and alone
+            with self.subTest(with_another=first):
+                self.fake.calls.clear()
+                args = ("--prepend-file", body) if first else ()
+                body.write_text(f"![a](file-upload://{one})\n")
+                code, out, err = self.run_cli("update", PAGE, *args, "--edit", "HERE" if first else "Intro", f"![b](file-upload://{two})"
+                                              if first else f"text\n\n```\n![b](file-upload://{two})\n```")
+                if not first:
+                    self.assertEqual(code, 0, err)  # in code: text, and no file of this command
+                    continue
+                self.assertEqual(code, 4, err)
+                self.assertIn("written: body edits 1", err)
+                self.assertRegex(err, rf"Not sent: file 'b' \({two}\) \(.*stands in a code block")
+                self.assertIn(f"![b](file-upload://{two})", err)
+                self.assertIn("--append-file", err)
+                self.assertIn("not sent: body added at the start", err)
+                self.assertNotRegex(err, r"nothing changed|never left this machine")
+        # a file no block was made of at all
+        self.fake.store_blocks = lambda identifier, markdown: self.fake.children.__setitem__(identifier, [])
+        body.write_text(f"![a](file-upload://{one})\n")
         code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
-        self.assertEqual(code, 4)
-        self.assertIn("Not sent: uploaded files in the body (the page could not be read to place them", err)
+        self.assertEqual(code, 4, err)
+        self.assertIn(f"Not sent: file 'a' ({one}) (no block of the page holds file 'a' ({one}))", err)
+
+    def test_a_rerun_never_leaves_a_placeholder_nor_takes_one_for_another_file(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        start, note, other = "## Context\n", self.tmp / "note.md", self.tmp / "other.md"
+        note.write_text(f"![a](file-upload://{one})\n")
+        other.write_text(f"![b](file-upload://{two})\n")
+
+        def lost_placement():
+            self.fake.overrides.clear()
+            self.fake.on("PATCH", r"/v1/blocks/[^/]+", ends_in("503"))
+
+        # append, its placement lost, then the same append again
+        self.fake.markdown[PAGE] = start
+        lost_placement()
+        code, out, err = self.run_cli("update", PAGE, "--append-file", note)
+        self.assertEqual(code, 4, err)
         self.fake.overrides.clear()
-        body.write_text(f'<bookmark source="file-upload://{upload}" />')
+        code, out, err = self.run_cli("update", PAGE, "--append-file", note)
+        self.assertEqual(code, 0, err)
+        self.assert_all_placed(PAGE, {one: 2})
+        self.assertEqual(err, "")
+
+        # the placeholder of another upload is never given this command's file, and it is named
+        self.fake.markdown[PAGE] = start
+        lost_placement()
+        self.run_cli("update", PAGE, "--append-file", note)
+        self.fake.overrides.clear()
+        code, out, err = self.run_cli("update", PAGE, "--append-file", other)
+        self.assertEqual(code, 0, err)
+        left = [b for b in self.fake.children[PAGE] if b["type"] == "image" and b["image"]["type"] == "external"]
+        self.assertEqual([b["image"]["external"]["url"] for b in left], [f"https://file-upload.invalid/{one}"])
+        self.assertEqual(self.placed(PAGE)[1], ("image", "https://files.example.com/" + two))
+        self.assertIn(f"warning: block {left[0]['id']} of {self.page['url']} holds the placeholder of another upload ({one})", err)
+        self.assertIn(f"--edit 'https://file-upload.invalid/{one}' 'file-upload://<new id>'", err)
+        three = uid(0xF13E)  # the upload expired: a new one takes its place
+        code, out, err = self.run_cli("update", PAGE, "--edit", f"https://file-upload.invalid/{one}", f"file-upload://{three}")
+        self.assertEqual(code, 0, err)
+        self.assert_all_placed(PAGE, {two: 1, three: 1})
+
+        # prepend lands with its file, the append of the same file is refused; only what was not written is run again
+        self.fake.markdown[PAGE] = start
+        self.fake.calls.clear()
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", lambda r: error(400, "validation_error", "No.")
+                     if r.json["insert_content"]["position"]["type"] == "end" else None)
+        code, out, err = self.run_cli("update", PAGE, "--prepend-file", note, "--append-file", note)
+        self.assertEqual(code, 4, err)
+        self.assertRegex(err, rf"written: body added at the start; file 'a' \({one}\) placed in block \S+\. Not written: body added at the end")
+        self.assertIn(f"not sent: file 'a' ({one})", err)
+        self.assertIn("Rerun only what was not written or not sent", err)
+        self.assertNotIn("nothing changed", err)
+        self.assert_all_placed(PAGE, {one: 1})
+        self.fake.overrides.clear()
+        code, out, err = self.run_cli("update", PAGE, "--append-file", note)
+        self.assertEqual(code, 0, err)
+        self.assert_all_placed(PAGE, {one: 2})
+
+        # the body write itself in doubt: the file was not sent, and the message says how to place it if it landed
+        self.fake.markdown[PAGE] = start
+
+        def landed_then_lost(r):
+            self.fake.patch_markdown(PAGE, r.json)
+            return ends_in("tls eof")(r)
+
+        self.fake.on("PATCH", rf"/v1/pages/{PAGE}/markdown", landed_then_lost)
+        code, out, err = self.run_cli("update", PAGE, "--append-file", note)
+        self.assertEqual(code, 1, err)
+        self.assertIn("In doubt: body added at the end", err)
+        self.assertIn(f"not sent: file 'a' ({one})", err)
+        self.fake.overrides.clear()
+        for command in self.commands(err):
+            code, out, err = self.run_cli(*command)
+            self.assertEqual(code, 0, err)
+        self.assert_all_placed(PAGE, {one: 1})
+
+        # a create in doubt that landed is found by its title and its file is placed in it; not found, it is named
+        def made_then_lost(r):
+            self.fake.create_page(r.json)
+            return ends_in("tls eof")(r)
+
+        self.fake.on("POST", r"/v1/pages", made_then_lost)
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Found later", "--body-file", note)
+        self.assertEqual(code, 0, err)
+        self.assert_all_placed(list(self.fake.pages)[-1], {one: 1})
+        self.fake.overrides.clear()
+        self.fake.on("POST", r"/v1/pages", ends_in("tls eof"))
+        code, out, err = self.run_cli("create", "--parent", "Tasks", "--set", "title=Never found", "--body-file", note)
+        self.assertEqual(code, 1, err)
+        self.assertIn("In doubt: 'Never found'", err)
+        self.assertIn(f"`notion update <its url> --edit 'https://file-upload.invalid/{one}' 'file-upload://{one}'`", err)
+
+    def test_a_body_that_holds_a_placeholder_is_refused_unless_the_command_supplies_its_file(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        stale, body, pages = f"https://file-upload.invalid/{one}", self.tmp / "body.md", self.tmp / "pages.json"
+        self.fake.markdown[PAGE] = f"![a]({stale})\n"
+        forms = [f"![a]({stale})", f"Intro\n\n> ![a]({stale})", f'<file source="{stale}">\na\n</file>', f"<toggle>\nT\n\n![a]({stale})\n</toggle>"]
+        for form in forms:
+            body.write_text(form)
+            pages.write_text(json.dumps([{"properties": {"Task name": "One"}, "content": form}]))
+            for verb in (("update", PAGE, "--set", "Status=Rollout", "--replace-file", body), ("update", PAGE, "--append-file", body),
+                         ("update", PAGE, "--prepend-file", body), ("update", PAGE, "--edit", "![a]", form + "\n\n![a]"),
+                         ("create", "--parent", "Tasks", "--set", "title=x", "--body-file", body),
+                         ("create", "--parent", "Tasks", "--pages-file", pages)):
+                with self.subTest(form=form, verb=verb[:3]):
+                    self.fake.calls.clear()
+                    code, out, err = self.run_cli(*verb)
+                    self.assertEqual(code, 2, err)
+                    self.assertIn(stale, err)
+                    self.assertIn(f"Write file-upload://{one} in its place", err)
+                    self.assertIn("nothing was sent", err)
+                    self.assertEqual(self.writes(), [])
+        # the same command supplies the file, or the placeholder stands in code: it is written
+        for form, wanted in ((f"![a]({stale})\n\n![b](file-upload://{one})", {one: 2}), (f"`{stale}`\n\n```\n![a]({stale})\n```\n", {})):
+            with self.subTest(form=form):
+                body.write_text(form)
+                code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+                self.assertEqual(code, 0, err)
+                self.assert_all_placed(PAGE, wanted)
+        # the other file of the command is not its file
+        body.write_text(f"![a]({stale})\n\n![b](file-upload://{two})")
         code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
-        self.assertEqual(code, 4)
-        self.assertIn(f"no image, file, pdf, audio or video block holds {upload}", err)
+        self.assertEqual(code, 2, err)
+
+    def test_a_file_is_placed_wherever_a_block_can_hold_it(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        image, tag = f"![a](file-upload://{one})", f'<file source="file-upload://{two}">b.txt</file>'
+        bodies = {  # name -> (body, the files it places)
+            "one file": (image, {one: 1}),
+            "two files": (f"{image}\n\n{tag}", {one: 1, two: 1}),
+            "the same file twice": (f"{image}\n\n{image}", {one: 2}),
+            "the same file as an image and as a file": (image + f'\n\n<file source="file-upload://{one}">x</file>', {one: 2}),
+            "in a toggle": (f"<toggle>\nMore\n\n{image}\n\n{tag}\n</toggle>", {one: 1, two: 1}),
+            "in a toggle in a toggle": (f"<toggle>\nMore\n\n<toggle>\nDeep\n\n{image}\n</toggle>\n</toggle>", {one: 1}),
+            "in columns": (f"<columns>\n<column>\n{image}\n</column>\n<column>\n{tag}\n</column>\n</columns>", {one: 1, two: 1}),
+            "in a callout": (f'<callout icon="⚡">\nTitle\n\n{image}\n</callout>', {one: 1}),
+            "in a quote": (f"> {image}", {one: 1}),
+            "beside code that shows one": (f"```\n{image}\n```\n\n{tag}", {two: 1}),
+            "an upper-case id": (f"![a](file-upload://{one.upper()})", {one: 1}),
+        }
+        pages, body = self.tmp / "pages.json", self.tmp / "body.md"
+        for name, (markdown, wanted) in bodies.items():
+            body.write_text(markdown)
+            pages.write_text(json.dumps([{"properties": {"Task name": "One"}, "content": markdown}]))
+            for verb, args in {"replace": ("update", PAGE, "--replace-file", body), "append": ("update", PAGE, "--append-file", body),
+                               "prepend": ("update", PAGE, "--prepend-file", body), "edit": ("update", PAGE, "--edit", "HERE", markdown),
+                               "create": ("create", "--parent", "Tasks", "--set", "title=x", "--body-file", body),
+                               "pages": ("create", "--parent", "Tasks", "--pages-file", pages)}.items():
+                with self.subTest(body=name, verb=verb):
+                    self.fake.calls.clear()
+                    self.fake.markdown[PAGE] = "Start\n\nHERE\n\nEnd\n"
+                    code, out, err = self.run_cli(*args)
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(err, "")
+                    page = PAGE if args[0] == "update" else list(self.fake.pages)[-1]
+                    self.assert_all_placed(page, wanted)
+                    self.assertIn(f"uploaded files placed: {sum(wanted.values())}", out)
+                    sent = self.fake.sent("PATCH", r"/v1/blocks/[^/]+")
+                    self.assertEqual(len(sent), sum(wanted.values()))
+                    self.assertGreater(self.fake.calls.index(self.fake.sent("GET", rf"/v1/blocks/{page}/children")[-1]),
+                                       self.fake.calls.index(sent[-1]), "the page is read again after the last file")
+                    for call in self.writes():
+                        self.assertFalse(re.search(r"!\[[^]]*\]\(file-upload|source=.file-upload", re.sub(r"```.*?```", "",
+                                                   json.dumps(call.json or {}), flags=re.S)), "an address the API does not know was sent")
+
+    def test_every_form_of_a_file_is_recognised_and_nothing_inside_code(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        u, held = f"file-upload://{one}", f"https://file-upload.invalid/{one}"
+        v, held_v = f"file-upload://{two}", f"https://file-upload.invalid/{two}"
+        recognised = [  # what is written -> what is sent
+            (f"![c]({u})", f"![c]({held})"), (f"![]({u})", f"![]({held})"), (f'![c]({u} "a title")', f'![c]({held} "a title")'),
+            (f"![c]({u} 'a title')", f"![c]({held} 'a title')"), (f"![c]({u} (a title))", f"![c]({held} (a title))"),
+            (f"![c]( {u} )", f"![c]( {held} )"), (f"![c](<{u}>)", f"![c](<{held}>)"), (f"![a [x] b]({u})", f"![a [x] b]({held})"),
+            (f"![a \\] b]({u})", f"![a \\] b]({held})"), (f"![a `x` b]({u})", f"![a `x` b]({held})"), (f"  ![c]({u})  ", f"  ![c]({held})  "),
+            (f"\t![c]({u})", f"\t![c]({held})"), (f"> ![c]({u})", f"> ![c]({held})"), (f"> > ![c]({u})", f"> > ![c]({held})"),
+            (f"![c]({u})\r", f"![c]({held})\r"), (f"![c](FILE-UPLOAD://{one})", f"![c]({held})"),
+            (f'<file source="{u}">c</file>', f'<file source="{held}">c</file>'), (f"<file source='{u}'>c</file>", f'<file source="{held}">c</file>'),
+            (f'<file source = "{u}" >c</file>', f'<file source = "{held}" >c</file>'), (f'<file source=" {u} ">c</file>', f'<file source="{held}">c</file>'),
+            (f'<file color="red" source="{u}">c</file>', f'<file color="red" source="{held}">c</file>'),
+            (f'<file source="{u}" color="red">c</file>', f'<file source="{held}" color="red">c</file>'),
+            (f'<file source="{u}" />', f'<file source="{held}" />'), (f'<file source="{u}">\nc\n</file>', f'<file source="{held}">\nc\n</file>'),
+            (f'<image src="{u}">c</image>', f'<image src="{held}">c</image>'), (f'<pdf source="{u}"></pdf>', f'<pdf source="{held}"></pdf>'),
+            (f'<audio source="{u}">c</audio>', f'<audio source="{held}">c</audio>'), (f'<video source="{u}">c</video>', f'<video source="{held}">c</video>'),
+            (f'- <file source="{u}">c</file>', f'- <file source="{held}">c</file>'), (f'- item\n\t<file source="{u}">c</file>', f'- item\n\t<file source="{held}">c</file>'),
+            (f'text\n<file source="{u}">c</file>\ntext', f'text\n<file source="{held}">c</file>\ntext'),
+        ]
+        for written, sent in recognised:
+            with self.subTest(recognised=written):
+                got, files = self.n.hold_files(written, "body.md")
+                self.assertEqual((got, [f.id for f in files]), (sent, [one]))
+        fenced = [  # code: text as it is; the file after it is a file
+            "```\n{}\n```", "````\n```\n{}\n```\n````", "~~~\n{}\n~~~", "~~~~\n~~~\n{}\n~~~~", "```js\n{}\n``` js\n{}\n```", "~~~ a`b\n{}\n~~~",
+            "~~~\na\n```\n{}\n~~~", "```\na\n    ```\n{}\n```", "```\n{}\n   ```", "```\n{}\n``````", "> ```\n> {}\n> ```", "> ~~~\n>{}\n> ~~~",
+            "> > ```\n> > {}\n> > ```", "- item\n\t```\n\t{}\n\t```", "- ```\n  {}\n  ```", "1. ```\n   {}\n   ```", "- a\n\t- b\n\t\t```\n\t\t{}\n\t\t```",
+            "text\n```\n{}\n```", "<toggle>\nT\n\n```\n{}\n```\n</toggle>", "$$\n{}\n$$", "$$\nx\n\n{}\n$$", "```\n\n{}\n\n```", "    ```\n    `{}`\n    ```",
+            "`{}`", "`` {} ``", "```{}```", "text `{}` text", "<code>{}</code>", "a `x` and `{}` b", "`a\n{} b`", "> ```\n> code\n",
+            "> ```\n> code", "- item\n\t```\n\tcode\n", "- ```\n", "```code``` text", "~~~not closed by ticks~~~ {}\n~~~", "text ```code``` text",
+            "```\na\n```\n\n``` js\n{}\n```", "# a\n\n`x`", "a ` b", "\\`", "~~", "``` a`b",
+        ]
+        for shape in fenced:
+            for example in (f"![c]({u})", f'<file source="{u}">c</file>'):
+                with self.subTest(code=shape, example=example):
+                    code = shape.replace("{}", example)
+                    if shape in ("text `{}` text", "a `x` and `{}` b", "`{}`", "`` {} ``", "```{}```", "<code>{}</code>", "`a\n{} b`"):
+                        code = shape.replace("{}", example + " ")
+                    got, files = self.n.hold_files(f"{code}\n\n![d]({v})", "body.md")
+                    self.assertEqual((got, [f.id for f in files]), (f"{code}\n\n![d]({held_v})", [two]))
+        refused = [  # (body, the line it names): outside code and not a block of its own, or code nothing closes
+            (f"Before ![c]({u}) after", 1), (f"Before ![c]({u})", 1), (f"![c]({u}) after", 1), (f"a\n\n- item ![c]({u})", 3), (f"- ![c]({u})", 1),
+            (f"## Heading ![c]({u})", 1), (f"## ![c]({u})", 1), (f"| a | b |\n| --- | --- |\n| ![c]({u}) | x |", 3),
+            (f"<table>\n<tr><td>![c]({u})</td></tr>\n</table>", 2), (f'<table>\n<tr>\n<td>\n<file source="{u}">c</file>\n</td>\n</tr>\n</table>', 4),
+            (f"<table>\n<tr>\n<td>\n![c]({u})\n</td>\n</tr>\n</table>", 4), (f"![a]({u}) ![b]({v})", 1), (f"[![c]({u})](https://example.com/)", 1),
+            (f"[c]({u})", 1), (f"see {u} there", 1), (f"<{u}>", 1), (f"![c][r]\n\n[r]: {u}", 3), (f"\\![c]({u})", 1), (f'\\<file source="{u}">c</file>', 1),
+            (f'Text <file source="{u}">c</file>', 1), (f'<file source="{u}">c</file> text', 1), (f'<file source="{u}">c</file> <file source="{v}">d</file>', 1),
+            (f'## <file source="{u}">c</file>', 1), (f'<embed source="{u}" />', 1), (f'<bookmark source="{u}" />', 1), (f"<file source={u}>c</file>", 1),
+            (f'<FILE SOURCE="{u}">c</FILE>', 1), (f"<!-- ![c]({u}) -->", 1), (f"\\`![c]({u})\\`", 1), (f"a $![c]({u})$ b", 1), (f"![a\nb]({u})", 2),
+            (f"![c `]({u})\n\n` d", 1), (f"a ` b\n\n![c]({u})\n\nc ` d", 3), (f"a ` b\n![c]({u})\nc ` d", 2), (f"```\ncode\n\n![c]({u})", 4),
+            (f"~~~\n![c]({u})\n```\n", 2), (f"![c]({u}) {{color=\"red\"}}", 1), ("![c](file-upload://not-an-id)", 1), ("<file source='file-upload://<id>'>c</file>", 1),
+            (f"![c]({u}?x=1)", 1),
+        ]
+        for markdown, line in refused:
+            with self.subTest(refused=markdown):
+                with self.assertRaises(self.n.Fail) as raised:
+                    self.n.hold_files(markdown, "body.md")
+                self.assertEqual(raised.exception.code, 2)
+                self.assertTrue(raised.exception.message.startswith(f"body.md, line {line}: "), raised.exception.message)
+                self.assertIn("nothing was sent", raised.exception.message)
+                body = self.tmp / "refused.md"
+                body.write_text(markdown)
+                for verb in (("update", PAGE, "--set", "Status=Rollout", "--append-file", body),
+                             ("create", "--parent", "Tasks", "--set", "title=x", "--body-file", body)):
+                    code, out, err = self.run_cli(*verb)
+                    self.assertEqual(code, 2, err)
+        self.assertEqual(self.writes(), [])
+        documented = re.findall(r"`([!<][^`]*file-upload://<id>[^`]*)`", (SKILL_DIR / "references" / "notion-markdown.md").read_text(encoding="utf-8"))
+        self.assertGreater(len(documented), 5)
+        for form in documented:
+            with self.subTest(documented=form):
+                self.assertEqual([f.id for f in self.n.hold_files(form.replace("<id>", one), "body.md")[1]], [one])
+        for untouched in ("no file here", "", "a `file-upload://<id>` in words", "file-upload:// is the scheme", "![c](https://example.com/x.png)"):
+            self.assertEqual(self.n.hold_files(untouched, "body.md"), (untouched, []))
+
+    def test_the_walk_of_a_long_body_is_linear(self):
+        line = f"![c](file-upload://{uid(0xF11E)})"
+        for shape in ("`", "``` ", "\\`", "> ", "- ", "\n", "$$\n", "```\n", "~~~\n", "[", "![", "![a](", "<file ", "<file source=", "<code>", "a ` b\n", "\t- x\n"):
+            with self.subTest(shape=shape):
+                body = line + "\n\n" + (shape * (60000 // len(shape))) + "\n"
+                began = time.process_time()
+                try:
+                    self.n.hold_files(body, "body.md")
+                except self.n.Fail:
+                    pass
+                self.assertLess(time.process_time() - began, 5)
+
+    def commands(self, err):
+        """The commands a message gives to place files, each as the client's arguments."""
+        return [shlex.split(found) for found in re.findall(r"`notion (update \S+ --edit '[^']+' '[^']+')`", err)]
+
+    def assert_all_placed(self, page, wanted):
+        """No placeholder is left on the page, in any block, and each upload is in as many blocks as wanted."""
+        wanted = {upload: count if isinstance(count, int) else 1 for upload, count in wanted.items()}
+        held = collections.Counter(url.rsplit("/", 1)[1] for _, url in self.placed(page) if url.startswith("https://files.example.com/"))
+        self.assertEqual(held, collections.Counter(wanted))
+
+        def every(identifier):
+            for block in self.fake.children.get(identifier, []):
+                yield block
+                yield from every(block["id"])
+
+        for block in every(page):
+            if block["type"] != "code" and "`" not in json.dumps(block[block["type"]]):
+                self.assertNotIn("file-upload.invalid", json.dumps(block))
 
     def test_download_saves_the_file_without_the_token(self):
         block = uid(0xF2)
