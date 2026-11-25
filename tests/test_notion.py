@@ -2943,6 +2943,77 @@ class DoctorTest(ClientTestCase):
         self.assertIn("| Column | Value |", self.fake.page_markdown(test_page["id"])["markdown"])  # what a read gives back
         self.assertIn(f"write check create: ok ({test_page['url']})", out.splitlines())
 
+    def test_doctor_write_check_trashes_its_card_after_a_create_in_doubt(self):
+        self.settings(test_marker="QA MARKER")
+        title = "QA MARKER doctor 2026-11-22 09:30:15"
+        older = self.fake.add_page(task_page(uid(0x4200), 160, title, created_by=ANA))  # never another author's card
+        where = f"data source Tasks ({COLLECTION}{DS_TASKS})"
+        query = rf"/v1/data_sources/{DS_TASKS}/query"
+
+        def checks(r):  # the lookups of the card; the read that samples a row for `read comments` is not one
+            return "filter" in (r.json or {})
+
+        def listed_late(r, state):
+            state["lookups"] += checks(r)
+            return (200, {"results": [], "has_more": False}) if checks(r) and state["lookups"] < 3 else None
+
+        for kind in ("500", "502", "503", "504", "529", *LOST, *UNREADABLE):
+            for landed, lookup in ((True, "found"), (True, "late"), (True, "403"), (True, "timeout"), (False, "found")):
+                with self.subTest(create=kind, landed=landed, lookup=lookup):
+                    self.fake.overrides.clear()
+                    self.fake.calls.clear()
+                    self.fake.pages = {PAGE: self.page, older["id"]: older}
+                    fails, state = ends_in(kind), {"lookups": 0}
+
+                    def create(r, landed=landed, fails=fails):
+                        if landed:
+                            self.fake.create_page(r.json)
+                        return fails(r)
+
+                    self.fake.on("POST", r"/v1/pages", create)
+                    if lookup == "late":
+                        self.fake.on("POST", query, lambda r, state=state: listed_late(r, state))
+                    elif lookup == "403":
+                        self.fake.on("POST", query, lambda r: error(403, "restricted_resource", "No.") if checks(r) else None)
+                    elif lookup == "timeout":
+                        self.fake.on("POST", query, lambda r: ends_in("timeout")(r) if checks(r) else None)
+                    code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                    self.assertEqual(code, 1, out + err)
+                    self.assertEqual(len(self.fake.sent("POST", r"/v1/pages")), 1, "the create is never sent again")
+                    self.assertRegex(out, r"(?m)^write check create: FAILED \(.*in doubt")
+                    self.assertFalse(older["in_trash"])
+                    made = [pg for pg in self.fake.pages.values() if pg["created_by"]["id"] == BOT and self.fake.title_of(pg) == title]
+                    self.assertEqual(len(made), int(landed))
+                    if landed and lookup in ("found", "late"):
+                        self.assertTrue(made[0]["in_trash"])
+                        self.assertIn(made[0]["url"], out)
+                        self.assertRegex(out, r"(?m)^write check trash: ok")
+                    else:
+                        self.assertRegex(out, r"(?m)^write check trash: FAILED")
+                        self.assertIn(f"look for a card titled {title!r} in {where} and trash it by hand", out)
+
+        # the card was made and answered, and the request that trashes it is lost: the card is named
+        for kind in (*LOST, *UNREADABLE, "400", "503"):
+            with self.subTest(trash=kind):
+                self.fake.overrides.clear()
+                self.fake.pages = {PAGE: self.page}
+                fails = ends_in(kind)
+                self.fake.on("PATCH", r"/v1/pages/[^/]+", lambda r, fails=fails: fails(r) if "in_trash" in r.json else None)
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out + err)
+                made = [pg for pg in self.fake.pages.values() if self.fake.title_of(pg) == title][0]
+                self.assertIn(f"trash the card {title!r} by hand: {made['url']}", out)
+
+        # a create Notion refused, or that was never sent, made no card: nothing to look for
+        for kind in ("400", "unreachable"):
+            with self.subTest(create=kind):
+                self.fake.overrides.clear()
+                self.fake.pages = {PAGE: self.page}
+                self.fake.on("POST", r"/v1/pages", ends_in(kind))
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out + err)
+                self.assertNotIn("by hand", out)
+
     def test_doctor_write_check_comment_carries_a_link_and_reads_back_with_it(self):
         self.settings(test_marker="QA MARKER")
         code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)

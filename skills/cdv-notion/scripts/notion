@@ -2674,6 +2674,35 @@ def cmd_doctor(client, args):
     return REFUSED if failed else DONE
 
 
+def trash_check_card(client, page, title, step):
+    """Trash the write check's card and read it back; when that fails, say which card to trash by hand."""
+    by_hand = f"trash the card {title!r} by hand: {page.get('url')}"
+    try:
+        client.call('PATCH', f"/v1/pages/{page['id']}", {'in_trash': True})
+        trashed = client.call('GET', f"/v1/pages/{page['id']}").get('in_trash')
+        step('trash', bool(trashed), f'the page is not in the trash; {by_hand}')
+    except Fail as failure:
+        step('trash', False, f'{failure.message}; {by_hand}')
+
+
+def trash_lost_check_card(client, schema, title, started, doubt, step):
+    """The card of a write check whose create ended in doubt: looked for by its title, which holds the time to
+    the second, and trashed; when it is not found, or cannot be looked for, its title is said."""
+    found, why = None, 'no card with that title was found'
+    for wait in (0, 2, 4):  # a query may not list a page at once
+        if wait:
+            SLEEP(wait)
+        try:
+            found = find_created(client, 'data_source', schema, title, started, doubt)
+        except Fail as failure:
+            why = f'it could not be looked for ({failure.cause})'
+        if found is not None and client.title_of(found) == title:
+            client.say(f"write check create: the card was made and was found by its title, {found.get('url')}")
+            return trash_check_card(client, found, title, step)
+    where = f"data source {plain(schema.get('title')) or schema['id']} ({COLLECTION}{schema['id']})"
+    step('trash', False, f'{why}; it may still appear, so look for a card titled {title!r} in {where} and trash it by hand')
+
+
 def write_check(client, args):
     marker = args.marker or client.settings().get('test_marker')
     if not marker:
@@ -2684,7 +2713,8 @@ def write_check(client, args):
         raise Fail(USAGE, '--write-check takes the data source to write the test card in')
     props = schema['properties']
     title_prop = next(n for n, p in props.items() if p.get('type') == 'title')
-    title = f"{marker} doctor {NOW().strftime('%Y-%m-%d %H:%M:%S')}"
+    started = NOW()
+    title = f"{marker} doctor {started.strftime('%Y-%m-%d %H:%M:%S')}"
     results, page = {}, None
 
     def step(name, ok, detail='', where=''):
@@ -2697,6 +2727,10 @@ def write_check(client, args):
         page = client.call('POST', '/v1/pages', {'parent': {'data_source_id': schema['id']},
                                                   'properties': {title_prop: {'title': rich_text(title)}}})
         step('create', client.title_of(page) == title, f"the title read back differs, {page.get('url')}", where=page.get('url'))
+    except WriteInDoubt as doubt:
+        step('create', False, doubt.message)
+        trash_lost_check_card(client, schema, title, started.replace(second=0, microsecond=0), doubt, step)
+        return results
     except Fail as failure:
         step('create', False, failure.message)
         return results
@@ -2725,12 +2759,7 @@ def write_check(client, args):
     except Fail as failure:
         client.say(f'write check stopped: {client.redact(failure.message)}')
     finally:
-        try:
-            client.call('PATCH', f"/v1/pages/{page['id']}", {'in_trash': True})
-            trashed = client.call('GET', f"/v1/pages/{page['id']}").get('in_trash')
-            step('trash', bool(trashed), 'the page is not in the trash')
-        except Fail as failure:
-            step('trash', False, f"{failure.message}; trash {page.get('url')} by hand")
+        trash_check_card(client, page, title, step)
     return results
 
 
