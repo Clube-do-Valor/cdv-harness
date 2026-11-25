@@ -3755,20 +3755,116 @@ class StaleCacheTest(ClientTestCase):
         self.assertIn("'Nowhere' is not a page id, a url, a key or the title of a connected data source", err)
         self.assertEqual(len(self.list_reads()), 1)
 
+    def refuses(self, status, method, pattern):
+        said = {403: ("restricted_resource", "Not shared with it."), 404: ("object_not_found", "Could not find data source.")}
+        self.fake.on(method, pattern, lambda r: error(status, *said[status]))
+        return said[status][1]
+
+    def reconnect(self):
+        self.fake.data_sources[DS_PROJECTS] = data_source(DS_PROJECTS, "Projects", projects_schema(), DB_PROJECTS)
+        self.fake.overrides.clear()
+        self.warm()
+
     def test_search_skips_a_data_source_no_longer_connected_after_one_list_refresh(self):
-        gone = {"404": lambda: self.fake.data_sources.pop(DS_PROJECTS),
-                "403": lambda: self.fake.on("POST", rf"/v1/data_sources/{DS_PROJECTS}/query",
-                                            lambda r: error(403, "restricted_resource", "Not shared."))}
-        for status, disconnect in gone.items():
+        for status in (403, 404):
             with self.subTest(status=status):
-                self.fake.data_sources[DS_PROJECTS] = data_source(DS_PROJECTS, "Projects", projects_schema(), DB_PROJECTS)
-                self.fake.overrides.clear()
-                self.warm()
-                disconnect()
+                self.reconnect()
+                del self.fake.data_sources[DS_PROJECTS]
+                self.refuses(status, "POST", rf"/v1/data_sources/{DS_PROJECTS}/query")
                 code, out, err = self.run_cli("search", "invoice")
                 self.assertEqual(code, 0, err)
                 self.assertIn(self.page["url"], out)
                 self.assertEqual(len(self.list_reads()), 1)
+                self.assertEqual(err.strip(), f"note: data source {DS_PROJECTS} is no longer connected (the list of data "
+                                              "sources, read again, does not hold it), so it was not searched")
+
+    def test_a_data_source_that_refuses_is_never_hidden_and_one_that_is_gone_is_said(self):
+        """Every place that asks a data source of the cached list, for both refusals: still listed, the command
+        exits 1 with the API's message; gone from the list read again, it is skipped with a note."""
+        query = ("POST", rf"/v1/data_sources/{DS_PROJECTS}/query")
+        schema = ("GET", rf"/v1/data_sources/{DS_PROJECTS}")
+        project = "PRJ" + "-5"
+
+        def forget_schema():
+            (self.home / ".cache" / "cdv-notion" / f"schema-{DS_PROJECTS}.json").unlink()
+
+        def forget_all():
+            shutil.rmtree(self.home / ".cache")
+
+        # call site: (the endpoint that refuses, what the cache lacks, the command, exit code and words once gone)
+        sites = {
+            "search, the rows": (query, None, ("search", "invoice"), 0, self.page["url"]),
+            "search, the schema": (schema, forget_schema, ("search", "invoice"), 0, self.page["url"]),
+            "search by key, the lookup": (query, None, ("search", project), 0, f"no hit for '{project}'"),
+            "fetch by key": (query, None, ("fetch", project), 2, "no connected data source has the key prefix PRJ"),
+            "update, a relation by key": (query, None, ("update", PAGE, "--set", f"Project={project}"), 2,
+                                          "no connected data source has the key prefix PRJ"),
+            "query --where, a relation by key": (query, None, ("query", "Tasks", "--where", f"Project has {project}"), 2,
+                                                 "no connected data source has the key prefix PRJ"),
+        }
+        for name, (endpoint, forget, command, code_gone, said_gone) in sites.items():
+            for status in (403, 404):
+                for listed in (True, False):
+                    with self.subTest(site=name, status=status, still_listed=listed):
+                        self.reconnect()
+                        self.run_cli("fetch", project)  # the list and both schemas are cached
+                        if forget:
+                            forget()
+                        self.fake.calls.clear()
+                        message = self.refuses(status, *endpoint)
+                        if not listed:
+                            del self.fake.data_sources[DS_PROJECTS]
+                        code, out, err = self.run_cli(*command)
+                        self.assertLessEqual(len(self.list_reads()), 1)
+                        if listed:
+                            self.assertEqual(code, 1, out + err)
+                            self.assertIn(f"Notion answered {status}", err)
+                            self.assertIn(message, err)
+                            self.assertNotIn("no hit", out)
+                            self.assertNotIn("not searched", err)
+                        else:
+                            self.assertEqual(code, code_gone, out + err)
+                            self.assertIn(said_gone, out + err)
+                            self.assertEqual(err.count(f"note: data source {DS_PROJECTS} is no longer connected"), 1, err)
+                        self.assertEqual(self.writes(), [])
+        for status in (403, 404):  # with no cache the list is read in the command itself, and still hides nothing
+            with self.subTest(site="search, nothing cached", status=status):
+                self.reconnect()
+                forget_all()
+                message = self.refuses(status, *query)
+                code, out, err = self.run_cli("search", "invoice")
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(message, err)
+            with self.subTest(site="search --in", status=status):
+                self.reconnect()
+                self.run_cli("fetch", project)
+                message = self.refuses(status, *query)
+                code, out, err = self.run_cli("search", "invoice", "--in", COLLECTION + DS_PROJECTS)
+                self.assertEqual(code, 1, out + err)
+                self.assertIn(message, err)
+
+    def test_a_key_lookup_that_fails_is_never_taken_for_no_hit(self):
+        """search looks a key up first; only "no such key" lets it go on without that hit."""
+        def lost(r):
+            raise TimeoutError("timed out")
+
+        failures = {"500": lambda r: error(500, "internal_server_error", "Broken."),
+                    "429": lambda r: error(429, "rate_limited", "Slow down."), "timeout": lost,
+                    "400": lambda r: error(400, "validation_error", "Bad filter.")}
+        for name, failure in failures.items():
+            with self.subTest(failure=name):
+                self.fake.overrides.clear()
+                self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query",
+                             lambda r, failure=failure: failure(r) if "unique_id" in json.dumps(r.json) else None)
+                code, out, err = self.run_cli("search", key(120))
+                self.assertEqual(code, 2 if name == "400" else 1, out + err)
+                self.assertNotIn("no hit", out)
+        self.fake.overrides.clear()
+        for words in (key(999999), "XYZ" + "-1"):  # no page has the key; no data source has the prefix
+            with self.subTest(words=words):
+                code, out, err = self.run_cli("search", words)
+                self.assertEqual((code, err), (0, ""))
+                self.assertIn(f"no hit for '{words}'", out)
 
 
 class ApiTest(ClientTestCase):

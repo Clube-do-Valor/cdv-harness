@@ -145,6 +145,10 @@ class CreateInDoubt(Fail):
         super().__init__(code, f'In doubt: the create of {name} ({cause}): {self.advice}', IN_DOUBT, cause)
 
 
+class NoSuchKey(Fail):
+    """A ticket key that leads to no page: no connected data source has its prefix, or none of them has its number."""
+
+
 class Unsent(ConnectionError):
     """The connection to the API could not be established: the request never left this machine."""
 
@@ -668,6 +672,7 @@ class Notion:
         self._schemas = {}
         self._fresh = set()  # data sources whose schema was read from the API in this command
         self._list_fresh = False  # the data source list was read from the API in this command
+        self._sources = None  # that list, once read
         self.json = False  # the command was given --json: stdout holds one JSON document, emit()'s, and nothing else
 
     # -- secrets and output ---------------------------------------------------------------
@@ -1024,7 +1029,19 @@ class Notion:
         """The list of connected data sources re-read, at most once per command; None when it was already."""
         return None if self._list_fresh else self.data_sources(refresh=True)
 
+    def disconnected(self, identifier):
+        """Whether a data source that answered 403 or 404 is gone: the list of connected data sources, read from
+        the API in this command, no longer holds it. One that is still listed refused, and that is never hidden."""
+        self.refresh_data_sources()
+        return not any(source['id'] == identifier for source in self.data_sources())
+
+    def skip_note(self, identifier):
+        self.warn(f'note: data source {identifier} is no longer connected (the list of data sources, read again, does '
+                  'not hold it), so it was not searched')
+
     def data_sources(self, refresh=False):
+        if not refresh and self._sources is not None:
+            return self._sources
         listed = None if refresh else self.cache.get('data_sources')
         if listed is not None:
             return listed
@@ -1044,6 +1061,7 @@ class Notion:
             prefix, unique = unique_of(schema['properties'])
             listed.append({'id': source['id'], 'title': plain(schema.get('title')), 'prefix': prefix, 'unique': unique})
         self.cache.put('data_sources', listed)
+        self._sources = listed
         return listed
 
     def data_source_title(self, identifier):
@@ -1053,19 +1071,34 @@ class Notion:
             return identifier
 
     def page_by_key(self, prefix, number):
-        sources = [s for s in self.data_sources() if (s.get('prefix') or '').upper() == prefix]
-        if not sources:
-            sources = [s for s in self.data_sources(refresh=True) if (s.get('prefix') or '').upper() == prefix]
-        if not sources:
+        def prefixed(listed):
+            return [s for s in listed or [] if (s.get('prefix') or '').upper() == prefix]
+
+        queue = prefixed(self.data_sources()) or prefixed(self.refresh_data_sources())
+        asked = set()
+        while queue:
+            source = queue.pop(0)
+            asked.add(source['id'])
+            try:
+                rows = self.rows_by_key(source, number)
+            except ApiError as failure:
+                if failure.status not in (403, 404) or not self.disconnected(source['id']):
+                    raise
+                self.skip_note(source['id'])
+                queue = [s for s in prefixed(self.data_sources()) if s['id'] not in asked]
+                continue
+            if rows:
+                return rows[0]
+        if not prefixed(self.data_sources()):
             known = sorted({s['prefix'] for s in self.data_sources() if s.get('prefix')})
-            raise Fail(USAGE, f'no connected data source has the key prefix {prefix}; known prefixes: '
-                              f"{', '.join(known) or 'none'}")
-        for source in sources:
-            answer = self.call('POST', f"/v1/data_sources/{source['id']}/query",
-                               {'filter': {'property': source['unique'], 'unique_id': {'equals': number}}, 'page_size': 1})
-            if answer.get('results'):
-                return answer['results'][0]
-        raise Fail(REFUSED, f'no page with key {prefix}-{number}')
+            raise NoSuchKey(USAGE, f'no connected data source has the key prefix {prefix}; known prefixes: '
+                                   f"{', '.join(known) or 'none'}")
+        raise NoSuchKey(REFUSED, f'no page with key {prefix}-{number}')
+
+    def rows_by_key(self, source, number):
+        return self.call('POST', f"/v1/data_sources/{source['id']}/query",
+                         {'filter': {'property': source['unique'], 'unique_id': {'equals': number}}, 'page_size': 1}
+                         ).get('results', [])
 
     def resolve(self, text, want=None):
         """('page', page) or ('data_source', schema) for any reference form."""
@@ -2647,9 +2680,8 @@ def cmd_search(client, args):
         if ref.kind == 'key':
             try:
                 add(client.page_by_key(ref.prefix, ref.number), 'key')
-            except Fail as failure:
-                if failure.code not in (REFUSED, USAGE):
-                    raise
+            except NoSuchKey:  # the words only look like a key, or no page has it: any other failure is the search's
+                pass
         if args.within:
             kind, scope = client.resolve(args.within, want='data_source')
             if kind != 'data_source':
@@ -2680,12 +2712,11 @@ def cmd_search(client, args):
                                              max_items=limit)
                 capped = capped or more
             except ApiError as failure:
-                if args.within or failure.status not in (403, 404):
+                # only a data source of the cached list that is gone is skipped; the one named by --in never is
+                if args.within or failure.status not in (403, 404) or not client.disconnected(identifier):
                     raise
-                # a data source of the cached list that is no longer connected: read the list again, once, and skip it
-                fresh = client.refresh_data_sources()
-                if fresh is not None:
-                    queue = [s['id'] for s in fresh if s['id'] not in searched]
+                client.skip_note(identifier)
+                queue = [s['id'] for s in client.data_sources() if s['id'] not in searched]
                 continue
             for row in rows:
                 # plain text, as the filter matched it: a link's address is not a match and never splits one
