@@ -1744,6 +1744,50 @@ class QueryTest(ClientTestCase):
         self.assertEqual(sent["sorts"], [{"timestamp": "created_time", "direction": "descending"}])
 
 
+class JsonOutputTest(ClientTestCase):
+    def test_json_stdout_is_one_document_for_every_verb_that_takes_json(self):
+        """Over every verb whose parser has --json: stdout parses as one JSON document, notes go to stderr."""
+        for i in range(60):
+            self.fake.add_page(task_page(uid(0x10000 + i), 1000 + i, f"Row {i}", status="Rollout"))
+        self.fake.on("POST", rf"/v1/data_sources/{DS_PROJECTS}/query",
+                     lambda r: (200, {"object": "list", "results": [], "has_more": False, "next_cursor": None}))
+        rows = [
+            (("fetch", PAGE), dict, ""),
+            (("fetch", PAGE, "--discussions"), dict, ""),
+            (("fetch", PAGE, "--props-only"), dict, ""),
+            (("fetch", "Tasks"), dict, ""),
+            (("query", "Tasks"), list, "11 more rows matched"),
+            (("query", "Tasks", "--limit", "5"), list, "56 more rows matched"),
+            (("query", "Tasks", "--limit", "0"), list, "61 more rows matched"),
+            (("query", "Tasks", "--max-rows", "20"), list, "stopped paging at 20 rows"),
+            (("query", "Projects"), list, "no row matched"),
+            (("query", "Tasks", "--count"), int, ""),
+            (("query", "Tasks", "--count", "--max-rows", "20"), int, "stopped paging at 20 rows"),
+            (("query", "Projects", "--count"), int, ""),
+            (("query", "Tasks", "--group-by", "Status"), dict, ""),
+            (("query", "Tasks", "--group-by", "Status", "--max-rows", "20"), dict, "stopped paging at 20 rows"),
+            (("query", "Projects", "--group-by", "Project ID"), dict, ""),
+        ]
+        sub = next(a for a in self.n.build_parser()._actions if hasattr(a, "choices") and isinstance(a.choices, dict))
+        takes_json = {name for name, p in sub.choices.items() if "--json" in p._option_string_actions}
+        self.assertEqual({args[0] for args, *_ in rows}, takes_json)
+        for args, kind, note in rows:
+            with self.subTest(args=args):
+                code, out, err = self.run_cli(*args, "--json")
+                self.assertEqual(code, 0, err)
+                self.assertIsInstance(json.loads(out), kind)
+                self.assertIn(note, err)
+                if not note:
+                    self.assertEqual(err, "")
+                plain_code, plain_out, plain_err = self.run_cli(*args)
+                self.assertEqual((plain_code, plain_err), (0, ""))
+                self.assertIn(note, plain_out)
+        code, out, err = self.run_cli("query", "Tasks", "--group-by", "Status", "--json")
+        self.assertEqual(list(json.loads(out).items()), [("Rollout", 60), ("Done", 1)])
+        code, out, err = self.run_cli("fetch", uid(0xDEAD), "--json")
+        self.assertEqual((code, out), (1, ""))
+
+
 class SearchTest(ClientTestCase):
     def setUp(self):
         super().setUp()

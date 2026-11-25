@@ -455,6 +455,7 @@ class Notion:
         self._schemas = {}
         self._fresh = set()  # data sources whose schema was read from the API in this command
         self._list_fresh = False  # the data source list was read from the API in this command
+        self.json = False  # the command was given --json: stdout holds one JSON document, emit()'s, and nothing else
 
     # -- secrets and output ---------------------------------------------------------------
 
@@ -465,7 +466,12 @@ class Notion:
         return TOKEN_SHAPE.sub('[token]', text)
 
     def say(self, text=''):
-        print(self.redact(text))
+        """A line for the reader; with --json it is a note beside the document, so it goes to stderr."""
+        print(self.redact(text), file=sys.stderr if self.json else sys.stdout)
+
+    def emit(self, value):
+        """The one JSON document a --json command prints on stdout."""
+        print(self.redact(json.dumps(value, ensure_ascii=False, indent=2)))
 
     def warn(self, text):
         print(self.redact(text), file=sys.stderr)
@@ -1260,7 +1266,7 @@ def cmd_fetch(client, args):
     if kind == 'data_source':
         client.refresh_schema(found)  # the schema a write is built from is read from the API, whatever the reference form
         if args.json:
-            client.say(json.dumps(found, ensure_ascii=False, indent=2))
+            client.emit(found)
         else:
             client.say('\n'.join(schema_lines(client, found)))
         return DONE
@@ -1268,7 +1274,7 @@ def cmd_fetch(client, args):
     body = None if args.props_only else client.markdown(page['id'])
     threads = client.discussions(page['id']) if args.discussions else None
     if args.json:
-        client.say(json.dumps({'page': page, 'markdown': body, 'discussions': threads}, ensure_ascii=False, indent=2))
+        client.emit({'page': page, 'markdown': body, 'discussions': threads})
         return DONE
     lines = [f'title: {client.title_of(page)}', f"url: {page.get('url')}", f"id: {page['id']}"]
     key = client.key_of(page)
@@ -1957,7 +1963,10 @@ def cmd_query(client, args):
     rows, more = client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query", body, max_items=max_rows)
     stopped = f'stopped paging at {max_rows} rows; more rows match (--max-rows N raises the cap)' if more else ''
     if args.count:
-        client.say(str(len(rows)))
+        if args.json:
+            client.emit(len(rows))
+        else:
+            client.say(str(len(rows)))
         if stopped:
             client.say(stopped)
         return DONE
@@ -1969,17 +1978,20 @@ def cmd_query(client, args):
             for item in (value if isinstance(value, list) else [value]) or [None]:
                 label = cell(item) or '(empty)'
                 counts[label] = counts.get(label, 0) + 1
-        for label, count in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
-            client.say(f'{label} {count}')
+        ordered = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        if args.json:
+            client.emit(dict(ordered))
+        else:
+            for label, count in ordered:
+                client.say(f'{label} {count}')
         if stopped:
             client.say(stopped)
         return DONE
     limit = args.limit if args.limit is not None else DEFAULT_ROWS
     shown = rows[:limit]
     if args.json:
-        client.say(json.dumps([{'id': r['id'], 'url': r.get('url'), 'key': client.key_of(r) or None,
-                                'properties': client.short_values(r, names=set(columns) if columns else None)}
-                               for r in shown], ensure_ascii=False, indent=2))
+        client.emit([{'id': r['id'], 'url': r.get('url'), 'key': client.key_of(r) or None,
+                      'properties': client.short_values(r, names=set(columns) if columns else None)} for r in shown])
     else:
         if columns is None:
             props = schema['properties']
@@ -2613,6 +2625,7 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
     client = Notion()
+    client.json = getattr(args, 'json', False)
     try:
         return args.func(client, args) or DONE
     except Fail as failure:
