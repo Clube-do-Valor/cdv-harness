@@ -2379,6 +2379,113 @@ class QueryTest(ClientTestCase):
                 self.assertEqual(code, 0, err)
                 self.assertEqual(json.loads(out)[0]["properties"], {label: value})
 
+    def named_like_built_ins(self, **renames):
+        """The tasks data source with some properties renamed, in the schema and in the page."""
+        names = {old.replace("_", " "): new for old, new in renames.items()}
+        schema = self.fake.data_sources[DS_TASKS]["properties"]
+        self.fake.data_sources[DS_TASKS]["properties"] = {
+            names.get(n, n): dict(p, name=names.get(n, n)) for n, p in schema.items()}
+        self.page["properties"] = {names.get(n, n): v for n, v in self.page["properties"].items()}
+
+    def test_a_property_named_like_a_built_in_column_prints_its_values(self):
+        """`ID` is the name Notion gives the unique id: in every output that reads a column by the property's name,
+        the property wins over the built-in and its value is there, whatever key the short format gives it."""
+        link, url = "https://example.com/pr/1", self.page["url"]
+        coll = COLLECTION + DS_TASKS
+        original = (dict(self.fake.data_sources[DS_TASKS]["properties"]), dict(self.page["properties"]))
+        workspaces = {
+            "the unique id is ID and a url property is URL": (
+                dict(Task_ID="ID", Pull_Request="URL"),
+                [((), "ID | Task name | Status | url", f"{key(120)} | Export invoices | Done | {url}"),
+                 (("--select", "id"), "ID | url", f"{key(120)} | {url}"),
+                 (("--select", "key"), "ID | url", f"{key(120)} | {url}"),
+                 (("--select", "url"), "URL | url", f"{link} | {url}"),
+                 (("--select", "URL,Task name,ID"), "URL | Task name | ID | url",
+                  f"{link} | Export invoices | {key(120)} | {url}")],
+                {"ID": key(120), "URL": link},
+                {"userDefined:ID": key(120), "userDefined:URL": link}),
+            "a text property is id and a date property is Url": (
+                dict(Notes="id", Done_at="Url"),
+                [(("--select", "id"), "id | url", f"Monthly export | {url}"),
+                 (("--select", "ID"), "id | url", f"Monthly export | {url}"),
+                 (("--select", "url,key"), "Url | Task ID | url", f"2026-11-22 | {key(120)} | {url}")],
+                {"id": "Monthly export", "Url": "2026-11-22"},
+                {"userDefined:id": "Monthly export", "date:Url:start": "2026-11-22", "date:Url:end": None,
+                 "date:Url:is_datetime": 0}),
+        }
+        for workspace, (renames, table, groups, stored) in workspaces.items():
+            shutil.rmtree(self.home / ".cache", ignore_errors=True)
+            self.fake.data_sources[DS_TASKS]["properties"], self.page["properties"] = dict(original[0]), dict(original[1])
+            self.page["properties"]["Pull Request"] = {"id": "pr", "type": "url", "url": link}
+            self.named_like_built_ins(**renames)
+            for flags, header, row in table:
+                with self.subTest(workspace, columns=flags):
+                    code, out, err = self.run_cli("query", coll, *flags)
+                    self.assertEqual(code, 0, err)
+                    self.assertEqual(out.splitlines()[:2], [header, row])
+            for name, value in groups.items():
+                with self.subTest(workspace, group_by=name):
+                    code, out, err = self.run_cli("query", coll, "--group-by", name)
+                    self.assertEqual((code, out), (0, f"{value} 1\n"), err)
+                    code, out, err = self.run_cli("query", coll, "--group-by", name, "--json")
+                    self.assertEqual(json.loads(out), {value: 1})
+            with self.subTest(workspace, output="--json"):
+                code, out, err = self.run_cli("query", coll, "--select", ",".join(groups), "--json")
+                self.assertEqual(json.loads(out)[0]["properties"], stored)
+
+    def test_the_write_check_reads_back_a_property_named_like_a_built_in_column(self):
+        for name in ("ID", "url"):
+            with self.subTest(checkbox=name):
+                self.fake.data_sources[DS_TASKS] = data_source(DS_TASKS, "Tasks", tasks_schema(), DB_TASKS)
+                shutil.rmtree(self.home / ".cache", ignore_errors=True)
+                schema = self.fake.data_sources[DS_TASKS]["properties"]
+                self.fake.data_sources[DS_TASKS]["properties"] = {
+                    (name if n == "Completed?" else n): dict(p, name=name if n == "Completed?" else n)
+                    for n, p in schema.items()}
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS, "--marker", "QA MARK")
+                self.assertIn(f"write check property ({name}): ok", out, err)
+
+    def test_group_by_a_built_in_name_counts_by_the_page_s_own_value(self):
+        """--group-by reads every name --select takes, the same way: a built-in prints the page's own value, and a
+        property of that name wins. No row is ever counted empty because the name is not a property."""
+        self.fake.pages.clear()
+        for i, (day, status) in enumerate([("01", "Done"), ("01", "Done"), ("02", "Rollout")]):
+            row = self.fake.add_page(task_page(uid(0x10000 + i), 1000 + i, f"Row {i}", status=status,
+                                               created_time=f"2026-11-{day}T10:00:00.000Z"))
+            row["last_edited_time"] = f"2026-11-1{day[1]}T08:00:00.000Z"
+        made = {"2026-11-01T10:00:00.000Z": 2, "2026-11-02T10:00:00.000Z": 1}
+        edited = {"2026-11-11T08:00:00.000Z": 2, "2026-11-12T08:00:00.000Z": 1}
+        each = {key(1000): 1, key(1001): 1, key(1002): 1}
+        titles = {"Row 0": 1, "Row 1": 1, "Row 2": 1}
+        table = [("created", made), ("Created", made), ("created_time", made), ("edited", edited), ("last_edited", edited),
+                 ("last_edited_time", edited), ("updated", edited), ("id", each), ("key", each), ("title", titles),
+                 ("name", titles)]
+        for name, counts in table:
+            with self.subTest(group_by=name):
+                code, out, err = self.run_cli("query", "Tasks", "--group-by", name)
+                self.assertEqual(code, 0, err)
+                self.assertNotIn("(empty)", out)
+                self.assertEqual(sorted(out.splitlines()), sorted(f"{value} {n}" for value, n in counts.items()))
+                code, out, err = self.run_cli("query", "Tasks", "--group-by", name, "--json")
+                self.assertEqual(json.loads(out), counts)
+        with self.subTest("a property of that name wins"):
+            self.fake.data_sources[DS_TASKS]["properties"]["Updated"] = {"id": "up", "name": "Updated", "type": "rich_text",
+                                                                          "rich_text": {}}
+            for row in self.fake.pages.values():
+                row["properties"]["Updated"] = {"id": "up", "type": "rich_text", "rich_text": text("by hand")}
+            shutil.rmtree(self.home / ".cache")
+            code, out, err = self.run_cli("query", "Tasks", "--group-by", "updated")
+            self.assertEqual((code, out), (0, "by hand 3\n"), err)
+        with self.subTest("a built-in column beside a property that has its column name"):
+            self.fake.data_sources[DS_TASKS]["properties"]["created_time"] = {
+                "id": "own", "name": "created_time", "type": "rich_text", "rich_text": {}}
+            for row in self.fake.pages.values():
+                row["properties"]["created_time"] = {"id": "own", "type": "rich_text", "rich_text": text("typed")}
+            shutil.rmtree(self.home / ".cache")
+            code, out, err = self.run_cli("query", "Tasks", "--select", "created_time,created")
+            self.assertEqual(code, 0, err)
+            self.assertIn("typed | 2026-11-01T10:00:00.000Z | ", out)
+
     def test_select_prefers_a_property_of_the_same_name_as_where_does(self):
         self.page["last_edited_time"] = "2026-11-21T08:15:00.000Z"
         self.fake.data_sources[DS_TASKS]["properties"]["Updated"] = {"id": "up", "name": "Updated", "type": "rich_text", "rich_text": {}}

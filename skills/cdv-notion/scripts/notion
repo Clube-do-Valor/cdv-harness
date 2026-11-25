@@ -1275,7 +1275,7 @@ class Notion:
     def short(self, name, prop, page_id):
         kind = prop.get('type')
         value = prop.get(kind)
-        label = f'userDefined:{name}' if name.lower() in ('id', 'url') else name
+        label = short_label(name)
         if kind in ('title', 'rich_text'):
             return [(label, linked(value))]
         if kind in ('select', 'status'):
@@ -1540,6 +1540,18 @@ def unique_of(properties):
         if prop.get('type') == 'unique_id':
             return (prop.get('unique_id') or {}).get('prefix'), name
     return None, None
+
+
+def short_label(name):
+    """The short format's key for a property: `id` and `url` are the page's own, so a property of one of those
+    names (any case) is under userDefined:<name>."""
+    return f'userDefined:{name}' if name.lower() in ('id', 'url') else name
+
+
+def value_named(values, name):
+    """The value of the property `name` among short_values(), whatever key the short format gives it; a date's
+    is its start."""
+    return next((values[key] for key in (short_label(name), f'date:{name}:start') if key in values), None)
 
 
 def listed_entry(identifier, schema):
@@ -2682,19 +2694,30 @@ def cell(value):
     return match.group(1) if match else text.replace('\n', ' ').replace('|', '\\|')
 
 
-def row_values(client, row, columns, facts):
-    """A row's values for the selected columns: its properties, and for a built-in column (`facts`) the page's own value."""
-    values = client.short_values(row, names=set(columns) if columns else None)
-    for name in facts:
-        values[name] = row.get(name)
+Column = collections.namedtuple('Column', 'name fact')  # fact: the page's own (created, edited), not a property
+
+
+def column_value(client, row, column):
+    """What a row holds in a column of the table or of --group-by."""
+    if column.fact:
+        return row.get(column.name)
+    return value_named(client.short_values(row, names={column.name}), column.name)
+
+
+def row_values(client, row, columns):
+    """A row's properties as --json prints them, under their short keys: all of them, or the selected columns,
+    a built-in one with the page's own value."""
+    if columns is None:
+        return client.short_values(row)
+    values = client.short_values(row, names={column.name for column in columns if not column.fact})
+    values.update({column.name: row.get(column.name) for column in columns if column.fact})
     return values
 
 
 def query_plan(client, args, schema):
     """What `query` asks of the data source and reads from its rows, from the schema as it stands: the request's
-    body, the table's columns (None: --json without --select, the whole property set), --group-by's column, and
-    which of those names are the page's own facts."""
-    body, columns, facts, group = {}, None, set(), None
+    body, the table's columns (None: --json without --select, the whole property set) and --group-by's column."""
+    body, columns, group = {}, None, None
     if args.where:
         body['filter'] = compile_where(client, args.where, schema)
     if args.order:
@@ -2702,9 +2725,7 @@ def query_plan(client, args, schema):
 
     def column(wanted):
         name, prop = where_property(schema, wanted, client)
-        if prop.get('type') == 'timestamp':  # a page's own fact (created, edited), when no property has the name
-            facts.add(name)
-        return name
+        return Column(name, prop.get('type') == 'timestamp')  # a built-in only when no property has the name
 
     if args.select:
         columns = [column(c.strip().strip('"`')) for c in args.select.split(',') if c.strip()]
@@ -2712,10 +2733,9 @@ def query_plan(client, args, schema):
         group = column(args.group_by)
     if columns is None and not args.json:
         props = schema['properties']
-        columns = [n for n, p in props.items() if p.get('type') == 'unique_id'][:1]
-        columns += [n for n, p in props.items() if p.get('type') == 'title'][:1]
-        columns += [n for n, p in props.items() if p.get('type') == 'status'][:1]
-    return {'body': body, 'columns': columns, 'facts': facts, 'group': group}
+        columns = [Column(name, False) for kind in ('unique_id', 'title', 'status')
+                   for name in [n for n, p in props.items() if p.get('type') == kind][:1]]
+    return {'body': body, 'columns': columns, 'group': group}
 
 
 def cmd_query(client, args):
@@ -2731,10 +2751,10 @@ def cmd_query(client, args):
         """Whether a row does not hold a property the output reads: the schema named it, so the schema is old."""
         read = [] if args.count else [plan['group']] if plan['group'] else plan['columns'] or []
         _, (rows, _) = answer
-        return any(name not in row.get('properties', {}) for row in rows for name in read if name not in plan['facts'])
+        return any(c.name not in row.get('properties', {}) for row in rows for c in read if not c.fact)
 
     plan, (rows, more) = client.on_current_schema(schema, lambda: query_plan(client, args, schema), ask, lacks)
-    columns, facts, group = plan['columns'], plan['facts'], plan['group']
+    columns, group = plan['columns'], plan['group']
     stopped = f'stopped paging at {max_rows} rows; more rows match (--max-rows N raises the cap)' if more else ''
     if args.count:
         if args.json:
@@ -2747,8 +2767,7 @@ def cmd_query(client, args):
     if group:
         counts = {}
         for row in rows:
-            value = client.short_values(row, names={group})
-            value = next(iter(value.values()), None) if value else None
+            value = column_value(client, row, group)
             for item in (value if isinstance(value, list) else [value]) or [None]:
                 label = cell(item) or '(empty)'
                 counts[label] = counts.get(label, 0) + 1
@@ -2765,17 +2784,11 @@ def cmd_query(client, args):
     shown = rows[:limit]
     if args.json:
         client.emit([{'id': r['id'], 'url': r.get('url'), 'key': client.key_of(r) or None,
-                      'properties': row_values(client, r, columns, facts)} for r in shown])
+                      'properties': row_values(client, r, columns)} for r in shown])
     else:
-        client.say(' | '.join(columns + ['url']))
+        client.say(' | '.join([column.name for column in columns] + ['url']))
         for row in shown:
-            values = row_values(client, row, columns, facts)
-            cells = []
-            for name in columns:
-                if name in values:
-                    cells.append(cell(values[name]))
-                else:
-                    cells.append(cell(values.get(f'date:{name}:start')))
+            cells = [cell(column_value(client, row, column)) for column in columns]
             client.say(' | '.join(cells + [row.get('url', '')]))
     if len(rows) > limit:
         client.say(f'… {len(rows) - limit} more rows matched (--limit N shows them, --count counts them)')
@@ -3310,8 +3323,8 @@ def write_check(client, args):
             value, expected = {'checkbox': ('__YES__', '__YES__'), 'rich_text': ('write check', 'write check'),
                                'number': ('1', 1)}[kind]
             client.call('PATCH', f"/v1/pages/{page['id']}", {'properties': client.build_properties([f'{name}={value}'], schema)})
-            stored = client.short_values(client.call('GET', f"/v1/pages/{page['id']}"), names={name})
-            step(f'property ({name})', stored.get(name) == expected, f'read back {stored.get(name)!r}')
+            stored = value_named(client.short_values(client.call('GET', f"/v1/pages/{page['id']}"), names={name}), name)
+            step(f'property ({name})', stored == expected, f'read back {stored!r}')
         client.call('PATCH', f"/v1/pages/{page['id']}/markdown",
                     {'markdown_version': MARKDOWN_VERSION, 'type': 'replace_content', 'replace_content': {'new_str': WRITE_CHECK_BODY}})
         problems = write_check_problems(client, page['id'])
