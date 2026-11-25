@@ -2251,9 +2251,10 @@ def cmd_search(client, args):
 
 
 def comment_body(args):
-    if args.body is not None:
-        return args.body
-    return read_file(args.body_file)
+    text = args.body if args.body is not None else read_file(args.body_file)
+    if not text.strip():  # the API would post an empty comment
+        raise Fail(USAGE, 'the comment is empty; nothing was sent')
+    return text
 
 
 def display_name(client):

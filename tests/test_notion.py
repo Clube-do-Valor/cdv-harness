@@ -2042,6 +2042,18 @@ class CommentsTest(ClientTestCase):
         self.assertNotIn("parent", sent)
         self.assertEqual(sent["markdown"], "Merged **today**")
 
+    def test_an_empty_comment_is_refused_and_not_sent(self):
+        """The API accepts an empty comment and posts it, so the client does not send one."""
+        blank = self.tmp / "blank.md"
+        blank.write_text(" \n")
+        for action, target in (("add", PAGE), ("reply", uid(0xCA)), ("edit", uid(0xC9))):
+            for body in (("--body", ""), ("--body", "  "), ("--body-file", blank)):
+                with self.subTest(action=action, body=body):
+                    code, out, err = self.run_cli("comments", action, target, *body)
+                    self.assertEqual(code, 2)
+                    self.assertIn("nothing was sent", err)
+        self.assertEqual(self.writes(), [])
+
     def test_comment_display_name_by_token_kind(self):
         self.settings(me="ana@example.com")
         self.run_cli("comments", "add", PAGE, "--body", "one")
