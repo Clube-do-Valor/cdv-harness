@@ -811,6 +811,21 @@ class RequestPinTest(CardCase):
             ("a picture taken out", f"antes ![tela]({signed})", "antes"),
         ], ["request-changed"])
 
+    def test_a_hosted_file_shown_as_an_embed_is_a_file(self):
+        # A file kept in Notion comes back with a signed query and the block it belongs to, whatever block shows it
+        hosted = "https://files.example.com/space/painel.html?X-Sig={}#notion_record=block." + cf.uid(0xF11E)
+        player = "https://video.example.com/watch?v={}"
+        embed, video = '<embed source="{}" />', '<video source="{}">x</video>'
+        self.assertRequest([("an embed", embed.format(hosted.format(1)), embed.format(hosted.format(2))),
+                            ("a video with no extension", video.format(hosted.format(1).replace(".html", "")),
+                             video.format(hosted.format(2).replace(".html", "")))], [])
+        self.assertRequest([
+            ("another file", embed.format(hosted.format(1)), embed.format(hosted.format(1).replace("painel", "nota"))),
+            ("an embedded page", embed.format(player.format(1)), embed.format(player.format(2))),
+            ("a link to one", f"[x]({hosted.format(1)})", f"[x]({hosted.format(2)})"),
+            ("an embed taken out", "antes\n\n" + embed.format(hosted.format(1)), "antes"),
+        ], ["request-changed"])
+
 
 class ReadingTimeTest(CardCase):
     """The time a reading takes follows the length of the text, not the shape of one line. Each input is

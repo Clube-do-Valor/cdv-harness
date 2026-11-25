@@ -180,6 +180,7 @@ BLOCK_TAGS = {"p", "br", "empty-block", "callout", "toggle", "quote", "columns",
               "colgroup", "col", "tr", "page", "database", "bookmark", "embed", "unknown", "file", "pdf", "audio",
               "video", "image", "img"}
 FILE_TAGS, PLAYED_TAGS = {"file", "pdf", "image", "img"}, {"audio", "video"}
+HOSTED_FILE = re.compile(r"#notion_record=")
 CELL_TAGS = {"td", "th"}
 WORD_TAGS = {"a", "mention", "date"}
 TARGET_ATTRIBUTES = {"url", "href", "source", "src"}
@@ -204,9 +205,11 @@ def unsigned(address):
 
 
 def is_file(name, address):
-    """True for the tag of a picture or a file; a video or an audio whose address names no file (a
+    """True for the tag of a picture or a file, and for any block that shows a file kept in Notion (an
+    embed, for one), whose address names its block; a video or an audio whose address names no file (a
     player's page) is a link, and its query string says which one it is."""
-    return name in FILE_TAGS or (name in PLAYED_TAGS and re.search(r"\.\w{2,5}$", re.split(r"[?#]", address)[0]))
+    return name in FILE_TAGS or (name in BLOCK_TAGS and HOSTED_FILE.search(address)) \
+        or (name in PLAYED_TAGS and re.search(r"\.\w{2,5}$", re.split(r"[?#]", address)[0]))
 
 
 def tag_words(match):
