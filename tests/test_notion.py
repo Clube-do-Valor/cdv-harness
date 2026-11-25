@@ -253,6 +253,7 @@ class FakeNotion:
         self.children = {}  # page or block id -> the blocks under it, as the block endpoints give them
         self.page_of = {}  # block id -> the page it was stored on
         self.files = {}
+        self.kinds = {}  # upload id -> what it is: image, pdf, file
         self.next_number = 200
         self.next_id = 0x5000
         self.now = "2026-11-22T09:30:00.000Z"  # created_time of new pages, to the minute as Notion stores it
@@ -476,13 +477,22 @@ class FakeNotion:
         """A media block given an uploaded file: it becomes a hosted file with a signed url, in the body too."""
         block = self.blocks[identifier]
         upload = body[block["type"]]["file_upload"]["id"]
+        kind = self.kinds.get(upload, block["type"])  # an image block takes only an image, a pdf block a pdf; a file block, all
+        if block["type"] not in ("file", kind):
+            return error(400, "validation_error", f"File upload {upload} has a type of {kind}, but only {block['type']} files are expected.")
         hosted = f"https://files.example.com/{upload}?X-Amz-Expires=3600"
         before = block[block["type"]].get("external", {}).get("url")
         block[block["type"]] = {"caption": block[block["type"]]["caption"], "type": "file",
                                 "file": {"url": hosted, "expiry_time": "2026-11-22T10:30:00.000Z"}}
         page = self.page_of.get(identifier)
-        if before and page:
-            self.markdown[page] = self.markdown[page].replace(before, hosted, 1)
+        if before and page:  # the first block of the body that holds it, never code
+            parts = re.split(r"(```.*?```|~~~.*?~~~|`[^`\n]*`|<code>.*?</code>)", self.markdown[page], flags=re.S)
+            for place in range(0, len(parts), 2):
+                for mark in ("](" + before, 'source="' + before):
+                    if mark in parts[place]:
+                        parts[place] = parts[place].replace(mark, mark.replace(before, hosted), 1)
+                        self.markdown[page] = "".join(parts)
+                        return 200, block
         return 200, block
 
     class Refused(Exception):
@@ -594,7 +604,7 @@ class FakeNotion:
         if kind == "update_content":
             matched = 0
             for pair in body["update_content"]["content_updates"]:
-                if current.count(pair["old_str"]) == 1:
+                if current.count(pair["old_str"]) == 1 or (pair.get("replace_all_matches") and pair["old_str"] in current):
                     current = current.replace(pair["old_str"], pair["new_str"])
                     matched += 1
                 else:
@@ -3315,9 +3325,10 @@ class FilesTest(ClientTestCase):
 
                     def read(r, reads=reads, fails=fails, when=when):
                         reads.append(r)
-                        return fails(r) if when == "to place" or len(reads) > 1 else None
+                        return fails(r)
 
-                    self.fake.on("GET", rf"/v1/blocks/{PAGE}/children", read)
+                    self.fake.on("GET", rf"/v1/blocks/{PAGE}/children" if when == "to place" else rf"/v1/pages/{PAGE}/markdown", lambda r:
+                                 None if when == "to confirm" and not self.fake.sent("PATCH", r"/v1/blocks/[^/]+") else read(r))
                     code, out, err = self.run_cli("update", PAGE, "--set", "Status=Rollout", "--replace-file", body)
                     self.assertEqual(code, 4, err)
                     self.assertNotRegex(err, r"nothing changed|never left this machine")
@@ -3404,8 +3415,9 @@ class FilesTest(ClientTestCase):
         left = [b for b in self.fake.children[PAGE] if b["type"] == "image" and b["image"]["type"] == "external"]
         self.assertEqual([b["image"]["external"]["url"] for b in left], [f"https://file-upload.invalid/{one}"])
         self.assertEqual(self.placed(PAGE)[1], ("image", "https://files.example.com/" + two))
-        self.assertIn(f"warning: block {left[0]['id']} of {self.page['url']} holds the placeholder of another upload ({one})", err)
-        self.assertIn(f"--edit 'https://file-upload.invalid/{one}' 'file-upload://<new id>'", err)
+        self.assertRegex(err, rf"^warning: {re.escape(self.page['url'])} holds the placeholder of another upload, .*\({one}\)")
+        self.assertIn(f"--edit 'https://file-upload.invalid/{one}' 'file-upload://{one}'", err)
+        self.assertEqual(len(err.splitlines()), 1, err)
         three = uid(0xF13E)  # the upload expired: a new one takes its place
         code, out, err = self.run_cli("update", PAGE, "--edit", f"https://file-upload.invalid/{one}", f"file-upload://{three}")
         self.assertEqual(code, 0, err)
@@ -3461,6 +3473,322 @@ class FilesTest(ClientTestCase):
         self.assertEqual(code, 1, err)
         self.assertIn("In doubt: 'Never found'", err)
         self.assertIn(f"`notion update <its url> --edit 'https://file-upload.invalid/{one}' 'file-upload://{one}'`", err)
+
+    def reported(self, err):
+        """What a report says of each `file …` label, by case: written, refused, in doubt, not sent."""
+        said = err.split(". Add it on a line")[0].split(". The page still holds")[0].split(". The page may still hold")[0]
+        cases = re.split(r"(written: |Not written: |Not sent: |In doubt: |; not sent: |Not confirmed: )", said)
+        out = {}
+        for mark, text_ in zip(cases[1::2], cases[2::2]):
+            text_ = re.sub(r"\((?:file '|no block|the page|Notion answered)[^()]*(?:\([^()]*\)[^()]*)*\)", "", text_)  # the reason
+            out.setdefault(mark.strip("; "), []).extend(re.findall(r"file (?:'[^']*' )?\(?([0-9a-f-]{36})\)?((?: placed)? in block [0-9a-f-]+)?", text_))
+        return out
+
+    def test_a_placed_file_is_written_whatever_code_or_text_says_its_address(self):
+        one, held = uid(0xF11E), f"https://file-upload.invalid/{uid(0xF11E)}"
+        image = f"![a](file-upload://{one})"
+        bodies = {"a fence": f"{image}\n\n```\n{held}\n```\n", "a fence with the line": f"```\n![a]({held})\n```\n\n{image}",
+                  "inline code": f"see `{held}`\n\n{image}", "code tags": f"see <code>{held}</code>\n\n{image}", "both": f"`{held}`\n\n{image}\n\n~~~\n{image}\n~~~"}
+        body = self.tmp / "body.md"
+        for name, markdown in bodies.items():
+            for verb in (("update", PAGE, "--replace-file", body), ("update", PAGE, "--append-file", body), ("update", PAGE, "--prepend-file", body),
+                         ("create", "--parent", "Tasks", "--set", "title=x", "--body-file", body)):
+                with self.subTest(body=name, verb=verb[2]):
+                    self.fake.markdown[PAGE] = f"Start\n\nthe client said `{held}`\n"
+                    body.write_text(markdown)
+                    code, out, err = self.run_cli(*verb)
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertIn("uploaded files placed: 1", out)
+                    page = PAGE if verb[0] == "update" else list(self.fake.pages)[-1]
+                    self.assert_all_placed(page, {one: 1})
+        # the address as text of the page: the file is placed, exit 0, and the text is named, never silent
+        kept = f'A sentence with \\<file source="{held}">a\\</file> inside.'
+        body.write_text(image)
+        for verb in ("--append-file", "--prepend-file"):
+            with self.subTest(text=verb):
+                self.fake.markdown[PAGE] = kept
+                code, out, err = self.run_cli("update", PAGE, verb, body)
+                self.assertEqual(code, 0, err)
+                self.assertEqual(err.strip(), f"warning: {self.page['url']} holds {held} in text, where Notion cannot show a file: take it out")
+        # an edit puts the file where no block is made of it, beside one that is: each is in one case, once
+        two = uid(0xF12E)
+        self.fake.markdown[PAGE] = "Intro\n\n```\nHERE\n```\n\nthere\n"
+        code, out, err = self.run_cli("update", PAGE, "--edit", "HERE", f"![b](file-upload://{two})", "--edit", "there", image)
+        self.assertEqual(code, 4, err)
+        cases = self.reported(err)
+        self.assertEqual([u for u, _ in cases["written:"]], [one])
+        self.assertEqual([u for u, _ in cases["Not sent:"]], [two])
+        self.assertEqual(set(cases), {"written:", "Not sent:"}, err)
+        # the same upload twice and one place of it only: the place that is not is counted, not the whole file
+        self.fake.markdown[PAGE] = "Intro\n\n```\nHERE\n```\n\nthere\n"
+        code, out, err = self.run_cli("update", PAGE, "--edit", "HERE", image, "--edit", "there", image)
+        self.assertEqual(code, 4, err)
+        self.assertRegex(err, rf"written: body edits 1, 2; file 'a' \({one}\) placed in block \S+\. Not sent: file 'a' \({one}\) \(1 of its 2 places\)")
+        # a block that says it took the file and still holds the placeholder is in doubt and not written
+        self.fake.markdown[PAGE] = "Start"
+        self.fake.on("PATCH", r"/v1/blocks/[^/]+", lambda r: (200, self.fake.blocks[r.path.split("/")[3]]))
+        code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+        self.assertEqual(code, 4, err)
+        self.assertEqual(set(self.reported(err)), {"written:", "In doubt:"}, err)
+        self.assertNotIn("placed in block", err)
+        command = self.commands(err)[0]
+        code, out, err = self.run_cli(*command)  # a command that only places and wrote nothing for sure: no empty "written:"
+        self.assertEqual(code, 1, err)
+        self.assertRegex(err, rf"^In doubt: file {one} in block ")
+        self.assertNotIn("written:", err)
+        self.fake.overrides.clear()
+        self.assertEqual(self.run_cli(*command)[0], 0)
+        self.assert_all_placed(PAGE, {one: 1})
+
+    def test_a_block_that_cannot_be_read_never_stops_a_file_that_is_elsewhere(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        image, body = f"![a](file-upload://{one})", self.tmp / "body.md"
+        toggles = "\n\n".join(f"<toggle>\nT{i}\n\ninside {i}\n</toggle>" for i in range(3))
+        for status in (400, 403, 404):
+            for deep in (False, True):
+                with self.subTest(status=status, deep=deep):
+                    self.fake.overrides.clear()
+                    self.fake.calls.clear()
+                    body.write_text(f"{toggles}\n\n" + (f"<toggle>\nTitle\n\n{image}\n</toggle>" if deep else image))
+                    self.fake.markdown[PAGE] = "Start"
+
+                    def unreadable(r):
+                        first = next(b["id"] for b in self.fake.children[PAGE] if b["type"] == "toggle")
+                        return error(status, "restricted_resource", "No.") if r.path.split("/")[3] == first else None
+
+                    self.fake.on("GET", r"/v1/blocks/[^/]+/children", unreadable)
+                    code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+                    self.assertEqual(code, 0, err)
+                    self.assert_all_placed(PAGE, {one: 1})
+                    if deep:  # it was in the way: named, and the search went on
+                        blocked = next(b["id"] for b in self.fake.children[PAGE] if b["type"] == "toggle")
+                        self.assertRegex(err, rf"^warning: the blocks inside block {blocked} could not be read")
+                    else:  # nothing under the page's own list had to be read
+                        self.assertEqual(err, "")
+                        self.assertEqual(len(self.fake.sent("GET", r"/v1/blocks/[^/]+/children")), 1)
+        # the file itself is in the block that cannot be read: reported once, the other file placed, and the advice finishes the job
+        with self.subTest("the file is in there"):
+            self.fake.overrides.clear()
+            body.write_text(f"<toggle>\nT\n\n{image}\n</toggle>\n\n![b](file-upload://{two})")
+            self.fake.on("GET", r"/v1/blocks/[^/]+/children", lambda r: error(404, "object_not_found", "No.")
+                         if r.path.split("/")[3] == self.fake.children[PAGE][0]["id"] and len(self.fake.children[PAGE]) < 4 else None)
+            code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+            self.assertEqual(code, 4, err)
+            blocked = self.fake.children[PAGE][0]["id"]
+            self.assertRegex(err, rf"written: body replaced; file 'b' \({two}\) placed in block \S+\. Not sent: file 'a' \({one}\) \(file 'a' "
+                                  rf"\({one}\) stands in a block that could not be read \({blocked}\)\)")
+            self.assertEqual(self.advised(err), [image])
+            body.write_text(self.advised(err)[0])
+            self.fake.on("GET", rf"/v1/blocks/{blocked}/children", lambda r: error(404, "object_not_found", "No."))
+            code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+            self.assertEqual(code, 0, err)
+            self.assertIn(f"holds the placeholder of another upload, or of another place of one ({one})", err)
+            self.assertIn(("image", "https://files.example.com/" + one), self.placed(PAGE))
+        # any other failure below the page's own list ends the search, with what was found placed and the command to go on
+        with self.subTest("lost on the way"):
+            self.fake.overrides.clear()
+            body.write_text(f"<toggle>\nT\n\n{image}\n</toggle>\n\n<toggle>\nU\n\nx\n</toggle>\n\n![b](file-upload://{two})")
+            self.fake.on("GET", r"/v1/blocks/[^/]+/children", lambda r: ends_in("500")(r) if r.path.split("/")[3] != PAGE else None)
+            code, out, err = self.run_cli("update", PAGE, "--replace-file", body)
+            self.assertEqual(code, 4, err)
+            self.assertEqual({k: [u for u, _ in v] for k, v in self.reported(err).items()}, {"written:": [two], "Not sent:": [one]}, err)
+            self.assertIn("the page could not be read to the end", err)
+            self.fake.overrides.clear()
+            for command in self.commands(err):
+                self.assertEqual(self.run_cli(*command)[0], 0)
+            self.assert_all_placed(PAGE, {one: 1, two: 1})
+
+    def advised(self, err):
+        """The lines a message says to add to the page."""
+        return re.findall(r"put `([^`]+)` in a file F and run `notion update \S+ --append-file F`", err)
+
+    def test_placing_a_file_reads_no_more_of_the_page_than_it_takes(self):
+        one = uid(0xF11E)
+        image, body = f"![a](file-upload://{one})", self.tmp / "body.md"
+        toggles = "\n\n".join(f"<toggle>\nT{i}\n\ninside {i}\n</toggle>" for i in range(60))
+        nested = f"<toggle>\nOuter\n\n<toggle>\nInner\n\n{image}\n</toggle>\n</toggle>"
+        for name, verb, written, reads in (("append", "--append-file", image, 1), ("prepend", "--prepend-file", image, 1),
+                                           ("append in a toggle", "--append-file", f"<toggle>\nNew\n\n{image}\n</toggle>", 2),
+                                           ("append in a toggle in a toggle", "--append-file", nested, 3),
+                                           ("prepend in a toggle in a toggle", "--prepend-file", nested, 3), ("edit", "--edit", image, 1)):
+            with self.subTest(name):
+                self.fake.markdown[PAGE] = toggles + "\n\nlast\n"
+                self.fake.calls.clear()
+                body.write_text(written)
+                code, out, err = self.run_cli("update", PAGE, verb, *(("last", written) if verb == "--edit" else (body,)))
+                self.assertEqual((code, err), (0, ""))
+                self.assert_all_placed(PAGE, {one: 1})
+                self.assertEqual(len(self.fake.sent("GET", r"/v1/blocks/.*")), reads)
+                self.assertEqual(len(self.fake.sent("GET", r"/v1/pages/[^/]+/markdown")), 2 if verb == "--edit" else 1)
+        # a long page is read from its start, and no further than the file when it was put there
+        self.fake.markdown[PAGE] = "\n\n".join(f"line {i}" for i in range(250))
+        for verb, pages in (("--prepend-file", 1), ("--append-file", 3)):
+            with self.subTest(verb, pages=pages):
+                self.fake.calls.clear()
+                self.fake.overrides.clear()
+
+                def paged(r):
+                    start = int(r.query.get("start_cursor", ["0"])[0])
+                    blocks = self.fake.children[PAGE]
+                    more = start + 100 < len(blocks)
+                    return 200, {"object": "list", "results": blocks[start:start + 100], "has_more": more, "next_cursor": str(start + 100) if more else None}
+
+                self.fake.on("GET", rf"/v1/blocks/{PAGE}/children", paged)
+                body.write_text(image)
+                code, out, err = self.run_cli("update", PAGE, verb, body)
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual(len(self.fake.sent("GET", r"/v1/blocks/.*")), pages)
+                self.fake.markdown[PAGE] = "\n\n".join(f"line {i}" for i in range(250))
+
+    def test_the_command_that_finishes_the_job_works_in_every_state(self):
+        one, two, new = uid(0xF11E), uid(0xF12E), uid(0xF99E)
+        image, body = f"![a](file-upload://{one})", self.tmp / "body.md"
+
+        def left(*args):
+            self.fake.overrides.clear()
+            self.fake.on("PATCH", r"/v1/blocks/[^/]+", ends_in("503"))
+            code, out, err = self.run_cli(*args)
+            self.assertEqual(code, 4, err)
+            self.fake.overrides.clear()
+            return self.commands(err)[0]
+
+        states = {  # how the page was left -> how many blocks wait for the upload
+            "once": ([image], 1), "twice in one body": ([f"{image}\n\n{image}"], 2), "two failed appends": ([image, image], 2),
+            "in a toggle and out of it": ([f"<toggle>\nT\n\n{image}\n</toggle>\n\n{image}"], 2),
+            "with other captions": ([f"{image}\n\n![b](file-upload://{one})\n\n<file source=\"file-upload://{one}\">c</file>"], 3),
+            "beside code that says it": ([f"```\nhttps://file-upload.invalid/{one}\n![a](https://file-upload.invalid/{one})\n```\n\n{image}"], 1),
+        }
+        for name, (bodies, count) in states.items():
+            for expired in (False, True):
+                with self.subTest(state=name, expired=expired):
+                    self.fake.markdown[PAGE] = "Start"
+                    for markdown in bodies:
+                        body.write_text(markdown)
+                        command = left("update", PAGE, "--append-file", body)
+                    if expired:  # as the message says: the new upload's id in the second part
+                        command[-1] = f"file-upload://{new}"
+                    self.fake.calls.clear()
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertIn(f"uploaded files placed: {count}", out)
+                    self.assert_all_placed(PAGE, {new if expired else one: count})
+                    self.assertEqual(self.fake.sent("PATCH", r"/v1/pages/.*"), [], "placing writes no text")
+                    before = self.fake.markdown[PAGE]
+                    code, out, err = self.run_cli(*command)  # safe to run twice
+                    self.assertEqual(code, 1, err)
+                    self.assertIn("no edit matched the body, so nothing was changed", err)
+                    self.assertEqual(self.fake.markdown[PAGE], before)
+        # a file its block cannot take, as Notion refuses a PDF in an image block: the block is written again as a <file>
+        for verb in ("--append-file", "--replace-file"):
+            for markdown, count in ((image, 1), (f"{image}\n\n{image}\n\n![it's a \\] b](file-upload://{one})", 3),
+                                    (f'<pdf source="file-upload://{one}">a</pdf>', 1), (f'<pdf source="file-upload://{one}" />', 1)):
+                with self.subTest(wrong_kind=markdown, verb=verb):
+                    self.fake.kinds = {one: "productivity"}
+                    self.fake.markdown[PAGE] = "Start"
+                    body.write_text(markdown)
+                    code, out, err = self.run_cli("update", PAGE, verb, body)
+                    self.assertEqual(code, 4, err)
+                    self.assertIn("files are expected", err)
+                    command = shlex.split(re.search(r"`notion (update .*? --edit '[^']+' '.*?)` \(it says", err).group(1))
+                    self.assertTrue(command[-1].startswith(f'<file source="file-upload://{one}">'), command)
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual((code, err), (0, ""))
+                    self.assertEqual(self.placed(PAGE), [("file", "https://files.example.com/" + one)] * count)
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual(code, 1, err)
+                    self.assertIn("nothing was changed", err)
+        # code that quotes the same line is never rewritten, and a placeholder that is only text is said to be
+        self.fake.kinds = {one: "pdf"}
+        held = f"https://file-upload.invalid/{one}"
+        self.fake.markdown[PAGE] = before = f"![a]({held})\n\n```\n![a]({held})\n```\n"
+        for new_text, said in ((f'<file source="file-upload://{one}">a</file>', "matches inside code too"),):
+            code, out, err = self.run_cli("update", PAGE, "--edit", held, new_text)
+            self.assertEqual((code, self.fake.markdown[PAGE]), (1, before), err)
+            self.assertIn(said, err)
+        self.fake.markdown[PAGE] = f"Only {held} in text\n"
+        code, out, err = self.run_cli("update", PAGE, "--edit", held, f"file-upload://{one}")
+        self.assertEqual(code, 1, err)
+        self.assertIn("it stands only in text, which cannot hold a file", err)
+        code, out, err = self.run_cli("update", PAGE, "--edit", held, "the file above")  # an ordinary edit still takes it out
+        self.assertEqual((code, self.fake.markdown[PAGE]), (0, "Only the file above in text\n"), err)
+        # one left deep in the page by an earlier command, and the same file appended: both are placed, none is in doubt
+        self.fake.kinds = {}
+        self.fake.markdown[PAGE] = "Start"
+        body.write_text(f"<toggle>\nT\n\n{image}\n</toggle>")
+        left("update", PAGE, "--append-file", body)
+        body.write_text(image)
+        code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+        self.assertEqual((code, err), (0, ""))
+        self.assert_all_placed(PAGE, {one: 2})
+        # a page too long to be read whole: the command looks for the block all the same
+        self.fake.kinds = {}
+        body.write_text(image)
+        self.fake.markdown[PAGE] = "Start"
+        command = left("update", PAGE, "--append-file", body)
+        self.fake.on("GET", rf"/v1/pages/{PAGE}/markdown", lambda r: (200, {"object": "page_markdown", "id": PAGE, "markdown": "Start", "truncated": True}))
+        code, out, err = self.run_cli(*command)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self.placed(PAGE), [("image", "https://files.example.com/" + one)])
+        code, out, err = self.run_cli(*command)  # nothing waits: nothing is written, and that is what it says
+        self.assertEqual(code, 1, err)
+        self.assertRegex(err, rf"^Not sent: file {one} \(no block of the page holds file {one}\): .*nothing changed")
+        self.assertNotIn("written:", err)
+
+    def test_every_placeholder_left_by_another_command_is_named(self):
+        one, two = uid(0xF11E), uid(0xF12E)
+        held, body = f"https://file-upload.invalid/{one}", self.tmp / "body.md"
+        body.write_text(f"![b](file-upload://{two})")
+        media = rf"warning: \S+ holds the placeholder of another upload, .*\({one}\).*--edit '{held}' 'file-upload://{one}'"
+        in_text = rf"warning: \S+ holds {held} in text, where Notion cannot show a file: take it out"
+        pages = {  # the page as it was left -> what is said of it
+            "an image": (f"![a]({held})", [media]), "in a toggle": (f"<toggle>\nT\n\n![a]({held})\n</toggle>", [media]),
+            "a tag over lines": (f'<file source="{held}">\na\n</file>', [media]), "twice": (f"![a]({held})\n\n![c]({held})", [media]),
+            "a tag kept as text": (f'Text \\<file source="[{held}">a\\</file>]({held}%22) here', [in_text]), "a linked address": (f"see [{held}]({held})", [in_text]),
+            "a table cell": (f"| a |\n| --- |\n| {held} |", [in_text]), "a bookmark": (f'<bookmark source="{held}" />', [in_text]),
+            "both": (f"![a]({held})\n\nand {held}", [media, in_text]), "code only": (f"`{held}`\n\n```\n{held}\n```\n\n<code>{held}</code>", []),
+        }
+        for name, (page, said) in pages.items():
+            for verb in ("--append-file", "--prepend-file", "--edit"):
+                with self.subTest(page=name, verb=verb):
+                    self.fake.overrides.clear()
+                    self.fake.markdown[PAGE] = page + "\n\nHERE\n"
+                    args = ("HERE", body.read_text()) if verb == "--edit" else (body,)
+                    code, out, err = self.run_cli("update", PAGE, verb, *args)
+                    self.assertEqual(code, 0, err)
+                    self.assertIn("uploaded files placed: 1", out)
+                    self.assertEqual(len(err.splitlines()), len(said), err)
+                    for line, pattern in zip(err.splitlines(), said):
+                        self.assertRegex(line, pattern)
+                    # also when this command's own file is not placed: exit 4 for its own work, and the others named
+                    self.fake.markdown[PAGE] = page + "\n\nHERE\n"
+                    self.fake.on("PATCH", r"/v1/blocks/[^/]+", ends_in("503"))
+                    code, out, err = self.run_cli("update", PAGE, verb, *args)
+                    self.assertEqual(code, 4, err)
+                    for pattern in said:
+                        self.assertRegex(err, pattern)
+        self.fake.overrides.clear()  # two writes of one command: said once
+        self.fake.markdown[PAGE] = f"![a]({held})"
+        code, out, err = self.run_cli("update", PAGE, "--prepend-file", body, "--append-file", body)
+        self.assertEqual((code, len(err.splitlines())), (0, 1), err)
+
+    def test_the_advice_for_a_file_with_no_block_is_the_form_it_was_written_in(self):
+        one, body = uid(0xF11E), self.tmp / "advice.md"
+        for written, advised, kind in (
+                (f'<pdf source="file-upload://{one}">r.pdf</pdf>', f'<pdf source="file-upload://{one}">r.pdf</pdf>', "pdf"),
+                (f'<file source="file-upload://{one}">r.pdf</file>', f'<file source="file-upload://{one}">r.pdf</file>', "pdf"),
+                (f'<file source="file-upload://{one}" />', f'<file source="file-upload://{one}"></file>', "file"),
+                (f'<img src="file-upload://{one}" />', f"![](file-upload://{one})", "image"),
+                (f"![shot](file-upload://{one})", f"![shot](file-upload://{one})", "image")):
+            with self.subTest(written):
+                self.fake.kinds = {one: kind}
+                self.fake.markdown[PAGE] = "Intro\n\n```\nHERE\n```\n"
+                code, out, err = self.run_cli("update", PAGE, "--edit", "HERE", written)
+                self.assertEqual(code, 4, err)
+                self.assertEqual(self.advised(err), [advised])
+                body.write_text(self.advised(err)[0])
+                code, out, err = self.run_cli("update", PAGE, "--append-file", body)
+                self.assertEqual((code, err), (0, ""))
+                self.assertEqual([url for _, url in self.placed(PAGE)], ["https://files.example.com/" + one])
 
     def test_a_body_that_holds_a_placeholder_is_refused_unless_the_command_supplies_its_file(self):
         one, two = uid(0xF11E), uid(0xF12E)
@@ -3529,8 +3857,8 @@ class FilesTest(ClientTestCase):
                     self.assertIn(f"uploaded files placed: {sum(wanted.values())}", out)
                     sent = self.fake.sent("PATCH", r"/v1/blocks/[^/]+")
                     self.assertEqual(len(sent), sum(wanted.values()))
-                    self.assertGreater(self.fake.calls.index(self.fake.sent("GET", rf"/v1/blocks/{page}/children")[-1]),
-                                       self.fake.calls.index(sent[-1]), "the page is read again after the last file")
+                    again = self.fake.calls[self.fake.calls.index(sent[-1]) + 1:]  # one read of the body, and no second walk
+                    self.assertEqual([(c.method, c.path) for c in again], [("GET", f"/v1/pages/{page}/markdown")])
                     for call in self.writes():
                         self.assertFalse(re.search(r"!\[[^]]*\]\(file-upload|source=.file-upload", re.sub(r"```.*?```", "",
                                                    json.dumps(call.json or {}), flags=re.S)), "an address the API does not know was sent")
@@ -3604,6 +3932,25 @@ class FilesTest(ClientTestCase):
                     code, out, err = self.run_cli(*verb)
                     self.assertEqual(code, 2, err)
         self.assertEqual(self.writes(), [])
+        for markdown, line, why in [
+                (f"a\n\n\t```\n\t![c]({u})\n\t```\n", 4, "is in the fence that line 3 opens, indented by a tab or by four spaces or more"),
+                (f"a\n\n     ````\n     ![c]({u})\n     ````\n", 4, "is in the fence that line 3 opens, indented by a tab or by four spaces or more"),
+                (f"a ` b\n![c]({u})\nc ` d", 2, "is inside the inline code that a backtick on line 1 opens"),
+                (f"A sentence about <table>.\n\n![c]({u})", 1, "<table> is never closed, and Notion refuses the whole body for it"),
+                (f"![c]({u})\n\nA sentence about the <table tag.", 3, "<table> is never closed, and Notion refuses the whole body for it"),
+                (f"<table>\n<tr>\n<td>\n![c]({u})\n</td>\n</tr>\n</table>", 4, "stands in a table"),
+                (f"- <table>\n<tr>\n<td>\n![c]({u})\n</td>\n</tr>\n</table>", 4, "stands in a table")]:
+            with self.subTest(why=why, markdown=markdown):
+                with self.assertRaises(self.n.Fail) as raised:
+                    self.n.hold_files(markdown, "body.md")
+                self.assertTrue(raised.exception.message.startswith(f"body.md, line {line}: "), raised.exception.message)
+                self.assertIn(why, raised.exception.message)
+        for said in ("about <table></table> closed.", "about \\<table> escaped.", "about `<table>` as code.", "about a <tablet>."):  # Notion stores these
+            with self.subTest(accepted=said):
+                self.assertEqual(self.n.hold_files(f"A sentence {said}\n\n![c]({u})\n\nEnd", "body.md")[0],
+                                 f"A sentence {said}\n\n![c]({held})\n\nEnd")
+        closed = f"A sentence about <table>.\n\n![c]({u})\n\nand </table> later.\n\n<table>\n<tr><td>x</td></tr>\n</table>\n\n![d]({v})"
+        self.assertEqual([f.id for f in self.n.hold_files(closed, "body.md")[1]], [one, two])
         documented = re.findall(r"`([!<][^`]*file-upload://<id>[^`]*)`", (SKILL_DIR / "references" / "notion-markdown.md").read_text(encoding="utf-8"))
         self.assertGreater(len(documented), 5)
         for form in documented:
@@ -3614,15 +3961,23 @@ class FilesTest(ClientTestCase):
 
     def test_the_walk_of_a_long_body_is_linear(self):
         line = f"![c](file-upload://{uid(0xF11E)})"
-        for shape in ("`", "``` ", "\\`", "> ", "- ", "\n", "$$\n", "```\n", "~~~\n", "[", "![", "![a](", "<file ", "<file source=", "<code>", "a ` b\n", "\t- x\n"):
-            with self.subTest(shape=shape):
-                body = line + "\n\n" + (shape * (60000 // len(shape))) + "\n"
+        for shape in ("`x` <table> </table>\n" * 7000, "<code>x</code> <table></table>\n" * 7000, f"`{line}` x\n" * 2000, "`", "``` ", "\\`", "> ", "- ", "\n", "$$\n", "```\n", "~~~\n", "[", "![", "![a](", "<file ", "<file source=", "<code>", "a ` b\n", "\t- x\n"):
+            with self.subTest(shape=shape[:40]):
+                body = line + "\n\n" + (shape * (60000 // len(shape) or 1)) + "\n"
                 began = time.process_time()
                 try:
                     self.n.hold_files(body, "body.md")
                 except self.n.Fail:
                     pass
-                self.assertLess(time.process_time() - began, 5)
+                self.assertLess(time.process_time() - began, 2)
+        space, upload = " " * 20000, f"file-upload://{uid(0xF11E)}"
+        for shape in ("<file {s}x", "<file {s}source{s}={s}x>", '<file {s}source{s}={s}"{u}"{s}>{s}x{s}x{s}', "![c]({u}{s}x", "![c]({s}{u}{s}", "source={s}x {u}",
+                      "source='{s}{u}", "- {s}<file {s}", '<file source="{u}"{s}' + "</file>{s}" * 20):
+            with self.subTest(line=shape):
+                began = time.process_time()
+                with contextlib.suppress(self.n.Fail):
+                    self.n.hold_files(shape.replace("{s}", space).replace("{u}", upload), "body.md")
+                self.assertLess(time.process_time() - began, 1)
 
     def commands(self, err):
         """The commands a message gives to place files, each as the client's arguments."""
@@ -3640,7 +3995,7 @@ class FilesTest(ClientTestCase):
                 yield from every(block["id"])
 
         for block in every(page):
-            if block["type"] != "code" and "`" not in json.dumps(block[block["type"]]):
+            if block["type"] != "code" and not re.search("`|<code>", json.dumps(block[block["type"]])):
                 self.assertNotIn("file-upload.invalid", json.dumps(block))
 
     def test_download_saves_the_file_without_the_token(self):
