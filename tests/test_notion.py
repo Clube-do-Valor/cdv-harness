@@ -2770,7 +2770,31 @@ class TokenTest(ClientTestCase):
         self.assertNotIn(TOKEN, joined)
         self.assertNotIn(TOKEN[4:20], joined)
 
+    def test_token_with_a_character_that_is_not_plain_ascii_exits_3(self):
+        for name, odd in (("zero-width space", chr(0x200B)), ("byte-order mark", chr(0xFEFF)), ("ellipsis", chr(0x2026)),
+                          ("accent", chr(0xE9)), ("no-break space", chr(0xA0)), ("a control character", chr(7))):
+            for source in ("env", "prompt"):
+                with self.subTest(odd=name, source=source):
+                    self.fake.calls.clear()
+                    os.environ.pop("NOTION_API_TOKEN", None)
+                    if source == "env":
+                        os.environ["NOTION_API_TOKEN"] = TOKEN[:20] + odd + TOKEN[20:]
+                        code, out, err = self.run_cli("fetch", PAGE)
+                    else:
+                        self.n.STDIN_IS_TTY = lambda: True
+                        self.n.GETPASS = lambda prompt, odd=odd: TOKEN[:20] + odd + TOKEN[20:]
+                        code, out, err = self.run_cli("auth", "login")
+                    self.assertEqual(code, 3, err)
+                    self.assertIn("malformed", err)
+                    self.assertNotIn(TOKEN[4:20], out + err)
+                    self.assertEqual(self.fake.calls, [])
+
     def test_token_with_a_line_break_inside_exits_3_and_is_never_printed(self):
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        self.n.API_HOST = "127.0.0.1:%d" % closed.getsockname()[1]
+        closed.close()  # the real transport is installed below: nothing it might send can reach the real host
+        self.n.API_ROOT = "http://" + self.n.API_HOST
         credentials = self.home / ".config" / "notion" / "credentials"
         credentials.parent.mkdir(parents=True)
         credentials.write_text(TOKEN + " " + TOKEN + "\n")

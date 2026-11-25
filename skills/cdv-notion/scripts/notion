@@ -311,11 +311,11 @@ def cache_dir():
 
 
 def well_formed(token, source):
-    """The token, or Fail(NO_TOKEN) naming the source (never the value) when it holds whitespace or a control
-    character: such a value would reach the Authorization header, and the error the HTTP layer raises prints it."""
-    if re.search(r'[\s\x00-\x1f\x7f]', token):
-        raise Fail(NO_TOKEN, f'the token from {source} is malformed (it holds a space or a line break); '
-                             f'store it again: {LOGIN_HINT}')
+    """The token, or Fail(NO_TOKEN) naming the source (never the value) when it holds anything but printable
+    ASCII: such a value would reach the Authorization header, and the error the HTTP layer raises prints it."""
+    if not re.fullmatch(r'[\x21-\x7e]+', token):
+        raise Fail(NO_TOKEN, f'the token from {source} is malformed (it holds a space, a line break or a character '
+                             f'that is not plain ASCII); store it again: {LOGIN_HINT}')
     return token, source
 
 
@@ -2546,7 +2546,7 @@ def cmd_auth(client, args):
         token = GETPASS('Notion API token (input hidden): ').strip()
         if not token:
             raise Fail(USAGE, 'no token typed; nothing stored')
-        client._token, client.source = token, 'the prompt'
+        client._token, client.source = well_formed(token, 'the prompt')
         client.bot()
         stored = secret_tool('store', '--label=Notion API token (cdv-notion)', *KEYRING, stdin=token)
         if stored is not None and stored.returncode == 0:
