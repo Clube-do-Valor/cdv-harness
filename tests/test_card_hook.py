@@ -427,13 +427,18 @@ class CardHookTest(HookCase):
 
     def client_run(self, argv, *failures):
         """(exit code, stdout, stderr) of the real client over the fake Notion, where each (method, path,
-        answer) of `failures` answers for it: a status, or the exception the transport raises."""
+        answer) of `failures` answers for it: a status, the exception the transport raises, or a handler."""
         fake, module = cf.fake_from_state(self.state), cf.real_client()
         fake.now = cf.CREATED
+        for identifier, markdown in fake.markdown.items():
+            if "file-upload.invalid" in markdown:  # the blocks that wait for an uploaded file
+                fake.store_blocks(identifier, markdown)
         module.SLEEP = lambda seconds: None
         module.TRANSPORT = fake
         for method, path, answer in failures:
             def handler(request, answer=answer):
+                if callable(answer):
+                    return answer(request)
                 if isinstance(answer, tuple):
                     return answer
                 if isinstance(answer, int):
@@ -544,6 +549,65 @@ class CardHookTest(HookCase):
         self.clear_calls()
         # The same words in a command that does not name the client are not a write
         self.assertSilent(self.hook(self.event("Bash", {"command": "cat notes.txt"}, {"stdout": doubt[2], "stderr": ""})))
+        self.assertEqual(self.calls(), [])
+
+    def test_a_write_that_places_a_file_is_checked_by_the_page_its_message_names(self):
+        # An edit that only gives a block its uploaded file writes the block, not the page: no `updated` line and no
+        # page path until every file is placed, and the page in a variable the command does not assign.
+        first, second = uid(0xF11E), uid(0xF12E)
+        held = [f"https://file-upload.invalid/{upload}" for upload in (first, second)]
+        page = self.add(cf.task(1, f"![a]({held[0]})\n\n![b]({held[1]})\n"))
+        edits = [["--edit", address, f"file-upload://{upload}"] for address, upload in zip(held, (first, second))]
+        one, both = ["update", cf.key(1), *edits[0]], ["update", cf.key(1), *edits[0], *edits[1]]
+        command = f'{CLIENT_CMD} update "$CARD" --edit "$HELD" "$FILE"'
+        block = r"/v1/blocks/[^/]+"
+
+        def checked(run, name):
+            proc = self.hook(self.failed(command, run, session=name))
+            self.assertSays(proc, cf.hex32(page["id"]), "request-zone:")
+            self.assertEqual(proc.stderr.count("request-zone:"), 1)
+
+        # In doubt on the first block: exit 1, and the page is in the command the client prints
+        unchanged = (200, {"object": "block", "id": uid(0xB10C), "type": "image", "image": {}})
+        for number, answer in enumerate((502, TimeoutError("slow"), unchanged)):
+            with self.subTest(answer=answer):
+                run = self.client_run(one, ("PATCH", block, answer))
+                self.assertEqual((run[0], "updated" in run[1]), (1, False), run)
+                self.assertIn("In doubt: ", run[2])
+                self.assertNotIn("/v1/pages/", run[2])
+                checked(run, f"block-{number}")
+
+        # Refused or never sent: the same command is printed, and nothing is checked
+        self.clear_calls()
+        for answer in (409, "Unsent"):
+            with self.subTest(answer=answer):
+                run = self.client_run(one, ("PATCH", block, answer))
+                self.assertEqual(run[0], 1, run)
+                self.assertIn("notion update https://", run[2])
+                self.assertSilent(self.hook(self.failed(command, run)))
+        self.assertEqual(self.calls(), [])
+
+        # Every file placed: the client's line; one placed and the other refused: the page of `done in part on`,
+        # also when the exit code is hidden
+        run = self.client_run(one)
+        self.assertEqual((run[0], run[1].count(f"updated {page['url']}")), (0, 1), run)
+        answers = iter([None, (409, {"object": "error", "status": 409, "code": "synthetic", "message": "synthetic"})])
+        run = self.client_run(both, ("PATCH", block, lambda request: next(answers)))
+        self.assertEqual((run[0], "updated" in run[1]), (4, False), run)
+        self.assertIn(f"done in part on {page['url']}:", run[2])
+        checked(run, "placed")
+        for name, out, err in (("stderr", run[1], run[2]), ("2>&1", run[1] + run[2], "")):
+            with self.subTest(exit=0, said_on=name):
+                masked = self.event("Bash", {"command": command + " || true"}, {"stdout": out, "stderr": err, "interrupted": False},
+                                    session="hidden " + name)
+                self.assertSays(self.hook(masked), cf.hex32(page["id"]), "request-zone:")
+
+        # Written, and what was stored could not be read: with stdout hidden, the message alone names the page
+        done = f"done on {page['url']}: written: properties Status. Not confirmed: the stored value of Status could not be read"
+        checked((4, "", done + "\n"), "not confirmed")
+        self.clear_calls()
+        elsewhere = done.replace(page["url"], "https://example.com/" + cf.hex32(page["id"]))
+        self.assertSilent(self.hook(self.failed(command, (4, "", elsewhere + "\n"))))
         self.assertEqual(self.calls(), [])
 
     def test_an_output_of_blank_lines_is_read_in_time_that_follows_its_length(self):

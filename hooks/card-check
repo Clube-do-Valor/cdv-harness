@@ -113,13 +113,16 @@ NAMES_CLIENT = re.compile(r"(?:^|[\s/'\"=;&|(`]|:-)notion(?=$|[\s'\";&|)`}])")
 # they sit (a loop may print a label before them).
 WRITE_LINE = re.compile(r"(updated|created) (https?://[^\s\"'<>),]+)")
 NOTION_HOST = re.compile(r"(?:[a-z0-9-]+\.)*notion\.(?:so|com|site)", re.I)
-# A done-in-part update names its page: `done in part on <url>: written: ...`.
-PARTIAL_ON = re.compile(r"done in part on (https?://\S+?):(?:\s|$)")
+# An update done in part, or done with something it could not read back, names its page: `done in part on
+# <url>: written: ...`, `done on <url>: written: ...`. An update that only places uploaded files prints no other.
+DONE_ON = re.compile(r"done (?:in part )?on (https?://[^\s\"'<>),]+?): written: ")
 # A write in doubt (sent, with no answer the client can trust), alone or after a write that landed:
-# `In doubt: <what> (<cause>): ...`. The cause names the page by the API path the request went to. A
-# refused (`Not written:`) or unsent (`Not sent:`) write names that path too, and is not one.
+# `In doubt: <what> (<cause>): ...`. The cause names the page by the API path the request went to; a file
+# placed goes to a block, and its page is in the command the line ends with. A refused (`Not written:`) or
+# unsent (`Not sent:`) write names them too, and is not one.
 IN_DOUBT = re.compile(r"(?m)^[^\S\n]*(?:done in part\b.*?\. )?In doubt: .*$")
 PAGE_PATH = re.compile(r"/v1/pages/(" + UUID.pattern + ")")
+PLACE_COMMAND = re.compile(r"`notion update (https?://[^\s\"'<>),]+) --edit ")
 MAX_DEPTH = 3  # a command string inside a command string
 OPERATOR = re.compile(r"&&|\|\||;;&|;;|;&|\|&|[;|&()]")
 REDIRECTION = re.compile(r"&>>|&>|>>|>\||>&|<<<|<<-|<<|<&|<>|>|<")
@@ -531,7 +534,11 @@ def written_lines(output):
 
 def pages_in_doubt(text):
     """The pages of the writes the client reports as in doubt."""
-    return [match.group(1) for line in IN_DOUBT.findall(text or "") for match in PAGE_PATH.finditer(line)]
+    found = []
+    for line in IN_DOUBT.findall(text or ""):
+        found += [match.group(1) for match in PAGE_PATH.finditer(line)]
+        found += [url for url in PLACE_COMMAND.findall(line) if is_notion_page(url)]
+    return found
 
 
 def bash_targets(command, output, code, errors=""):
@@ -539,17 +546,16 @@ def bash_targets(command, output, code, errors=""):
 
     The pages are those of the client's own write lines, wherever they sit in the output, and, on a call
     that ended well or exited 4 (done in part), those the client's `update` calls name, as far as the
-    command can be read. A call that exited 4 also checks the page its message names (`done in part on
-    <url>`). A write in doubt is said on stderr (`errors` when the call succeeded). One page may come
+    command can be read. The page a message names as written (`done in part on <url>`) is one too, whatever
+    the call's exit code. Messages are said on stderr (`errors` when the call succeeded). One page may come
     under several names: main() checks it once."""
     try:
         calls = client_calls(command)
     except (IndexError, RecursionError):  # a command nested past reading: the output still names its pages
         calls = []
     lines = written_lines(output)
-    pages = [url for _, url in lines] + pages_in_doubt(f"{output}\n{errors}")
-    if code == 4:
-        pages += [m.group(1) for m in PARTIAL_ON.finditer(output or "")]
+    said = f"{output}\n{errors}"
+    pages = [url for _, url in lines] + pages_in_doubt(said) + [url for url in DONE_ON.findall(said) if is_notion_page(url)]
     created = {hyphenated(url) for verb, url in lines if verb == "created"}
     flags = replaced_flags(calls, {hyphenated(page) for page in pages}, created)
     # a loop that failed does not tell which of its pages it reached: the output does
