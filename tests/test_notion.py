@@ -220,6 +220,7 @@ class FakeNotion:
         self.comments = {}
         self.property_items = {}
         self.blocks = {}
+        self.children = {}  # page or block id -> the blocks under it, as the block endpoints give them
         self.files = {}
         self.next_number = 200
         self.next_id = 0x5000
@@ -339,6 +340,10 @@ class FakeNotion:
         match = re.fullmatch(r"/v1/file_uploads/([^/]+)/send", p)
         if match and m == "POST":
             return 200, {"object": "file_upload", "id": match.group(1), "status": "uploaded"}
+        match = re.fullmatch(r"/v1/blocks/([^/]+)/children", p)
+        if match and m == "GET":
+            return 200, {"object": "list", "results": self.children.get(match.group(1), []), "next_cursor": None,
+                         "has_more": False, "type": "block", "block": {}}
         match = re.fullmatch(r"/v1/blocks/([^/]+)", p)
         if match and m == "GET":
             found = self.blocks.get(match.group(1))
@@ -387,8 +392,45 @@ class FakeNotion:
         return True
 
     def page_markdown(self, identifier):
-        return {"object": "page_markdown", "id": identifier, "markdown": self.markdown.get(identifier, ""),
+        """A body as the markdown endpoint gives it back: a table whose only style is its header row comes back
+        as a pipe table, whatever form it was written in."""
+        def pipes(match):
+            rows = [re.findall(r"<td>(.*?)</td>", row) for row in re.findall(r"<tr>(.*?)</tr>", match.group(1), re.S)]
+            lines = ["| " + " | ".join(row) + " |" for row in rows]
+            return "\n".join(lines[:1] + ["| " + " | ".join("---" for _ in rows[0]) + " |"] + lines[1:])
+        body = re.sub(r'<table header-row="true">(.*?)</table>', pipes, self.markdown.get(identifier, ""), flags=re.S)
+        return {"object": "page_markdown", "id": identifier, "markdown": body,
                 "truncated": False, "unknown_block_ids": []}
+
+    def block(self, kind, content, children=()):
+        made = {"object": "block", "id": self.new_id(), "has_children": bool(children), "in_trash": False,
+                "type": kind, kind: content}
+        self.blocks[made["id"]] = made
+        self.children[made["id"]] = list(children)
+        return made
+
+    def store_blocks(self, identifier, markdown):
+        """The blocks Notion stores for the constructs the tests write: callout, table, toggle, text."""
+        def paragraph(value):
+            return self.block("paragraph", {"rich_text": text(value), "color": "default"})
+        stored = []
+        pattern = (r'<callout icon="([^"]+)"[^>]*>\n(.*?)\n</callout>|<table([^>]*)>\n(.*?)</table>|'
+                   r"<toggle>\n(.*?)\n\n(.*?)\n</toggle>|([^\n]+)")
+        for m in re.finditer(pattern, markdown, re.S):
+            icon, callout, flags, rows, toggle, hidden, line = m.groups()
+            if callout is not None:
+                stored.append(self.block("callout", {"rich_text": text(callout), "icon": {"type": "emoji", "emoji": icon},
+                                                     "color": "gray_background"}))
+            elif rows is not None:
+                cells = [re.findall(r"<td>(.*?)</td>", row) for row in re.findall(r"<tr>(.*?)</tr>", rows, re.S)]
+                made = [self.block("table_row", {"cells": [text(c) for c in row]}) for row in cells]
+                stored.append(self.block("table", {"table_width": len(cells[0]), "has_column_header": 'header-row="true"' in flags,
+                                                   "has_row_header": False}, made))
+            elif toggle is not None:
+                stored.append(self.block("toggle", {"rich_text": text(toggle), "color": "default"}, [paragraph(hidden)]))
+            else:
+                stored.append(paragraph(line))
+        self.children[identifier] = stored
 
     def patch_markdown(self, identifier, body):
         if identifier not in self.pages:
@@ -413,6 +455,7 @@ class FakeNotion:
             position = (body["insert_content"].get("position") or {}).get("type", "end")
             current = content + "\n\n" + current if position == "start" else current + "\n\n" + content
         self.markdown[identifier] = current
+        self.store_blocks(identifier, current)
         answer = self.page_markdown(identifier)
         if warnings:
             answer["warnings"] = warnings
@@ -2339,18 +2382,58 @@ class DoctorTest(ClientTestCase):
         for step in ("create", "property", "body", "comment", "trash"):
             self.assertRegex(out, rf"(?m)^write check {step}.*: ok")
         self.assertNotIn("FAILED", out)
+        self.assertIn("| Column | Value |", self.fake.page_markdown(test_page["id"])["markdown"])  # what a read gives back
 
     def test_doctor_write_check_mismatch_exits_1_and_trashes(self):
+        """A construct stored as anything but its own block fails the check, even when the text is the same."""
         self.settings(test_marker="QA MARKER")
-        self.fake.on("GET", r"/v1/pages/[^/]+/markdown",
-                     lambda r: (200, {"object": "page_markdown", "id": r.path.split("/")[3], "markdown": "something else",
-                                      "truncated": False, "unknown_block_ids": []}))
-        code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
-        self.assertEqual(code, 1)
-        self.assertIn("FAILED", out)
-        created = [pg for pg in self.fake.pages.values() if self.fake.title_of(pg).startswith("QA MARKER")]
-        self.assertEqual(len(created), 1)
-        self.assertTrue(created[0]["in_trash"])
+
+        def as_text(value):
+            return self.fake.block("paragraph", {"rich_text": text(value), "color": "default"})
+
+        def replaced(index, value):
+            return lambda blocks: blocks[:index] + [as_text(value)] + blocks[index + 1:]
+
+        def changed(index, change):
+            def apply(blocks):
+                change(blocks[index])
+                return blocks
+            return apply
+
+        def without_child(index, keep):
+            def change(block):
+                self.fake.children[block["id"]] = self.fake.children[block["id"]][:keep]
+            return changed(index, change)
+
+        cases = [
+            ("callout as text", replaced(0, "Write check callout"), "stored as paragraph, table, toggle"),
+            ("table as text", replaced(1, "| Column | Value |"), "stored as callout, paragraph, toggle"),
+            ("toggle as text", replaced(2, "Write check toggle"), "stored as callout, table, paragraph"),
+            ("everything as one text", lambda b: [as_text(self.n.WRITE_CHECK_BODY)], "stored as paragraph,"),
+            ("nothing", lambda b: [], "stored as nothing"),
+            ("an extra block", lambda b: b + [as_text("more")], "stored as callout, table, toggle, paragraph"),
+            ("callout with other text", changed(0, lambda b: b["callout"].update(rich_text=text("x"))), "the callout holds 'x'"),
+            ("no header row", changed(1, lambda b: b["table"].update(has_column_header=False)), "2 columns and no header row"),
+            ("three columns", changed(1, lambda b: b["table"].update(table_width=3)), "3 columns and a header row"),
+            ("one row", without_child(1, 1), "the table holds [['Column', 'Value']]"),
+            ("empty toggle", without_child(2, 0), "the toggle 'Write check toggle' holds []"),
+        ]
+        for name, spoil, said in cases:
+            with self.subTest(case=name):
+                self.fake.pages = {PAGE: self.page}
+                store = FakeNotion.store_blocks
+
+                def spoiled(identifier, markdown):
+                    store(self.fake, identifier, markdown)
+                    self.fake.children[identifier] = spoil(self.fake.children[identifier])
+                self.fake.store_blocks = spoiled
+                code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+                self.assertEqual(code, 1, out)
+                self.assertIn("write check body (callout, table, toggle): FAILED (", out)
+                self.assertIn(said, out)
+                created = [pg for pg in self.fake.pages.values() if self.fake.title_of(pg).startswith("QA MARKER")]
+                self.assertEqual(len(created), 1)
+                self.assertTrue(created[0]["in_trash"])
 
 
 class CacheTest(ClientTestCase):

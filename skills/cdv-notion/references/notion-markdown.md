@@ -5,13 +5,13 @@ The client reads and writes page bodies with `markdown_version: "v2"` of the mar
 ## Base
 
 - CommonMark plus GFM tables, task lists (`- [ ]`, `- [x]`) and strikethrough.
-- Headings `#` to `####` (a `#####` becomes `####`). A plain heading has no children; for a collapsible heading use `<toggle heading="h2">`.
+- Headings `#` to `####` (a `#####` becomes `####`). A plain heading has no children; for a collapsible heading use `<toggle heading="h2">`. In a body file for `notion create`, start at `##`: when the only `#` heading is the first line, Notion takes it for a title and leaves it out of the page.
 - Divider: `---` on its own line, with a blank line around it.
-- Code: always fenced, never indented; the fence is longer than the longest backtick run inside.
-- Hard line break: a trailing `\`. Empty paragraph: `<p />`.
+- Code: always fenced, never indented; the fence is longer than the longest backtick run inside. The language comes back in its short form (` ```python ` reads as ` ```py `).
+- Hard line break: a trailing `\` (it reads back as `<br />`). Empty paragraph: `<p />`.
 - Every block starts on a new line after a blank line.
 - Inline math `$x$`; display math between two lines that hold only `$$`.
-- Any HTML tag not listed here (`<div>`, `<details>`, `<sup>`, `<mark>`…) is saved as literal text. Escape a literal tag in text as `\<tag>`; escape `[`, `]`, `|`, `$`, `*` where they would be read as syntax (`\[Module\]`, `R\$ 10`).
+- Any HTML tag not listed here loses its tag and keeps its text (`<div>`, `<sup>`), is converted (`<mark>` to a yellow background, `<details>` to a toggle) or, when Notion does not know it at all, is saved as literal text. `notion update` prints a `warning` line for each; `notion create` prints none, because the API returns none. Escape a literal tag in text as `\<tag>`; escape `[`, `]`, `|`, `$`, `*` where they would be read as syntax (`\[Module\]`, `R\$ 10`).
 
 ## Inline
 
@@ -57,7 +57,7 @@ A plain table is a pipe table (`| a | b |`, `| --- | --- |`, a `|` inside a cell
 </table>
 ```
 
-`<table header-row="true">` without `fit-page-width` is the same table at its natural width.
+`<table header-row="true">` without `fit-page-width` is the same table at its natural width, stored with its header row; it reads back as a pipe table, because a header row is all a pipe table has. A `<table>` with no header row, a header column, a fitted width or colours reads back in the tag form, with each `<td>` on lines of its own. Other tags: `header-column="true"`, `<tr color="blue_bg">`, `<td color="red_bg">`.
 
 ## Media, files and child pages
 
@@ -68,4 +68,4 @@ A plain table is a pipe table (`| a | b |`, `| --- | --- |`, a `|` inside a cell
 
 ## What comes back
 
-A read gives the body in this same syntax, with signed file urls that expire after about an hour. Inline code reads back as `` `code` `` or `<code>`, bold as `<b>`. An empty page reads back as an empty body. A write that used a tag the parser does not know still runs and returns a `warning` line: report it.
+A read gives the body in this same syntax, with signed file urls that expire after about an hour. The form is not always the one written: bold, italic, strike and inline code come back as `<b>`, `<i>`, `<s>` and `<code>` whatever form they were written in, a table with only a header row as a pipe table, a hard line break as `<br />`, a coloured quote or a styled table in the tag form. The blocks are the same. So copy the `OLD` of an `--edit` from a `notion fetch` of the page, never from the file that wrote it. An empty page reads back as an empty body. A write that used a tag the parser does not know still runs and returns a `warning` line: report it.

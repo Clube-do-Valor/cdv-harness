@@ -2353,8 +2353,35 @@ Hidden line
 </toggle>"""
 
 
-def squash(text):
-    return re.sub(r'\s+', ' ', text or '').strip()
+def children_of(client, identifier):
+    """The blocks directly under a page or a block, every page of the list."""
+    return client.pages_of('GET', f'/v1/blocks/{identifier}/children')[0]
+
+
+def write_check_problems(client, page_id):
+    """What the stored blocks of WRITE_CHECK_BODY are not, empty when every construct landed as its own block.
+    The blocks are read, not the markdown: text that came back the same may still be a plain paragraph."""
+    blocks = children_of(client, page_id)
+    kinds = [b.get('type') for b in blocks]
+    if kinds != ['callout', 'table', 'toggle']:
+        return [f"stored as {', '.join(kinds) or 'nothing'}, not as a callout, a table and a toggle"]
+    callout, table, toggle = blocks
+    problems = []
+    said = plain(callout['callout'].get('rich_text'))
+    if said != 'Write check callout':
+        problems.append(f'the callout holds {said!r}')
+    shape = table['table']
+    if shape.get('table_width') != 2 or not shape.get('has_column_header'):
+        problems.append(f"the table has {shape.get('table_width')} columns and "
+                        f"{'a' if shape.get('has_column_header') else 'no'} header row")
+    cells = [[plain(cell) for cell in (row.get('table_row') or {}).get('cells', [])] for row in children_of(client, table['id'])]
+    if cells != [['Column', 'Value'], ['a', '1']]:
+        problems.append(f'the table holds {cells!r}')
+    said = plain(toggle['toggle'].get('rich_text'))
+    hidden = [plain((b.get(b.get('type')) or {}).get('rich_text')) for b in children_of(client, toggle['id'])]
+    if said != 'Write check toggle' or hidden != ['Hidden line']:
+        problems.append(f'the toggle {said!r} holds {hidden!r}')
+    return problems
 
 
 def cmd_doctor(client, args):
@@ -2452,9 +2479,8 @@ def write_check(client, args):
             step(f'property ({name})', stored.get(name) == expected, f'read back {stored.get(name)!r}')
         client.call('PATCH', f"/v1/pages/{page['id']}/markdown",
                     {'markdown_version': MARKDOWN_VERSION, 'type': 'replace_content', 'replace_content': {'new_str': WRITE_CHECK_BODY}})
-        back = client.markdown(page['id']).get('markdown', '')
-        step('body (callout, table, toggle)', squash(back) == squash(WRITE_CHECK_BODY),
-             f'read back {squash(back)[:160]!r}')
+        problems = write_check_problems(client, page['id'])
+        step('body (callout, table, toggle)', not problems, '; '.join(problems))
         said = f'{marker} write check comment'
         client.call('POST', '/v1/comments', {'parent': {'page_id': page['id']}, 'markdown': said,
                                              'markdown_version': MARKDOWN_VERSION})

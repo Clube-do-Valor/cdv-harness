@@ -15,7 +15,7 @@ Store it once, in a terminal (not through the chat: the prompt needs a real TTY)
 - **Capabilities** (set on the integration by its owner): read, update and insert content; read and insert comments; user information with e-mail addresses (without it, `whoami` and `users find` only know the people seen in rows read).
 - **Access:** the pages and data sources it works on must be connected to it (page menu → Connections → the integration); children inherit the connection.
 
-`notion doctor` prints one line per item: the token's owner kind (workspace integration or personal token), each capability (the read ones probed; the write ones proven by `notion doctor --write-check <data source>`, which creates a card whose title starts with the test marker, writes a property, a callout, a table and a toggle, reads them back, comments, and trashes it), and each connected data source with its title and key prefix.
+`notion doctor` prints one line per item: the token's owner kind (workspace integration or personal token), each capability (the read ones probed; the write ones proven by `notion doctor --write-check <data source>`, which creates a card whose title starts with the test marker, writes a property, a callout, a table and a toggle, reads the stored blocks back (a construct saved as plain text fails), comments, and trashes it), and each connected data source with its title and key prefix.
 
 ## Settings: `~/.config/cdv-notion/config.json`
 
