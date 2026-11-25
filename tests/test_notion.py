@@ -1865,6 +1865,16 @@ class QueryTest(ClientTestCase):
                 self.assertIn(named, err)
         self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
 
+    def test_where_refuses_a_type_the_api_cannot_filter(self):
+        """A type with no filter (a place) is refused here: the API answers a page of alternatives that name none."""
+        self.fake.data_sources[DS_TASKS]["properties"]["Where"] = {"id": "pl", "name": "Where", "type": "place", "place": {}}
+        for where in ("Where is empty", "Where is not empty", "Where = 'x'"):
+            with self.subTest(where=where):
+                code, out, err = self.run_cli("query", "Tasks", "--where", where)
+                self.assertEqual(code, 2)
+                self.assertIn("Where is a place property, which the", err)
+        self.assertEqual(self.fake.sent("POST", rf"/v1/data_sources/{DS_TASKS}/query"), [])
+
     def rows(self, statuses):
         for i, status in enumerate(statuses):
             self.fake.add_page(task_page(uid(0x10000 + i), 1000 + i, f"Row {i}", status=status))

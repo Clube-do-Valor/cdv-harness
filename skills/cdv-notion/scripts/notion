@@ -1754,6 +1754,8 @@ TOKEN_RE = re.compile(r"""\s*(?:
 )""", re.X)
 
 TEXT_TYPES = ('title', 'rich_text', 'url', 'email', 'phone_number')
+EMPTY_TYPES = TEXT_TYPES + ('number', 'select', 'status', 'multi_select', 'date', 'people', 'created_by',
+                            'last_edited_by', 'relation', 'files')  # the types the API filters by is_empty
 DATE_OPS = {'=': 'equals', '>': 'after', '>=': 'on_or_after', '<': 'before', '<=': 'on_or_before'}
 NUMBER_OPS = {'=': 'equals', '!=': 'does_not_equal', '>': 'greater_than', '>=': 'greater_than_or_equal_to',
               '<': 'less_than', '<=': 'less_than_or_equal_to'}
@@ -1980,6 +1982,8 @@ def compile_condition(client, schema, name, operator, values):
     if operator in ('is empty', 'is not empty'):
         if kind in ('checkbox', 'unique_id', 'timestamp', 'created_time', 'last_edited_time', 'formula', 'rollup'):
             raise refuse()
+        if kind not in EMPTY_TYPES:
+            raise Fail(USAGE, f'{prop_name} is a {kind} property, which the API cannot filter; nothing was sent')
         return dict(head, **{key: {'is_empty' if operator == 'is empty' else 'is_not_empty': True}})
 
     def leaf(op, value):
