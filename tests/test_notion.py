@@ -75,6 +75,16 @@ def run(value, url=None, kind="text", **annotations):
             "annotations": marks, "plain_text": value, "href": url}
 
 
+def comment_runs(markdown):
+    """A comment's markdown as the API stores it: each [text](address) a linked run, the rest plain runs."""
+    runs, at = [], 0
+    for found in re.finditer(r"\[([^\[\]]+)\]\((https?://[^\s()]+)\)", markdown):
+        runs += text(markdown[at:found.start()]) if found.start() > at else []
+        runs.append(run(found.group(1), found.group(2)))
+        at = found.end()
+    return runs + (text(markdown[at:]) if at < len(markdown) else []) or text(markdown)
+
+
 def person(identifier, name, email=None):
     found = {"object": "user", "id": identifier, "type": "person", "name": name, "avatar_url": None}
     if email:
@@ -338,7 +348,7 @@ class FakeNotion:
                     if comment["id"] == match.group(1):
                         if comment["created_by"]["id"] != BOT:
                             return error(404, "object_not_found", "Could not find comment.")
-                        comment["rich_text"] = text((r.json or {}).get("markdown", ""))
+                        comment["rich_text"] = comment_runs((r.json or {}).get("markdown", ""))
                         return 200, comment
             return error(404, "object_not_found", "Could not find comment.")
         if m == "POST" and p == "/v1/comments":
@@ -580,7 +590,7 @@ class FakeNotion:
             "discussion_id": body.get("discussion_id") or self.new_id(),
             "parent": body.get("parent") or {"type": "page_id", "page_id": PAGE},
             "created_by": {"object": "user", "id": BOT},
-            "rich_text": text(body.get("markdown", "")),
+            "rich_text": comment_runs(body.get("markdown", "")),
         }
         if body.get("display_name"):
             comment["display_name"] = {"type": body["display_name"]["type"],
@@ -2100,6 +2110,34 @@ class CommentsTest(ClientTestCase):
         self.assertNotIn("parent", sent)
         self.assertEqual(sent["markdown"], "Merged **today**")
 
+    def test_a_link_in_a_comment_is_printed_as_text_properties_print_it(self):
+        discussion = uid(0xC0)
+        runs = [run("see "), run("the ", "https://example.com/a"), run("runbook", "https://example.com/a", bold=True),
+                run(" or "), run("write", "mailto:ana@example.com"), run(" now")]
+        printed = "see [the runbook](https://example.com/a) or [write](mailto:ana@example.com) now"
+        self.fake.comments[PAGE] = [{"object": "comment", "id": uid(0xC1), "discussion_id": discussion,
+                                     "created_by": {"object": "user", "id": ANA}, "rich_text": runs}]
+        self.assertEqual(self.n.linked(runs), printed)  # the one renderer text properties use
+        code, out, err = self.run_cli("comments", "list", PAGE)
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"  Ana Lima [{uid(0xC1)}]: {printed}", out.splitlines())
+        code, out, err = self.run_cli("fetch", PAGE, "--discussions")
+        self.assertEqual(code, 0, err)
+        self.assertIn(f"  Ana Lima: {printed}", out.splitlines())
+        code, out, err = self.run_cli("fetch", PAGE, "--discussions", "--json")
+        self.assertEqual(json.loads(out)["discussions"][discussion][0]["rich_text"], runs)  # the raw runs keep their address
+
+    def test_a_comment_added_with_a_link_reads_back_in_the_same_form(self):
+        said = "Docs are at [the runbook](https://example.com/runbook) now"
+        code, out, err = self.run_cli("comments", "add", PAGE, "--body", said)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self.fake.comments[PAGE][-1]["rich_text"][1]["text"]["link"], {"url": "https://example.com/runbook"})
+        for command in (("comments", "list", PAGE), ("fetch", PAGE, "--discussions")):
+            with self.subTest(command=command):
+                code, out, err = self.run_cli(*command)
+                self.assertEqual(code, 0, err)
+                self.assertTrue(any(line.endswith(": " + said) for line in out.splitlines()), out)
+
     def test_an_empty_comment_is_refused_and_not_sent(self):
         # The API accepts an empty comment and posts it, so the client does not send one.
         blank = self.tmp / "blank.md"
@@ -2689,6 +2727,22 @@ class DoctorTest(ClientTestCase):
         self.assertNotIn("FAILED", out)
         self.assertIn("| Column | Value |", self.fake.page_markdown(test_page["id"])["markdown"])  # what a read gives back
         self.assertIn(f"write check create: ok ({test_page['url']})", out.splitlines())
+
+    def test_doctor_write_check_comment_carries_a_link_and_reads_back_with_it(self):
+        self.settings(test_marker="QA MARKER")
+        code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+        self.assertEqual(code, 0, out + err)
+        sent = self.fake.sent("POST", r"/v1/comments")[-1].json
+        self.assertIn("[a link](https://example.com/)", sent["markdown"])
+        self.assertRegex(out, r"(?m)^write check comment: ok")
+        # a comment that comes back without its address fails the check, and the card is still trashed
+        self.fake.calls.clear()
+        self.fake.on("POST", r"/v1/comments", lambda r: (200, dict(
+            self.fake.create_comment(dict(r.json, markdown=re.sub(r"\[(.*?)\]\(.*?\)", r"\1", r.json["markdown"])))[1])))
+        code, out, err = self.run_cli("doctor", "--write-check", COLLECTION + DS_TASKS)
+        self.assertEqual(code, 1, out + err)
+        self.assertRegex(out, r"(?m)^write check comment: FAILED \(the comment did not read back with its link\)")
+        self.assertRegex(out, r"(?m)^write check trash: ok")
 
     def test_doctor_write_check_mismatch_exits_1_and_trashes(self):
         # A construct stored as anything but its own block fails the check, even when the text is the same.

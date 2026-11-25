@@ -1341,7 +1341,7 @@ def cmd_fetch(client, args):
         for discussion, comments in threads.items():
             lines.append(f'- discussion {discussion}')
             for comment in comments:
-                said = plain(comment.get('rich_text')) or '(attachment only)'
+                said = linked(comment.get('rich_text')) or '(attachment only)'
                 lines.append(f'  {client.author(comment)}: {said}')
     client.say('\n'.join(lines))
     return DONE
@@ -2295,7 +2295,7 @@ def cmd_comments(client, args):
         for discussion, comments in threads.items():
             client.say(f'- discussion {discussion}')
             for comment in comments:
-                client.say(f"  {client.author(comment)} [{comment['id']}]: {plain(comment.get('rich_text')) or '(attachment only)'}")
+                client.say(f"  {client.author(comment)} [{comment['id']}]: {linked(comment.get('rich_text')) or '(attachment only)'}")
         return DONE
     if args.body is None and args.body_file is None:
         raise Fail(USAGE, f'`notion comments {args.action}` needs --body TEXT or --body-file F')
@@ -2640,12 +2640,12 @@ def write_check(client, args):
                     {'markdown_version': MARKDOWN_VERSION, 'type': 'replace_content', 'replace_content': {'new_str': WRITE_CHECK_BODY}})
         problems = write_check_problems(client, page['id'])
         step('body (callout, table, toggle)', not problems, '; '.join(problems))
-        said = f'{marker} write check comment'
+        said = f'{marker} write check comment with [a link](https://example.com/)'  # read back with its address
         client.call('POST', '/v1/comments', {'parent': {'page_id': page['id']}, 'markdown': said,
                                              'markdown_version': MARKDOWN_VERSION})
         threads = client.discussions(page['id'])
-        step('comment', any(plain(c.get('rich_text')) == said for cs in threads.values() for c in cs),
-             'the comment did not read back')
+        step('comment', any(linked(c.get('rich_text')) == said for cs in threads.values() for c in cs),
+             'the comment did not read back with its link')
     except Fail as failure:
         client.say(f'write check stopped: {client.redact(failure.message)}')
     finally:
