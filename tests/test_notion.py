@@ -4517,6 +4517,43 @@ class StaleCacheTest(ClientTestCase):
                     self.assertIn("The body is too long.", err)
                     self.assertEqual(self.statuses.count(400), 1)
 
+    def test_only_the_write_is_sent_again_never_after_it_landed(self):
+        """The property lands, and the read that prints it back is answered 400 over a schema that now builds the
+        write differently: the write is not sent a second time."""
+        self.cached_before(self.rename("Project", "PROJECT"))  # --set resolves it in any case, to another payload
+        related = [uid(0x40000 + i) for i in range(26)]
+        self.page["properties"]["Project"] = {"id": "pj", "type": "relation", "relation": [], "has_more": False}
+
+        def lands(r):
+            return 200, dict(self.page, properties={"Project": {"id": "pj", "type": "relation", "has_more": True,
+                                                                "relation": [{"id": i} for i in related[:25]]}})
+
+        self.fake.on("PATCH", r"/v1/pages/[^/]+", lands)
+        self.fake.on("GET", r"/v1/pages/[^/]+/properties/pj", lambda r: error(400, "validation_error", "No such property."))
+        code, out, err = self.run_cli("update", PAGE, "--set", "Project=" + page_url(PROJECT))
+        self.assertEqual(len(self.fake.sent("PATCH", r"/v1/pages/[^/]+")), 1, out + err)
+        self.assertNotEqual(code, 0, out)
+
+    def test_a_check_that_fails_for_another_reason_leaves_the_refusal_as_it_was(self):
+        """A 403 or 404 is checked against the schema; when that read fails some other way, the refusal is what is said."""
+        coll = COLLECTION + DS_TASKS
+        sites = {"query": ("query", coll), "search --in": ("search", "invoice", "--in", coll),
+                 "create": ("create", "--parent", coll, "--set", "title=A")}
+        for name, command in sites.items():
+            for broken in (500, 429):
+                with self.subTest(command=name, the_check_gets=broken):
+                    self.cached_before(lambda: None)
+                    refusal = lambda r: error(403, "restricted_resource", "Not shared with it.")
+                    self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", refusal)
+                    self.fake.on("POST", r"/v1/pages", refusal)
+                    self.fake.on("GET", rf"/v1/data_sources/{DS_TASKS}",
+                                 lambda r, broken=broken: error(broken, "unavailable", "Try later."))
+                    code, out, err = self.run_cli(*command)
+                    self.assertEqual(code, 1, out + err)
+                    self.assertIn("Notion answered 403 restricted_resource", err)
+                    self.assertIn("Not shared with it.", err)
+                    self.assertNotIn("Try later.", err)
+
     def test_the_duplicate_search_and_the_write_check_read_a_renamed_title_again(self):
         with self.subTest("the search after a create in doubt"):
             self.cached_before(self.rename("Task name", "Name"))

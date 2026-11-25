@@ -152,6 +152,10 @@ class CreateInDoubt(Fail):
         super().__init__(code, f'In doubt: the create of {name} ({cause}): {self.advice}', IN_DOUBT, cause)
 
 
+class NotConnected(Fail):
+    """What the command was pointed at cannot be read: the message says how to connect it."""
+
+
 class Unbuildable(Fail):
     """A step Notion refused with a 400 that cannot be built from the schema read again: a property or an option it
     names is unknown. It has that failure's message and exit code; Notion did nothing."""
@@ -912,10 +916,10 @@ class Notion:
             cursor = answer['next_cursor']
 
     def not_connected(self, identifier, error):
-        return Fail(REFUSED, f'Notion answered {error.status} {error.api_code} for {identifier}: the integration is not '
-                             'connected to that page or its parent, or it lacks the capability. Open the page in '
-                             'Notion, menu > Connections, and add the integration (D8 keeps the access to the '
-                             'data sources the team agreed on).')
+        return NotConnected(REFUSED, f'Notion answered {error.status} {error.api_code} for {identifier}: the integration '
+                                     'is not connected to that page or its parent, or it lacks the capability. Open the '
+                                     'page in Notion, menu > Connections, and add the integration (D8 keeps the access '
+                                     'to the data sources the team agreed on).')
 
     # -- the bot, settings, people --------------------------------------------------------
 
@@ -1284,8 +1288,18 @@ class Notion:
             return ask()
         except ApiError as refused:
             if refused.status in (403, 404):
-                self.refresh_schema(schema)
+                self.check_connected(schema)
             raise
+
+    def check_connected(self, schema):
+        """NotConnected when the schema of a data source can no longer be read. Any other failure of that read says
+        nothing about it, and the refusal it was checking stands."""
+        try:
+            self.refresh_schema(schema)
+        except NotConnected:
+            raise
+        except Fail:
+            pass
 
     def data_source_titled(self, text):
         def find(listed):
@@ -1540,7 +1554,7 @@ class Notion:
                 value['time_zone'] = current['time_zone']
         if end and not no_date(end):
             if ends_before_it_starts(start, end, current.get('time_zone') if start_kept or end_kept else None):
-                said = (f'the new start {start} is after the end the property keeps, {end}' if end_kept and end
+                said = (f'the new start {start} is after the end the property keeps, {end}' if end_kept
                         else f'the new end {end} is before the start the property keeps, {start}' if start_kept
                         else f'the start {start} is after the end {end}')
                 raise Fail(USAGE, f'date:{name}: {said}; nothing was sent. Set the end with date:{name}:end=<date>, on or '
@@ -2120,10 +2134,13 @@ def cmd_update(client, args):
         if args.icon:
             what.append('icon')
         def write_them():
-            if not properties:
-                return write_properties(client, page, {}, args.icon)
-            return client.on_current_schema(schema, build, lambda built: write_properties(client, page, built, args.icon),
-                                            built=properties)
+            def send(built):
+                return built, send_properties(client, page, built, args.icon)
+
+            # only the write is inside the rule that may send it again; what reads its answer comes after
+            built, stored = (client.on_current_schema(schema, build, send, built=properties) if properties
+                             else send(properties))
+            say_written(client, page, stored, built, args.icon)
 
         steps.append((' and '.join(what), write_them, []))
     if args.edit:
@@ -2200,14 +2217,17 @@ def report_writes(kind, done, label, failure, rest, total=None, where='', misses
     return Fail(PARTIAL if done else failure.code, message, outcome, failure.cause)
 
 
-def write_properties(client, page, properties, icon_text):
+def send_properties(client, page, properties, icon_text):
     payload = {}
     if properties:
         payload['properties'] = properties
     if icon_text:
         icon = icon_of(icon_text)
         payload['icon'] = None if icon == 'none' else icon
-    stored = client.call('PATCH', f"/v1/pages/{page['id']}", payload)
+    return client.call('PATCH', f"/v1/pages/{page['id']}", payload)
+
+
+def say_written(client, page, stored, properties, icon_text):
     changed = client.short_values(stored, names=set(properties))
     client.say(f"updated {stored.get('url') or page.get('url')}")
     if changed:
@@ -2333,8 +2353,8 @@ def cmd_create(client, args):
             except ApiError as refused:
                 if kind == 'data_source' and refused.status in (403, 404):
                     try:
-                        client.refresh_schema(parent)
-                    except Fail as gone:  # the cached parent is gone: say how to connect it, as with nothing cached
+                        client.check_connected(parent)
+                    except NotConnected as gone:  # the cached parent is gone: say how to connect it, as with no cache
                         raise Fail(gone.code, gone.message, refused.outcome)
                 raise
 
