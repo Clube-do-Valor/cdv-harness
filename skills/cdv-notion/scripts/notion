@@ -1048,7 +1048,7 @@ class Notion:
         identifier = schema.get('id')
         if not identifier:
             return False
-        fresh = self.data_source(identifier, refresh=identifier not in self._fresh)
+        fresh = self.get_data_source(identifier, refresh=identifier not in self._fresh)
         if fresh == schema:
             return False
         schema.clear()
@@ -1231,12 +1231,24 @@ class Notion:
             raise Fail(USAGE, f'{identifier} is a database with {len(sources)} data sources; name one: {listed}')
         raise self.not_connected(identifier, last)
 
-    def get_data_source(self, identifier):
+    def get_data_source(self, identifier, refresh=False):
+        """A data source the command was pointed at: one that cannot be read says how to connect it."""
         try:
-            return self.data_source(identifier)
+            return self.data_source(identifier, refresh=refresh)
         except ApiError as error:
             if error.status in (403, 404):
                 raise self.not_connected(identifier, error)
+            raise
+
+    def of_data_source(self, schema, ask):
+        """ask(), a request about a data source whose schema may come from the cache. When it is answered 403 or
+        404 the schema is read from the API: a data source that is gone then fails as it does with nothing cached,
+        and one that can be read keeps the API's own refusal."""
+        try:
+            return ask()
+        except ApiError as refused:
+            if refused.status in (403, 404):
+                self.refresh_schema(schema)
             raise
 
     def data_source_titled(self, text):
@@ -1254,10 +1266,10 @@ class Notion:
             raise Fail(USAGE, f'{text} is a data source, not a page')
         return found
 
-    def schema_for(self, page, refresh=False):
+    def schema_for(self, page):
         source = page.get('parent', {}).get('data_source_id')
         if source:
-            return self.data_source(source, refresh=refresh)
+            return self.get_data_source(source)
         return {'object': 'page_parent', 'title': [], 'properties': {'title': {'id': 'title', 'name': 'title', 'type': 'title'}}}
 
     # -- reading values -------------------------------------------------------------------
@@ -2236,11 +2248,20 @@ def cmd_create(client, args):
     for number, (payload, title, files, assignments) in enumerate(payloads):
         rest = [repr(t or '(untitled)') for _, t, *_ in payloads[number + 1:]]
         then = 'Then create only the pages not sent' if rest else ''
+        def create(built):
+            try:
+                return create_one(client, kind, parent, dict(payload, properties=built), title, started, seen, where)
+            except ApiError as refused:
+                if kind == 'data_source' and refused.status in (403, 404):
+                    try:
+                        client.refresh_schema(parent)
+                    except Fail as gone:  # the cached parent is gone: say how to connect it, as with nothing cached
+                        raise Fail(gone.code, gone.message, refused.outcome)
+                raise
+
         try:
             page = client.on_current_schema(
-                page_schema, lambda: client.build_properties(assignments, page_schema),
-                lambda built: create_one(client, kind, parent, dict(payload, properties=built), title, started, seen, where),
-                built=payload['properties'])
+                page_schema, lambda: client.build_properties(assignments, page_schema), create, built=payload['properties'])
         except Fail as failure:
             if isinstance(failure, Unbuildable) and not created:  # said as any unknown property is: nothing was made
                 if len(payloads) > 1:
@@ -2745,7 +2766,8 @@ def cmd_query(client, args):
     max_rows = args.max_rows or MAX_ROWS
 
     def ask(plan):
-        return plan, client.pages_of('POST', f"/v1/data_sources/{schema['id']}/query", plan['body'], max_items=max_rows)
+        return plan, client.of_data_source(schema, lambda: client.pages_of(
+            'POST', f"/v1/data_sources/{schema['id']}/query", plan['body'], max_items=max_rows))
 
     def lacks(plan, answer):
         """Whether a row does not hold a property the output reads: the schema named it, so the schema is old."""
@@ -2883,7 +2905,11 @@ def cmd_search(client, args):
             searched.add(identifier)
             try:
                 schema = client.data_source(identifier)
-                rows, more, searchable = search_rows(client, schema, words, limit)
+
+                def ask():
+                    return search_rows(client, schema, words, limit)
+
+                rows, more, searchable = client.of_data_source(schema, ask) if args.within else ask()
                 capped = capped or more
             except ApiError as failure:
                 # only a data source of the cached list that is gone is skipped; the one named by --in never is

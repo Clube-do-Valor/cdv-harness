@@ -676,6 +676,8 @@ class FakeNotion:
         identifier = self.new_id()
         if "data_source_id" in parent:
             ds = parent["data_source_id"]
+            if ds not in self.data_sources:
+                return error(404, "object_not_found", "Could not find data source.")
             schema = self.data_sources[ds]["properties"]
             refused = self.refused_values(schema, body.get("properties") or {})
             if refused:
@@ -4340,6 +4342,54 @@ class StaleCacheTest(ClientTestCase):
                 code, out, err = self.run_cli("search", "invoice", "--in", COLLECTION + DS_PROJECTS)
                 self.assertEqual(code, 1, out + err)
                 self.assertIn(message, err)
+
+    def test_a_cached_data_source_that_is_gone_keeps_the_advice_to_connect_it(self):
+        """Every command that is pointed at a data source, with its schema cached or not: the same answer, which
+        says the integration is not connected and how to connect it."""
+        body = self.tmp / "body.md"
+        body.write_text("More")
+        coll = COLLECTION + DS_TASKS
+        sites = {
+            "fetch, the collection form": ("fetch", coll),
+            "fetch, the title": ("fetch", "Tasks"),
+            "fetch, the bare id": ("fetch", DS_TASKS),
+            "query": ("query", coll),
+            "query by title": ("query", "Tasks"),
+            "query --where": ("query", coll, "--where", "Status = 'Done'"),
+            "query --where, a name the cache lacks": ("query", coll, "--where", "Sprint = 'x'"),
+            "query --select, a name the cache lacks": ("query", coll, "--select", "Sprint"),
+            "search --in": ("search", "invoice", "--in", coll),
+            "create": ("create", "--parent", coll, "--set", "title=A"),
+            "create, a name the cache lacks": ("create", "--parent", coll, "--set", "title=A", "--set", "Sprint=x"),
+            "update --set": ("update", PAGE, "--set", "Notes=x"),
+            "update --set, a name the cache lacks": ("update", PAGE, "--set", "Sprint=x", "--append-file", str(body)),
+            "update --set, an option the cache lacks": ("update", PAGE, "--set", "Status=Shipped"),
+        }
+        said = {403: ("restricted_resource", "Not shared with it."), 404: ("object_not_found", "Could not find data source.")}
+        for status, (code_said, words) in said.items():
+            advice = (f"Notion answered {status} {code_said} for {DS_TASKS}: the integration is not connected to that page "
+                      "or its parent, or it lacks the capability. Open the page in Notion, menu > Connections")
+
+            def refuse(r, status=status, answer=(code_said, words)):
+                return error(status, *answer)
+
+            for name, command in sites.items():
+                for cached in (True, False):
+                    if not cached and ("title" in name or name.startswith("update")):
+                        continue  # nothing cached: the title is unknown; an update meets the data source only as a schema
+                    with self.subTest(command=name, status=status, cached=cached):
+                        self.cached_before(lambda: None)
+                        if not cached:
+                            shutil.rmtree(self.home / ".cache")
+                        del self.fake.data_sources[DS_TASKS]
+                        self.fake.on("GET", rf"/v1/data_sources/{DS_TASKS}", refuse)
+                        self.fake.on("POST", rf"/v1/data_sources/{DS_TASKS}/query", refuse)
+                        self.fake.on("POST", r"/v1/pages", refuse)
+                        if name.startswith("update") and "lacks" not in name:
+                            (self.home / ".cache" / "cdv-notion" / f"schema-{DS_TASKS}.json").unlink()
+                        code, out, err = self.run_cli(*command)
+                        self.assertEqual(code, 1, out + err)
+                        self.assertIn(advice, err)
 
     def test_a_key_lookup_that_fails_is_never_taken_for_no_hit(self):
         """search looks a key up first; only "no such key" lets it go on without that hit."""
