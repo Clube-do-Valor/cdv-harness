@@ -3,6 +3,7 @@
 The checker and the cdv-notion client are loaded as modules; the client's transport is a fake Notion
 (card_fixtures.CardNotion) and HOME is a temporary directory, so nothing reaches Notion."""
 
+import datetime
 import hashlib
 import json
 import os
@@ -216,7 +217,7 @@ class NamesMapTest(CardCase):
             "request": "Descrição do Projeto", "current": "Discovery & Define",
             "checklist": "Checklist de Desenvolvimento"})
         self.assertEqual(names["projects"]["properties"], {"executors": "Executores", "score": "Pontuação Total Projeto"})
-        self.assertGreater(names["since"], "2900-01-01")
+        self.assertEqual(names["since"], "2026-11-25")
 
     def test_card_setting_replaces_a_default_and_bad_settings_exit_2(self):
         review = self.add(cf.task(1, full_task(), status="Code Review", summary=SUMMARY))
@@ -255,9 +256,18 @@ class ClassifyTest(CardCase):
         self.assertClean(before)
         self.assertEqual(self.check(before, "--body-replaced")[0], 1)
         self.assertEqual(self.check(on_the_day)[0], 1)
+        # The tracked default is the day the pattern started: both cards above came before it, and a card
+        # is judged from its first minute on.
         self.settings({"me": ME})
-        for ref in (before, on_the_day):
-            self.assertClean(ref)
+        start = json.loads(cf.CONTRACT.read_text())["names"]["since"]
+        day = datetime.date.fromisoformat(start)
+        eve = (day - datetime.timedelta(days=1)).isoformat()
+        before_start = self.add(cf.task(3, "", created=f"{eve}T23:59:00.000Z"))
+        on_start = self.add(cf.task(4, "", created=f"{start}T00:00:00.000Z"))
+        for ref in (before, on_the_day, before_start):
+            with self.subTest(ref=ref):
+                self.assertClean(ref)
+        self.assertEqual(self.check(on_start)[0], 1)
 
     def test_a_card_of_someone_else_is_exempt_unless_its_body_was_replaced(self):
         other = self.add(cf.task(1, "", assignee=(BRUNO,)))
