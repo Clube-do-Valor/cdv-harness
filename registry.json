@@ -15,7 +15,7 @@
       "owner": "augusto-henriques",
       "description": "Single-pass code review of a feature branch, emitting paste-ready inline-comment files under <profile.pr_review_dir_prefix>[TICKET]/ (prose in the repository's UI language, verified file:line anchors, _summary.md + INDEX.md). Triggers on 'revise esse PR', 'gera os comentários do code review', 'review my branch before I open the PR'. Read-only — never edits source, never posts. Do NOT use for the multi-agent protocol (\"review PR with subagents\" → cdv-pr-review), debugging (cdv-debug), planning (cdv-kickoff/cdv-grilling), or PR/commit generation (cdv-finalize).",
       "path": "skills/cdv-code-review",
-      "contentHash": "900f17d380512a115defbd0a85c5f18c828115bd8c633e53be51c5c349b1c57e"
+      "contentHash": "a838812aeb3b49d2918df5732e24f8be521a118b5946fb00b6e94ee212655149"
     },
     {
       "name": "cdv-debug",
@@ -47,7 +47,7 @@
       "owner": "augusto-henriques",
       "description": "Finalize a feature branch — ephemeral `<slug>-pr.md` at repo root (lean PR format, never committed), atomic conventional commits with inferred scope, branch guard, state report, then the push and the pull request opened (or updated) through `cdv-open-pr` at wrap-up (never merges). Triggers on \"finaliza essa feature\", \"wrap up this branch\", \"gera o PR description e os commits\", \"comita isso e prepara o PR\". Do NOT use for planning unimplemented work (cdv-kickoff), PRD/PROGRESS artifacts, or merging.",
       "path": "skills/cdv-finalize",
-      "contentHash": "0cde4f6ca84bf3d6e638654aa65d6f631226adeb2af8a2eeee1cd4dc1fe95882"
+      "contentHash": "f3c2a789fc9853bf1f42914134714026196ae409946530fc5abecb880d0bcee8"
     },
     {
       "name": "cdv-frontend",
@@ -79,15 +79,15 @@
       "owner": "augusto-henriques",
       "description": "Write the handoff block that lets a FRESH Claude session pick up work in this repository — QA of a branch, a code review, a continued investigation — without the current session's context. Verified facts only (git counts, worktree, fixtures, production-affecting steps), rendered in the chat for copy-paste; a HANDOFF-<slug>.md file only on request. Triggers on \"handoff prompt\", \"prompt pra outra sessão\", \"me dá um handoff\", \"hand this off to a fresh session\", \"passa isso pra uma sessão nova\", and the wrap-up of `cdv-finalize`. Do NOT use to summarize a conversation for a human (write prose), to generate the PR description (`cdv-finalize`) or the ticket note (`cdv-notion-ticket`).",
       "path": "skills/cdv-handoff",
-      "contentHash": "9ff04aafeb6440f57a376f398d76a60f8efeadc8e57d0134ee3bdf427e76b6cb"
+      "contentHash": "4bfda340b0cb327d630762ed4053740b9bc6c61d72b5b31419c2134a34eff676"
     },
     {
       "name": "cdv-kickoff",
       "version": "0.1.0",
       "owner": "augusto-henriques",
-      "description": "Start a feature or a fix larger than a one-liner with one command - read the request (a card link, a chat thread, a brief) and the repository, propose the run profile through its scripts (track small/medium/big, mode, chain, workspace, roles, optional steps), ask one question screen for medium and big work and none for small, write and validate the run profile, then run the chain (grilling, tlc-spec-lean plan, build and Verifier, review, fixes, browser QA, PR, pipeline, card) with no prompt per stage, stopping only where the profile says. Triggers on \"start this feature\", \"kickoff\", \"/cdv-kickoff\", \"começa essa feature\", \"vamos fazer esse card\", or a hand-off from cdv-debug or cdv-grilling. Do NOT use for a pure root-cause investigation with no build (cdv-debug), an open interview (cdv-grilling), a review of an existing branch (cdv-code-review), or a factory run (cdv-factory-small-feature).",
+      "description": "Start a feature or a fix larger than a one-liner with one command - read the request (a card link, a chat thread, a brief) and the repository, propose the run profile through its scripts (track small/medium/big, mode, chain, workspace, roles, optional steps), ask one question screen for medium and big work and none for small, write and validate the run profile, then run the chain (grilling, tlc-spec-lean plan, build and its independent review, code review, fixes, browser QA, PR, pipeline, card) with no prompt per stage, stopping only where the profile says. Triggers on \"start this feature\", \"kickoff\", \"/cdv-kickoff\", \"começa essa feature\", \"vamos fazer esse card\", or a hand-off from cdv-debug or cdv-grilling. Do NOT use for a pure root-cause investigation with no build (cdv-debug), an open interview (cdv-grilling), a review of an existing branch (cdv-code-review), or a factory run (cdv-factory-small-feature).",
       "path": "skills/cdv-kickoff",
-      "contentHash": "1a89f48136b4b72c4e25553320ab8bd07c252c594ede15b6b8e9c9d37d305361"
+      "contentHash": "9baae52067ea77e2861c925863f14851f0aa30b1907c9d3cf487e49c9796cc08"
     },
     {
       "name": "cdv-notion",
@@ -179,11 +179,11 @@
     },
     {
       "name": "tlc-spec-lean",
-      "version": "2.2.0",
+      "version": "3.2.0",
       "owner": "tech-leads-club (third party)",
-      "description": "Spec-driven feature work that freezes obligations instead of the plan: one human-reviewed plan with EARS criteria, path, entities, interface and one-way doors, then proof-backed checks, then build, then an independent Verifier. Use when the user says \"tlc-spec-lean\", \"plan feature\", \"specify feature\", \"write the checks\", \"build this plan\", or \"verify work\". Do NOT use for standalone design documents unattached to a feature, architecture decomposition analysis, or work that already has a task list or checklist to execute.",
+      "description": "Spec-driven feature work that freezes what must be true and frees how it is built: one human-reviewed plan with EARS criteria, path, entities, interface and one-way doors; then the build, one vertical slice at a time, each committed; then one review by a fresh sub-agent and one fix pass. Use when the user says \"tlc-spec-lean\", \"plan feature\", \"specify feature\", \"build this plan\", or \"review this work\". Do NOT use for standalone design documents unattached to a feature, architecture decomposition analysis, or work that already has a task list or checklist to execute.",
       "path": "skills/tlc-spec-lean",
-      "contentHash": "59c93b6b27c08e1305b670214633df7726051a9005013c014269522cb9126464"
+      "contentHash": "567f4bccc1831bb5d79f971cc754d748210fda247f31011da16526410abd17c1"
     }
   ]
 }

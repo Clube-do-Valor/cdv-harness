@@ -1,6 +1,6 @@
 # Explain Findings — the three-layer format
 
-Shared by `cdv-code-review`, `cdv-apply-review`, `cdv-debug` and the Verifier of `tlc-spec-lean`. One format for every place a finding is shown to the user: first the plain explanation, then how to see it on the screen, then the technical detail for an agent. The technical detail never disappears; it moves below the explanation.
+Shared by `cdv-code-review`, `cdv-apply-review`, `cdv-debug` and the review of `tlc-spec-lean`. One format for every place a finding is shown to the user: first the plain explanation, then how to see it on the screen, then the technical detail for an agent. The technical detail never disappears; it moves below the explanation.
 
 Why this exists: readers without the code ask for a high-level version; a finding that carries all three layers answers that up front.
 
@@ -49,7 +49,7 @@ Never pad: a branch with two real findings gets two blocks. Two honest findings 
 | `cdv-code-review` | Every per-finding file (three layers, per `comment-format.md`) and the Step 10 chat presentation | `_summary.md`, `INDEX.md`, anchors, severity mapping |
 | `cdv-apply-review` | The Step 3 triage: each finding is presented as **O problema / Como ver na tela / Recomendação** before the verdict and the "aplico?" question | One commit per finding, the verdict table |
 | `cdv-debug` | A **Resumo para quem abriu o chamado** block at the top of the Step 7 report: problema, como ver na tela, desde quando, o que fazer agora, correção recomendada — ten lines, no jargon | The technical report below it |
-| `tlc-spec-lean` Verifier | When it reports to the developer: one line naming itself (an independent verification by a child that did not write the code), then each open finding in prose (what is missing, what would break if it stays missing, the test that would cover it) | `verification.md` as `tlc-spec-lean` writes it |
+| `tlc-spec-lean` review | When it reports to the developer: one line naming itself (an independent review by a child that did not write the code), then each finding in prose (what is missing, what would break if it stays missing, the test that would cover it) | `review.md` as `tlc-spec-lean` writes it |
 
 ## Worked example (condensed chat form)
 
@@ -62,4 +62,4 @@ The condensed chat form of one finding is in the extension (`<profile.extension_
 - "Como ver" that describes a query result instead of a screen.
 - Repeating the comment files verbatim in the chat.
 - A recommendation with two options.
-- A verifier report that is only the table.
+- A review report that is only the table.

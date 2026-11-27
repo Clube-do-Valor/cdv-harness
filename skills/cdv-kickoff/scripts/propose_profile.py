@@ -188,7 +188,7 @@ def propose(s, answers=None):
         "workspace": pick("workspace", "main" if s["main_checkout_free"] and track != "big" else "worktree"),
         "builder": pick("builder", "inline" if small else "child"),
         "builder_role": pick("builder_role", "builder_risk" if risk else "builder"),
-        "verify_rounds": pick("verify_rounds", {"small": "0", "medium": "2", "big": "3"}[track]),
+        "verify_rounds": pick("verify_rounds", {"small": "0", "medium": "1", "big": "1"}[track]),
         "fault_injection": pick("fault_injection", "true" if risk else "false"),
         "review": pick("review", "none" if small else "bugs-and-regressions"),
         "qa": pick("qa", qa),

@@ -124,10 +124,8 @@ class RunStatusTest(RepoCase):
                 self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
                 self.assertEqual(self.status_path.read_bytes(), before)
 
-    def test_verify_over_the_cap_exits_3_and_marks_capped(self):
+    def test_verify_runs_once_a_second_start_exits_3_and_marks_capped(self):
         self.walk_to("verify")
-        self.assertEqual(self.status("start", "verify").returncode, 0)
-        self.ok("done", "verify")
         self.assertEqual(self.status("start", "verify").returncode, 0)
         self.ok("done", "verify")
         before = self.status_path.read_bytes()
@@ -140,7 +138,7 @@ class RunStatusTest(RepoCase):
         self.ok("start", "review")
 
     def test_none_and_zero_stages_are_skipped_and_never_start(self):
-        text = VALID_RUN.replace("review: bugs-and-regressions", "review: none").replace("verify_rounds: 2", "verify_rounds: 0")
+        text = VALID_RUN.replace("review: bugs-and-regressions", "review: none").replace("verify_rounds: 1", "verify_rounds: 0")
         self.write_run(text)
         self.walk_to("verify")
         shown = self.shown()
@@ -152,7 +150,7 @@ class RunStatusTest(RepoCase):
         self.ok("start", "qa")
 
     def test_show_prints_one_line_per_stage_with_state_times_and_child(self):
-        self.write_run(VALID_RUN.replace("review: bugs-and-regressions", "review: none").replace("verify_rounds: 2", "verify_rounds: 1"))
+        self.write_run(VALID_RUN.replace("review: bugs-and-regressions", "review: none"))
         self.walk_to("verify")
         self.ok("start", "verify", "--child", "verifier-7")
         self.assertEqual(self.status("start", "verify").returncode, 3)  # running: no second start
@@ -271,9 +269,12 @@ class OrchestratorProseTest(SkillProse):
     def test_next_stage_starts_without_a_prompt(self):
         self.assertSentence(r"`plan-then-build`", r"`autonomous`", r"stage ends", r"next stage", r"without a prompt")
 
-    def test_capped_verifier_items_go_to_the_pr_tagged(self):
-        self.assertSentence(r"`capped`", r"open item", r"`defect`", r"`proof-gap`", r"pull request description")
-        self.assertSentence(r"`capped`", r"(continue|go on) to the review")
+    def test_verify_is_one_review_and_one_fix_pass(self):
+        self.assertSentence(r"`Review:`", r"sent at", r"references/review\.md", r"writes `\.specs/features/<feature>/review\.md`")
+        self.assertSentence(r"`builder_role`", r"fix pass", r"`Fix pass:`", r"`run_status\.py done verify`")
+
+    def test_a_second_review_is_refused_and_open_findings_go_to_the_pr(self):
+        self.assertSentence(r"no second review", r"`capped`", r"finding left open", r"pull request description", r"continue to the code review")
 
     def test_stops_before_external_send_production_write_or_deploy(self):
         self.assertSentence(

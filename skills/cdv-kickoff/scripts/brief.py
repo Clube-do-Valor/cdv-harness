@@ -31,9 +31,9 @@ from run_common import (  # noqa: E402
 # Role -> (skill to load, what to do with it).
 ROLE_SKILL = {
     "orchestrator": ("cdv-kickoff", "run the chain of the run profile"),
-    "builder": ("tlc-spec-lean", "Build phase: tests from the checks, then the code, then commits"),
-    "builder_risk": ("tlc-spec-lean", "Build phase: tests from the checks, then the code, then commits"),
-    "verifier": ("tlc-spec-lean", "Verify phase: check_proofs.py first, then references/verify.md; you are not the author"),
+    "builder": ("tlc-spec-lean", "Build phase: one slice at a time, S1 first, one commit per slice; when the review is back, the one fix pass"),
+    "builder_risk": ("tlc-spec-lean", "Build phase: one slice at a time, S1 first, one commit per slice; when the review is back, the one fix pass"),
+    "verifier": ("tlc-spec-lean", "Review phase: the prompt of references/review.md, filled; you are not the author, change no code and commit nothing, write review.md"),
     "reviewer": ("cdv-code-review", "bugs and regressions only: no refactor, no style"),
     "fixer": ("cdv-apply-review", "one commit per finding, on the same branch"),
     "qa": ("cdv-qa", "drive the browser yourself and record every step"),

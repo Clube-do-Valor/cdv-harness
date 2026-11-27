@@ -150,7 +150,7 @@ class ProposeProfileTest(ProposeCase):
                 self.assertEqual((profile["builder_role"], profile["fault_injection"]), ("builder", "false"))
 
     def test_verify_rounds_follow_the_track(self):
-        for track, rounds in (("small", "0"), ("medium", "2"), ("big", "3")):
+        for track, rounds in (("small", "0"), ("medium", "1"), ("big", "1")):
             with self.subTest(track=track):
                 profile = self.on_track(track)
                 self.assertEqual((profile["track"], profile["verify_rounds"]), (track, rounds))
@@ -246,7 +246,7 @@ class ProposeProfileTest(ProposeCase):
         profile = self.propose("track=big")
         self.assertEqual(
             (profile["track"], profile["mode"], profile["verify_rounds"], profile["workspace"]),
-            ("big", "plan-then-build", "3", "worktree"),
+            ("big", "plan-then-build", "1", "worktree"),
         )
         bad = script("propose_profile.py", "--signals", json.dumps(BASE_SIGNALS), "--answer", "track=huge")
         self.assertEqual(bad.returncode, 2)
@@ -261,7 +261,7 @@ planning: tlc-spec-lean
 workspace: main
 builder: child
 builder_role: builder
-verify_rounds: 2
+verify_rounds: 1
 fault_injection: false
 review: bugs-and-regressions
 qa: browser-local
@@ -297,7 +297,7 @@ class RunProfileTest(HarnessTestCase):
         cases = {
             "unknown key": ("deadline: friday\n", None, "deadline"),
             "track outside its set": (None, ("track: medium", "track: huge"), "track"),
-            "verify_rounds over 3": (None, ("verify_rounds: 2", "verify_rounds: 4"), "verify_rounds"),
+            "verify_rounds over 1": (None, ("verify_rounds: 1", "verify_rounds: 2"), "verify_rounds"),
             "inherit role": (None, ("role_builder: personal sonnet high", "role_builder: personal inherit high"), "role_builder"),
         }
         for name, (extra, swap, key) in cases.items():

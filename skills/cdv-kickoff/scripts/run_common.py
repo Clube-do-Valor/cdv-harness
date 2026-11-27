@@ -59,7 +59,7 @@ RUN_SCALARS = {
     "workspace": ("main", "worktree"),
     "builder": ("inline", "child"),
     "builder_role": ("builder", "builder_risk"),
-    "verify_rounds": ("0", "1", "2", "3"),
+    "verify_rounds": ("0", "1"),  # the Review phase of tlc-spec-lean runs once or not at all
     "fault_injection": ("true", "false"),
     "review": ("none", "bugs-and-regressions"),
     "qa": ("none", "browser-local", "browser-external-test-records"),

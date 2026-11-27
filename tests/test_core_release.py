@@ -256,14 +256,15 @@ class SkillProseTest(unittest.TestCase):
         self.assertRegex(text, re.compile(r"larger than small.{0,120}hands? (it )?off to `cdv-kickoff`", re.I))
         self.assertRegex(text, re.compile(r"invoke `cdv-kickoff`", re.I))
 
-    def test_finalize_gate_reads_validate_verification_or_capped(self):
+    def test_finalize_gate_reads_the_review_and_fix_pass_lines(self):
         text = one_line(skill("cdv-finalize"))
-        gate = re.search(r"Verifier gate.{0,1200}", text, re.I)
+        gate = re.search(r"Review gate.{0,1800}", text, re.I)
         self.assertIsNotNone(gate)
         gate = gate.group(0)
-        self.assertIn(".specs/features/<f>/verification.md", gate)
-        self.assertRegex(gate, r"`validate_verification\.py[^`]*`.{0,80}(exits? `?0`?|green)")
-        self.assertRegex(gate, re.compile(r"`capped`.{0,200}open items.{0,120}pull request description", re.I))
+        self.assertIn(".specs/features/<f>/review.md", gate)
+        self.assertRegex(gate, r"`\*\*Review:\*\*` line.{0,80}`sent at <hash>`")
+        self.assertRegex(gate, r"`\*\*Fix pass:\*\*` line.{0,80}`done - \.\.\.`")
+        self.assertRegex(gate, re.compile(r"no second review.{0,160}pull request description", re.I))
         self.assertRegex(gate, re.compile(r"otherwise.{0,80}refuse to commit", re.I))
 
     def test_code_review_offers_apply_on_a_colleagues_branch_and_asks_before_push(self):

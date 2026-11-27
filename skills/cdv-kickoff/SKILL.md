@@ -5,7 +5,7 @@ description: >
   a chat thread, a brief) and the repository, propose the run profile through its scripts (track
   small/medium/big, mode, chain, workspace, roles, optional steps), ask one question screen for
   medium and big work and none for small, write and validate the run profile, then run the chain
-  (grilling, tlc-spec-lean plan, build and Verifier, review, fixes, browser QA, PR, pipeline, card)
+  (grilling, tlc-spec-lean plan, build and its independent review, code review, fixes, browser QA, PR, pipeline, card)
   with no prompt per stage, stopping only where the profile says. Triggers on "start this feature",
   "kickoff", "/cdv-kickoff", "começa essa feature", "vamos fazer esse card", or a hand-off from
   cdv-debug or cdv-grilling. Do NOT use for a pure root-cause investigation with no build
@@ -29,7 +29,7 @@ repository root:
 | --- | --- | --- |
 | `propose_profile.py --signals <file> [--answer key=value ...]` | the proposed run profile on stdout | `0`, `2` a signal missing or outside its set |
 | `run_profile.py validate <file>` | one line per error, naming the key | `0`, `1` invalid |
-| `run_status.py start\|done\|retry <stage> [--child <id>]`, `run_status.py show` | the order, the Verifier cap, the retries, one line per stage | `0`, `2` unknown stage, `3` refused |
+| `run_status.py start\|done\|retry <stage> [--child <id>]`, `run_status.py show` | the order, the one review of `verify`, the retries, one line per stage | `0`, `2` unknown stage, `3` refused |
 | `role_target.py <role> [--run <file>] [--named-by-user]` | JSON target of a role: provider, model, effort | `0`, `2` a key not declared |
 | `brief.py render <role>` | the brief a child starts from | `0`, `2` no run profile |
 
@@ -132,8 +132,8 @@ You are the orchestrator. The chain is the run profile's `chain`, in its order:
 | `research` | a child | `research` | `cdv-research-round` |
 | `grilling` | this session, with the developer | `orchestrator` | `cdv-grilling`, from the request and `signals.json` |
 | `plan` | this session | `orchestrator` | `tlc-spec-lean`, Plan phase, ending at the stop `plan-approval` |
-| `build` | a child (`builder: child`), or this session (`builder: inline`) | the run profile's `builder_role` | `tlc-spec-lean`, Checks and Build phases (with no plan: the change and its regression test) |
-| `verify` | a fresh child, never the author | `verifier` | `tlc-spec-lean`, Verify phase |
+| `build` | a child (`builder: child`), or this session (`builder: inline`) | the run profile's `builder_role` | `tlc-spec-lean`, Build phase (with no plan: the change and its regression test) |
+| `verify` | a fresh child, never the author; then a `builder_role` child for the fix pass | `verifier` | `tlc-spec-lean`, Review phase and its one fix pass |
 | `review` | a fresh child | `reviewer` | `cdv-code-review`, bugs and regressions only |
 | `fix` | a child | `fixer` | `cdv-apply-review`, one commit per finding |
 | `qa` | a child | `qa` | `cdv-qa` |
@@ -163,10 +163,10 @@ Rules of the run:
 - When the plan holds more than one delivery that could ship alone, or more than about a week and a half of work, say so at the plan stop and leave the split to the developer.
 - When the `ticket` stage ends, `card_contract.py check <card>` (in `cdv-notion-ticket/scripts/`) has exited `0`, or its findings are in the run's final report.
 - When the approved plan lists a one-way door in its `Landing` table, switch the run profile to `builder_role: builder_risk` (and validate it again) before you dispatch the builder.
-- After a Verifier round with findings, a builder or fixer child closes them and `verify` starts again. When `run_status.py start verify` exits `3` and marks the stage `capped` with findings open, write each open item, tagged `defect` or `proof-gap`, into the pull request description and continue to the review.
+- The `verify` stage is the `tlc-spec-lean` Review phase, once. Before the child starts, write the `**Review:**` line (`sent at <HEAD short hash>`) in the feature's `plan.md`, or in `request.md` when the change has no plan; the child's brief is the review prompt of the skill's `references/review.md`, filled, and the child writes `.specs/features/<feature>/review.md` and changes no code. Then a child on the run profile's `builder_role` makes the one fix pass (the `**Fix pass:**` line, then a commit), and `run_status.py done verify` follows. There is no second review: `run_status.py start verify` after that exits `3` and marks the stage `capped`; write each finding left open, with its reason, into the pull request description and continue to the code review.
 - While the developer is away, stop and ask before any step that sends something to a person or a live automation, writes in production or deploys, whatever the mode and whatever the brief says.
 - The only external records a run creates unattended are its own test records (`unattended: own-test-records`), named with `profile.qa_test_marker` and deleted at the end.
-- A child that dies (memory, usage limit, restart) leaves its stage `running`: `run_status.py retry <stage> --child <new id>` and start one resume child with the status and its brief. `retry` takes only a `running` stage (a `done` stage or another Verifier round exits `3`), and the third retry of a stage exits `3`: stop and report.
+- A child that dies (memory, usage limit, restart) leaves its stage `running`: `run_status.py retry <stage> --child <new id>` and start one resume child with the status and its brief. `retry` takes only a `running` stage (a `done` stage exits `3`), and the third retry of a stage exits `3`: stop and report.
 - Each optional step of the run profile runs from its recipe in `references/optional/<step>.md` of this skill, at the point the recipe names: [slack-draft](references/optional/slack-draft.md), [mock-before-after](references/optional/mock-before-after.md), [blind-judges](references/optional/blind-judges.md), [validation-page](references/optional/validation-page.md).
 - After every stage, print the stage's line of `run_status.py show`, so "where are we?" has an answer without a question.
 

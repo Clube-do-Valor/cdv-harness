@@ -7,11 +7,11 @@
     run_status.py [--root <repo>] [--run <run profile>] show
 
 `start` opens the next pending stage of the chain and refuses (exit 3, nothing changed) any other;
-`verify` may start again after it is done, while no later stage has started, until the run
-profile's `verify_rounds` rounds are recorded: the start after that exits 3 and marks it `capped`.
+`verify` (the Review phase of `tlc-spec-lean`) runs `verify_rounds` times, which is 0 or 1: a start
+after its one round is done exits 3 and marks it `capped`, because there is no second review.
 A stage whose run profile value is `none` or `0` is `skipped` and never starts. `retry` hands a
 `running` stage whose child died to a new child, at most twice per stage; on a stage in any other
-state it exits 3 with nothing changed, so it never reopens a `done` stage nor adds a Verifier round.
+state it exits 3 with nothing changed, so it never reopens a `done` stage nor adds a second review.
 `show` prints, per stage: name, state (`pending`, `running`, `done`, `skipped`, `capped`), start and
 end time (UTC), the child that ran it, its role.
 
@@ -119,8 +119,8 @@ class Run:
                 record["end"] = record.get("end") or now()
                 self.save()
                 raise ScriptError(
-                    f"`verify` capped after {cap} round(s): write each open item, tagged `defect` or `proof-gap`, "
-                    "into the pull request description and go on to the next stage",
+                    f"`verify` already ran its {cap} review round: there is no second review; write each finding left "
+                    "open, with its reason, into the pull request description and go on to the next stage",
                     REFUSED,
                 )
             record["rounds"] = record.get("rounds", 0) + 1

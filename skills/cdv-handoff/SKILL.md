@@ -46,7 +46,7 @@ ls QA-<slug>.md STATE-<slug>.md <slug>-pr.md decisions-<slug>.md 2>/dev/null
 grep -n 'PRODUCTION-AFFECTING' QA-<slug>.md 2>/dev/null
 ```
 
-For `qa`: the fixtures come from the QA file's own steps (ids + display labels, the way `cdv-qa` needs them; [qa-fixtures.md](../../harness/references/qa-fixtures.md)). For `review`: the ticket id via `cdv-code-review/scripts/resolve-ticket-id.sh` and whether a `<profile.pr_review_dir_prefix><TICKET>/` already exists. For `investigation`: the hypotheses block and the evidence table from the `cdv-debug` report, verbatim. For `continue-implementation`: the run profile and its status (`.specs/features/<slug>/run.yaml`, or `RUN-<slug>.yaml` with no plan, and what `run_status.py show` prints), and whether `.specs/features/<slug>/verification.md` exists.
+For `qa`: the fixtures come from the QA file's own steps (ids + display labels, the way `cdv-qa` needs them; [qa-fixtures.md](../../harness/references/qa-fixtures.md)). For `review`: the ticket id via `cdv-code-review/scripts/resolve-ticket-id.sh` and whether a `<profile.pr_review_dir_prefix><TICKET>/` already exists. For `investigation`: the hypotheses block and the evidence table from the `cdv-debug` report, verbatim. For `continue-implementation`: the run profile and its status (`.specs/features/<slug>/run.yaml`, or `RUN-<slug>.yaml` with no plan, and what `run_status.py show` prints), and whether `.specs/features/<slug>/review.md` exists and the `**Fix pass:**` line of its `plan.md` (or `request.md`) reads `done`.
 
 ### Step 2 — Render the block
 
